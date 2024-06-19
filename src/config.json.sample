@@ -2,5 +2,6 @@
     "client_id": "abcdefg",
     "client_secret": "abcdefg",
     "refresh_token": "abcdefg",
-    "user_agent": "Reddit Image Moderator Tool by RadialMonster"
+    "user_agent": "Red Image Browser by RadialMonster",
+    "default_subreddit": "pics"
 }

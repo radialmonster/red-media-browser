@@ -161,25 +161,26 @@ class RedditGalleryModel(QAbstractListModel):
     def fetch_submissions(self, initial_fetch=False):
         if initial_fetch:
             self.load_cached_data()
+            submissions = self.cached_submissions  # Load cached submissions first if it's an initial fetch
+        else:
+            submissions = []  # Initialize submissions as an empty list if it's not an initial fetch
 
-        submissions = []
         after = self.after
         while True:
             try:
                 logging.debug(f"Fetching: GET https://oauth.reddit.com/r/{self.subreddit.display_name}/new with after={after}")
                 new_submissions = list(self.subreddit.new(limit=100, params={'after': after}))
                 if not new_submissions:
-                    break
+                    break  # Exit the loop if there are no new submissions
 
                 for submission in new_submissions:
-                    if any(cached_sub['id'] == submission.id for cached_sub in self.cached_submissions):
+                    if any(cached_sub.id == submission.id for cached_sub in self.cached_submissions):
                         logging.debug(f"Encountered cached submission: {submission.id}. Stopping fetch.")
                         return submissions, after
 
                     submissions.append(submission)
 
                 after = new_submissions[-1].name if new_submissions else None
-
             except prawcore.exceptions.TooManyRequests as e:
                 wait_time = int(e.response.headers.get('Retry-After', 60))  # Default to 60 seconds if not specified
                 logging.warning(f"Rate limit exceeded. Waiting for {wait_time} seconds.")
@@ -193,13 +194,13 @@ class RedditGalleryModel(QAbstractListModel):
 
         if not submissions:
             logging.warning("No submissions available to display.")
-            # QMessageBox.warning(None, "No Submissions", "No submissions available to display.")  # Comment out or remove this line
             return [], None
 
         self.current_items = submissions
         self.after = after
         self.cache_submissions(self.current_items, self.after)
         return self.current_items, self.after
+
 
 
     def load_cached_data(self):
@@ -877,8 +878,11 @@ if __name__ == '__main__':
         }
     """)
 
+    # Load the default subreddit from the config.json file
+    default_subreddit = config.get('default_subreddit', 'pics')
+
     # Initialize the main window with the default subreddit
-    main_win = MainWindow(subreddit='bikini')
+    main_win = MainWindow(subreddit=default_subreddit)
     main_win.show()
 
     # Load cached data and fetch new submissions

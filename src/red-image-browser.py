@@ -62,6 +62,7 @@ class RedditGalleryModel(QAbstractListModel):
         self.initial_fetch = True
         self.after = None
         self.moderators = None
+        self.is_moderator = False
         
 
     def check_user_moderation_status(self):
@@ -71,6 +72,7 @@ class RedditGalleryModel(QAbstractListModel):
             user = reddit.user.me()
             is_moderator = any(mod.name == user.name for mod in self.moderators)
             logging.debug("User %s is a moderator: %s", user.name, is_moderator)
+            self.is_moderator = is_moderator  # Store the moderation status in the model
             return is_moderator
         except prawcore.exceptions.PrawcoreException as e:
             logging.error(f"PRAW error while checking moderation status: {e}")
@@ -121,7 +123,7 @@ class RedditGalleryModel(QAbstractListModel):
                     try:
                         if isinstance(submission, praw.models.Submission):
                             if hasattr(submission, 'is_gallery') and submission.is_gallery:
-                                if hasattr(submission, 'media_metadata'):
+                                if hasattr(submission, 'media_metadata') and submission.media_metadata is not None:
                                     cached_submission['gallery_urls'] = [html.unescape(media['s']['u'])
                                                                         for media in submission.media_metadata.values()
                                                                         if 's' in media and 'u' in media['s']]
@@ -160,10 +162,10 @@ class RedditGalleryModel(QAbstractListModel):
 
     def fetch_submissions(self, initial_fetch=False):
         if initial_fetch:
-            self.load_cached_data()
-            submissions = self.cached_submissions  # Load cached submissions first if it's an initial fetch
+            submissions = []  # Initialize submissions as an empty list for initial fetch
         else:
-            submissions = []  # Initialize submissions as an empty list if it's not an initial fetch
+            self.load_cached_data()
+            submissions = self.cached_submissions  # Load cached submissions for subsequent fetches
 
         after = self.after
         while True:
@@ -173,24 +175,13 @@ class RedditGalleryModel(QAbstractListModel):
                 if not new_submissions:
                     break  # Exit the loop if there are no new submissions
 
-                for submission in new_submissions:
-                    if any(cached_sub.id == submission.id for cached_sub in self.cached_submissions):
-                        logging.debug(f"Encountered cached submission: {submission.id}. Stopping fetch.")
-                        return submissions, after
-
-                    submissions.append(submission)
-
-                after = new_submissions[-1].name if new_submissions else None
+                submissions.extend(new_submissions)
+                after = new_submissions[-1].name
             except prawcore.exceptions.TooManyRequests as e:
                 wait_time = int(e.response.headers.get('Retry-After', 60))  # Default to 60 seconds if not specified
                 logging.warning(f"Rate limit exceeded. Waiting for {wait_time} seconds.")
                 time.sleep(wait_time)
                 continue
-
-        if not submissions and initial_fetch:
-            # No new submissions fetched, load cached submissions
-            self.load_cached_data()
-            submissions = self.cached_submissions
 
         if not submissions:
             logging.warning("No submissions available to display.")
@@ -381,6 +372,9 @@ class MainWindow(QMainWindow):
         # Clear current_items in the model, as we're switching to a new subreddit and need to start fresh.
         self.model.current_items = []
 
+        # Reset the 'after' parameter to None
+        self.model.after = None
+
         # Update the Previous button state; it should be disabled when a new subreddit is loaded as we start from the first page.
         self.update_previous_button_state()
 
@@ -388,7 +382,7 @@ class MainWindow(QMainWindow):
         self.table_widget.clearContents()
 
         # Begin loading submissions from the new subreddit.
-        self.fetcher = SubmissionFetcher(self.model, self.model.after, initial_fetch=True)
+        self.fetcher = SubmissionFetcher(self.model, self.model.after, initial_fetch=self.model.initial_fetch)
         self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
         self.fetcher.start()  # Start the fetcher thread to asynchronously load the data.
         
@@ -555,8 +549,7 @@ class MainWindow(QMainWindow):
 
                 praw_submission = submission if isinstance(submission, praw.models.Submission) else None
 
-                widget = ThumbnailWidget(local_image_paths, title, image_urls[0], post_id, self.model.subreddit.display_name, has_multiple_images, post_url, praw_submission)
-                widget.set_model(self.model)
+                widget = ThumbnailWidget(local_image_paths, title, image_urls[0], post_id, self.model.subreddit.display_name, has_multiple_images, post_url, praw_submission, self.model)
                 
 
                 self.table_widget.setCellWidget(row, col, widget)
@@ -681,14 +674,15 @@ class MainWindow(QMainWindow):
             return []
 
 class ThumbnailWidget(QWidget):
-    def __init__(self, images, title, source_url, submission_id, subreddit_name, has_multiple_images, post_url, praw_submission):
+    def __init__(self, images, title, source_url, submission_id, subreddit_name, has_multiple_images, post_url, praw_submission, model):
         super().__init__(parent=None)
         self.praw_submission = praw_submission
+        self.model = model
         
         self.images = images
         self.current_index = 0
         self.post_url = post_url
-        self.model = None  # Initialize the model attribute to None
+
 
         self.layout = QVBoxLayout(self)
 
@@ -723,13 +717,11 @@ class ThumbnailWidget(QWidget):
         self.subreddit_name = subreddit_name
 
         # Check if the user is a moderator and create moderation buttons if true
-        if self.praw_submission:
-            logging.debug(f"Checking moderation status for submission: {self.praw_submission.id}")
-            if self.check_user_moderation_status():
-                logging.debug("User is a moderator. Creating moderation buttons.")
-                self.create_moderation_buttons()
-            else:
-                logging.debug("User is not a moderator.")
+        # if self.praw_submission and self.model.is_moderator:  # Use the stored moderation status from the model
+        #    logging.debug("User is a moderator. Creating moderation buttons.")
+        #    self.create_moderation_buttons()
+        # else:
+        #    logging.debug("User is not a moderator.")
     
     
     def set_model(self, model):
@@ -841,12 +833,11 @@ class ThumbnailWidget(QWidget):
         self.remove_button.setStyleSheet("background-color: red;")
         self.remove_button.setText("Removed")
  
-    
     def check_user_moderation_status(self):
-        logging.debug("Checking user moderation status for thumbnailwidget for subreddit")
         if self.model:
-            return self.model.check_user_moderation_status()
-        return False# Further processing if neededf
+            return self.model.is_moderator
+        return False
+    
 
 
 if __name__ == '__main__':

@@ -22,19 +22,23 @@ import time
 import datetime
 
 # Set up basic logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+if not logging.getLogger().hasHandlers():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
 # Configure PRAW logging
-handler = logging.StreamHandler()
-handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
 logger = logging.getLogger('prawcore')
-logger.addHandler(handler)
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+else:
+    logger.setLevel(logging.DEBUG)  # Ensure the logger level is set to DEBUG
 
 
 # Load Reddit credentials from config.json
@@ -159,26 +163,26 @@ class RedditGalleryModel(QAbstractListModel):
             json.dump(cached_data, f, ensure_ascii=False, indent=4)
             logging.debug(f"Cached data written to {cache_file}")
 
-
+     
     def fetch_submissions(self, initial_fetch=False):
         if initial_fetch:
-            submissions = []  # Initialize submissions as an empty list for initial fetch
+            submissions = [] 
+            after = None # Reset 'after' for a fresh start
         else:
             self.load_cached_data()
-            submissions = self.cached_submissions  # Load cached submissions for subsequent fetches
+            submissions = self.cached_submissions  
+            after = self.after  
 
-        after = self.after
         while True:
             try:
                 logging.debug(f"Fetching: GET https://oauth.reddit.com/r/{self.subreddit.display_name}/new with after={after}")
                 new_submissions = list(self.subreddit.new(limit=100, params={'after': after}))
                 if not new_submissions:
-                    break  # Exit the loop if there are no new submissions
-
+                    break 
                 submissions.extend(new_submissions)
                 after = new_submissions[-1].name
             except prawcore.exceptions.TooManyRequests as e:
-                wait_time = int(e.response.headers.get('Retry-After', 60))  # Default to 60 seconds if not specified
+                wait_time = int(e.response.headers.get('Retry-After', 60)) 
                 logging.warning(f"Rate limit exceeded. Waiting for {wait_time} seconds.")
                 time.sleep(wait_time)
                 continue
@@ -191,6 +195,7 @@ class RedditGalleryModel(QAbstractListModel):
         self.after = after
         self.cache_submissions(self.current_items, self.after)
         return self.current_items, self.after
+
 
 
 

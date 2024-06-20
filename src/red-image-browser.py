@@ -22,7 +22,8 @@ import time
 import datetime
 
 # Set up basic logging
-if not logging.getLogger().hasHandlers():
+logger = logging.getLogger()
+if not logger.hasHandlers():
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -30,15 +31,9 @@ if not logging.getLogger().hasHandlers():
     )
 
 # Configure PRAW logging
-logger = logging.getLogger('prawcore')
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-else:
-    logger.setLevel(logging.DEBUG)  # Ensure the logger level is set to DEBUG
+praw_logger = logging.getLogger('prawcore')
+praw_logger.setLevel(logging.DEBUG)  # Ensure the logger level is set to DEBUG
+praw_logger.propagate = True
 
 
 # Load Reddit credentials from config.json
@@ -166,23 +161,23 @@ class RedditGalleryModel(QAbstractListModel):
      
     def fetch_submissions(self, initial_fetch=False):
         if initial_fetch:
-            submissions = [] 
-            after = None # Reset 'after' for a fresh start
+            self.load_cached_data()  # Load cached data to get the 'after' value
+            submissions = self.cached_submissions
+            after = self.after
         else:
-            self.load_cached_data()
-            submissions = self.cached_submissions  
-            after = self.after  
+            submissions = self.current_items
+            after = self.after
 
         while True:
             try:
                 logging.debug(f"Fetching: GET https://oauth.reddit.com/r/{self.subreddit.display_name}/new with after={after}")
                 new_submissions = list(self.subreddit.new(limit=100, params={'after': after}))
                 if not new_submissions:
-                    break 
+                    break
                 submissions.extend(new_submissions)
                 after = new_submissions[-1].name
             except prawcore.exceptions.TooManyRequests as e:
-                wait_time = int(e.response.headers.get('Retry-After', 60)) 
+                wait_time = int(e.response.headers.get('Retry-After', 60))
                 logging.warning(f"Rate limit exceeded. Waiting for {wait_time} seconds.")
                 time.sleep(wait_time)
                 continue

@@ -366,7 +366,6 @@ class MainWindow(QMainWindow):
 
         # Reset the current page and the 'after' parameter when a new subreddit is loaded.
         self.current_page = 0
-        self.model.after = None
         self.model.initial_fetch = True  # Set initial_fetch to True
 
         # Clear current_items in the model, as we're switching to a new subreddit and need to start fresh.
@@ -382,9 +381,12 @@ class MainWindow(QMainWindow):
         self.table_widget.clearContents()
 
         # Begin loading submissions from the new subreddit.
-        self.fetcher = SubmissionFetcher(self.model, self.model.after, initial_fetch=self.model.initial_fetch)
+        self.fetcher = SubmissionFetcher(self.model, self.model.after, initial_fetch=True) 
         self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
-        self.fetcher.start()  # Start the fetcher thread to asynchronously load the data.
+        self.fetcher.start()
+
+        # Set initial_fetch to False after starting the initial fetch
+        self.model.initial_fetch = False 
         
 
     def load_next(self):

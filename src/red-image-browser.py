@@ -57,9 +57,7 @@ class RedditGalleryModel(QAbstractListModel):
         super().__init__(parent)
         self.subreddit = reddit.subreddit(subreddit)
         self.current_items = []
-        self.current_page = 0
-        self.initial_fetch = True
-        self.after = None
+        self.before = None
         self.moderators = None
         self.is_moderator = False
         
@@ -159,38 +157,27 @@ class RedditGalleryModel(QAbstractListModel):
             logging.debug(f"Cached data written to {cache_file}")
 
      
-    def fetch_submissions(self, initial_fetch=False):
-        if initial_fetch:
-            self.load_cached_data()  # Load cached data to get the 'after' value
-            submissions = self.cached_submissions
-            after = self.after
-        else:
-            submissions = self.current_items
-            after = self.after
-
-        while True:
-            try:
-                logging.debug(f"Fetching: GET https://oauth.reddit.com/r/{self.subreddit.display_name}/new with after={after}")
-                new_submissions = list(self.subreddit.new(limit=100, params={'after': after}))
-                if not new_submissions:
-                    break
-                submissions.extend(new_submissions)
-                after = new_submissions[-1].name
-            except prawcore.exceptions.TooManyRequests as e:
-                wait_time = int(e.response.headers.get('Retry-After', 60))
-                logging.warning(f"Rate limit exceeded. Waiting for {wait_time} seconds.")
-                time.sleep(wait_time)
-                continue
-
-        if not submissions:
-            logging.warning("No submissions available to display.")
-            return [], None
-
-        self.current_items = submissions
-        self.after = after
-        self.cache_submissions(self.current_items, self.after)
-        return self.current_items, self.after
-
+    def fetch_submissions(self, after=None, before=None):
+        submissions = []
+        try:
+            logging.debug(f"Fetching: GET https://oauth.reddit.com/r/{self.subreddit.display_name}/new with after={after}, before={before}")
+            params = {}
+            if after:
+                params['after'] = after
+            if before:
+                params['before'] = before
+            new_submissions = list(self.subreddit.new(limit=10, params=params))
+            submissions.extend(new_submissions)
+            if new_submissions:
+                self.after = new_submissions[-1].name
+            else:
+                # If no new submissions are found, reset the 'after' parameter
+                self.after = None
+        except prawcore.exceptions.TooManyRequests as e:
+            wait_time = int(e.response.headers.get('Retry-After', 60))
+            logging.warning(f"Rate limit exceeded. Waiting for {wait_time} seconds.")
+            time.sleep(wait_time)
+        return submissions, self.after
 
 
 
@@ -259,99 +246,63 @@ class RedditGalleryModel(QAbstractListModel):
 class SubmissionFetcher(QThread):
     submissionsFetched = pyqtSignal(list, str)
 
-    def __init__(self, model, after=None, initial_fetch=False, parent=None):
+    def __init__(self, model, after=None, before=None, parent=None):
         super().__init__(parent)
         self.model = model
         self.after = after
-        self.initial_fetch = initial_fetch
+        self.before = before
 
     def run(self):
-        # Adjusted call to match the method definition
-        submissions, after = self.model.fetch_submissions(initial_fetch=self.model.initial_fetch)
+        submissions, after = self.model.fetch_submissions(after=self.after, before=self.before)
         self.submissionsFetched.emit(submissions, after)
 
 
 class MainWindow(QMainWindow):
-    updateTableSignal = pyqtSignal(list)
-
     def __init__(self, subreddit='pics'):
         super().__init__()
         self.setWindowTitle("Reddit Image and Video Gallery")
-        
         self.current_page = 0
-        self.initial_fetch = True
-
         self.central_widget = QWidget()
         self.layout = QVBoxLayout(self.central_widget)
-
         self.subreddit_input = QLineEdit(subreddit)
-        
         self.load_subreddit_button = QPushButton('Load Subreddit')
-
-        # Create the buttons for Previous and Next
         self.load_previous_button = QPushButton('Previous')
         self.load_next_button = QPushButton('Next')
-
-        # Connect the buttons to their respective methods
         self.load_subreddit_button.clicked.connect(self.load_subreddit)
         self.load_previous_button.clicked.connect(self.load_previous)
         self.load_next_button.clicked.connect(self.load_next)
-
-        # Initially disable the Previous button
         self.load_previous_button.setEnabled(False)
-
-        # Create a horizontal layout for Previous and Next buttons
         buttons_layout = QHBoxLayout()
         buttons_layout.addWidget(self.load_previous_button)
         buttons_layout.addWidget(self.load_next_button)
-
-        self.table_widget = QTableWidget(2, 5, self)  # 2 rows and 5 columns
+        self.table_widget = QTableWidget(2, 5, self)
         self.table_widget.setHorizontalHeaderLabels(['A', 'B', 'C', 'D', 'E'])
         self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_widget.verticalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_widget.setEditTriggers(QTableWidget.NoEditTriggers)
-
-        # Add widgets to the main layout
         self.layout.addWidget(self.subreddit_input)
         self.layout.addWidget(self.load_subreddit_button)
         self.layout.addWidget(self.table_widget)
-        self.layout.addLayout(buttons_layout)  # Add the horizontal layout for buttons
-
+        self.layout.addLayout(buttons_layout)
         self.setCentralWidget(self.central_widget)
-        
         self.update_previous_button_state()
-        
-        self.page_history = []  # This will store the 'after' parameter for each page
-        self.submissions_history = []
-
-        self.updateTableSignal.connect(self.fill_table)
-
-        # Initial fetch and display of data
         self.model = RedditGalleryModel(subreddit)
-        self.initial_load()
+        self.load_subreddit()
 
 
-    def initial_load(self):
-        # Start the fetcher to load initial data
-        self.fetcher = SubmissionFetcher(self.model, self.model.after, initial_fetch=True)
-        self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
-        self.fetcher.start()
-    
-    
-    
     def load_subreddit(self):
         subreddit_name = self.subreddit_input.text()
         try:
             self.model.subreddit = reddit.subreddit(subreddit_name)
             logging.debug(f"Loading subreddit: {self.model.subreddit.url}")
             is_moderator = self.model.check_user_moderation_status()
-            self.model.is_moderator = is_moderator  # Store the moderation status in the model
+            self.model.is_moderator = is_moderator
             logging.debug(f"User is moderator: {is_moderator}")
         except prawcore.exceptions.Redirect:
             error_msg = f"Subreddit '{subreddit_name}' does not exist."
             logging.error(error_msg)
             QMessageBox.critical(self, "Subreddit Error", error_msg)
-            self.subreddit_input.clear()  # Optionally clear the input
+            self.subreddit_input.clear()
             return
         except prawcore.exceptions.ResponseException as e:
             error_msg = f"Error loading subreddit: {str(e)}"
@@ -363,144 +314,68 @@ class MainWindow(QMainWindow):
             logging.error(error_msg)
             QMessageBox.critical(self, "Error", error_msg)
             return
-
-        # Reset the current page and the 'after' parameter when a new subreddit is loaded.
         self.current_page = 0
-        self.model.initial_fetch = True  # Set initial_fetch to True
-
-        # Clear current_items in the model, as we're switching to a new subreddit and need to start fresh.
         self.model.current_items = []
-
-        # Reset the 'after' parameter to None
         self.model.after = None
-
-        # Update the Previous button state; it should be disabled when a new subreddit is loaded as we start from the first page.
         self.update_previous_button_state()
-
-        # Make sure the table is cleared as we're switching to a new subreddit.
         self.table_widget.clearContents()
-
-        # Begin loading submissions from the new subreddit.
-        self.fetcher = SubmissionFetcher(self.model, self.model.after, initial_fetch=True) 
+        self.fetcher = SubmissionFetcher(self.model, after=None)
+        self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
+        self.fetcher.start()
+        
+    def load_next(self):
+        self.current_page += 1
+        self.update_previous_button_state()
+        self.table_widget.clearContents()
+        
+        self.fetcher = SubmissionFetcher(self.model, after=self.model.after)
         self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
         self.fetcher.start()
 
-        # Set initial_fetch to False after starting the initial fetch
-        self.model.initial_fetch = False 
-        
-
-    def load_next(self):
-        logging.debug(f"Next button clicked. Current page before increment: {self.current_page}")
-        self.current_page += 1
-        logging.debug(f"Current page after increment: {self.current_page}")
-        next_page_start_index = self.current_page * 10
-        logging.debug(f"Next page start index: {next_page_start_index}")
-
-        if next_page_start_index >= len(self.model.current_items):
-            logging.debug("Need to fetch new items from Reddit.")
-            self.fetcher = SubmissionFetcher(self.model, self.model.after, initial_fetch=False)
-            self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
-            self.fetcher.start()
-        else:
-            logging.debug("Displaying already fetched submissions.")
-            self.display_current_page_submissions()
-
-        self.update_previous_button_state()
-
-
-
     def load_previous(self):
         logging.debug(f"Previous button clicked. Current page before decrement: {self.current_page}")
-
         if self.current_page > 0:
             self.current_page -= 1
             logging.debug(f"Current page after decrement: {self.current_page}")
-
-            logging.debug("Displaying previous set of submissions.")
-            self.display_previous_set_of_submissions()
+            self.display_current_page_submissions()
         else:
             logging.debug("Already at the first page. No action taken.")
-
         self.update_previous_button_state()
 
 
-    def display_previous_set_of_submissions(self):
-        logging.debug(f"Displaying previous set of submissions for page {self.current_page}")
-        items_per_page = 10
-        start_index = self.current_page * items_per_page
-        end_index = min(start_index + items_per_page, len(self.model.current_items))
-
-        if start_index >= len(self.model.current_items):
-            logging.debug(f"No submissions to display for index range {start_index}-{end_index}")
-            return  # No submissions to display
-
-        logging.debug(f"Displaying submissions from index {start_index} to {end_index}")
-
-        self.table_widget.clearContents()
-        submissions_to_display = self.model.current_items[start_index:end_index]
-        self.fill_table(submissions_to_display)
-
-        self.table_widget.viewport().update()
-        self.table_widget.update()
-        QApplication.processEvents()
 
     def update_previous_button_state(self):
-        # Enable the Previous button if the current page is greater than 0
         self.load_previous_button.setEnabled(self.current_page > 0)
 
 
     def on_submissions_fetched(self, submissions, after):
         logging.debug(f"Submissions fetched: {len(submissions)}")
-
         if submissions:
-            # New submissions fetched
-            if self.model.initial_fetch or not self.model.current_items:
-                logging.debug("Initial fetch or current_items is empty. Resetting current_items.")
-                self.model.current_items = submissions
-                self.current_page = 0
-                logging.debug(f"Reset current page to 0. Current items count: {len(self.model.current_items)}")
-            else:
-                logging.debug("Processing fetched submissions for existing items.")
-                existing_ids = set(sub.id for sub in self.model.current_items)
-                logging.debug(f"Existing IDs: {existing_ids}")
-
-                fetched_ids = set(sub.id for sub in submissions)
-                logging.debug(f"Fetched IDs: {fetched_ids}")
-
-                new_submissions = [sub for sub in submissions if sub.id not in existing_ids]
-                logging.debug(f"New submissions: {len(new_submissions)} (out of {len(submissions)} fetched)")
-
-                if new_submissions:
-                    logging.debug("Adding new submissions to current_items.")
-                    self.model.current_items.extend(new_submissions)
-                    logging.debug(f"Updated current items count: {len(self.model.current_items)}")
-                else:
-                    logging.debug("No new submissions to add.")
+            self.model.current_items.extend(submissions)  # Append new submissions to existing ones
+            self.model.after = after
+            self.update_previous_button_state()
+            self.display_current_page_submissions()
         else:
-            # No new submissions fetched, load cached submissions
-            logging.debug("No new submissions fetched. Loading cached submissions.")
-            self.model.current_items = self.model.cached_submissions
-            self.current_page = 0
-            logging.debug(f"Loaded cached submissions. Current items count: {len(self.model.current_items)}")
-
-        self.model.after = after
-        logging.debug(f"Model's 'after' parameter updated to: {self.model.after}")
-
-        self.model.initial_fetch = False
-        logging.debug("Set initial_fetch to False.")
-
-        self.update_previous_button_state()
-        self.display_current_page_submissions()
-        logging.debug(f"Displayed submissions for the current page: {self.current_page}")
+            logging.debug("No new submissions found.")
+            QMessageBox.information(self, "No More Posts", "There are no more posts to display.")
+            self.current_page -= 1  # Revert the page increment
+            self.update_previous_button_state()
         
     def display_current_page_submissions(self):
         items_per_page = 10
         start_index = self.current_page * items_per_page
         end_index = start_index + items_per_page
-
         submissions_to_display = self.model.current_items[start_index:end_index]
-        self.fill_table(submissions_to_display)
-
+        
+        if len(submissions_to_display) < items_per_page and self.model.after:
+            self.fetcher = SubmissionFetcher(self.model, after=self.model.after)
+            self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
+            self.fetcher.start()
+        else:
+            self.fill_table(submissions_to_display)
+    
+    def update_previous_button_state(self):
+        self.load_previous_button.setEnabled(self.current_page > 0)
 
     def fill_table(self, submissions):
         logging.debug(f"---------------------------Processing a new batch of submissions...")
@@ -525,10 +400,10 @@ class MainWindow(QMainWindow):
             image_urls = []
             if isinstance(submission, praw.models.Submission):
                 if hasattr(submission, 'is_gallery') and submission.is_gallery:
-                    if hasattr(submission, 'media_metadata'):
+                    if hasattr(submission, 'media_metadata') and submission.media_metadata is not None:
                         image_urls = [html.unescape(media['s']['u'])
-                                      for media in submission.media_metadata.values()
-                                      if 's' in media and 'u' in media['s']]
+                                    for media in submission.media_metadata.values()
+                                    if 's' in media and 'u' in media['s']]
                 else:
                     image_urls = [submission.url]
             else:
@@ -878,7 +753,6 @@ if __name__ == '__main__':
     main_win = MainWindow(subreddit=default_subreddit)
     main_win.show()
 
-    # Load cached data and fetch new submissions
-    main_win.model.fetch_submissions(initial_fetch=True)
+    # The initial fetch is now handled by load_subreddit()
 
     sys.exit(app.exec_())

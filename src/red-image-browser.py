@@ -318,6 +318,10 @@ class MainWindow(QMainWindow):
             logging.error(error_msg)
             QMessageBox.critical(self, "Error", error_msg)
             return
+        
+        is_moderator = self.model.check_user_moderation_status()
+        self.model.is_moderator = is_moderator
+
         self.current_page = 0
         self.model.current_items = []
         self.model.after = None
@@ -428,15 +432,12 @@ class MainWindow(QMainWindow):
                 has_multiple_images = len(image_urls) > 1
                 post_url = f"https://www.reddit.com{submission.permalink}"
 
-                widget = ThumbnailWidget(local_image_paths, title, url, post_id, self.model.subreddit.display_name, has_multiple_images, post_url, submission, self.model)
+                widget = ThumbnailWidget(local_image_paths, title, url, post_id, self.model.subreddit.display_name, has_multiple_images, post_url, submission, self.model.is_moderator)
                 
                 self.table_widget.setCellWidget(row, col, widget)
 
                 if has_multiple_images:
                     widget.init_arrow_buttons()
-
-                if widget.check_user_moderation_status():
-                    widget.create_moderation_buttons()
 
                 col += 1
                 if col >= 5:
@@ -548,10 +549,10 @@ class MainWindow(QMainWindow):
             return []
 
 class ThumbnailWidget(QWidget):
-    def __init__(self, images, title, source_url, submission_id, subreddit_name, has_multiple_images, post_url, praw_submission, model):
+    def __init__(self, images, title, source_url, submission_id, subreddit_name, has_multiple_images, post_url, praw_submission, is_moderator):
         super().__init__(parent=None)
         self.praw_submission = praw_submission
-        self.model = model
+        
         
         self.images = images
         self.current_index = 0
@@ -590,12 +591,14 @@ class ThumbnailWidget(QWidget):
 
         self.subreddit_name = subreddit_name
 
-        # Check if the user is a moderator and create moderation buttons if true
-        # if self.praw_submission and self.model.is_moderator:  # Use the stored moderation status from the model
-        #    logging.debug("User is a moderator. Creating moderation buttons.")
-        #    self.create_moderation_buttons()
-        # else:
-        #    logging.debug("User is not a moderator.")
+        self.is_moderator = is_moderator
+        
+        # Check if the user is a moderator
+        if self.is_moderator:
+            logging.debug("User is a moderator. Creating moderation buttons.")
+            self.create_moderation_buttons()
+        else:
+            logging.debug("User is not a moderator.")
     
     
     def set_model(self, model):

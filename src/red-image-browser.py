@@ -157,21 +157,21 @@ class RedditGalleryModel(QAbstractListModel):
             logging.debug(f"Cached data written to {cache_file}")
 
      
-    def fetch_submissions(self, after=None, before=None):
+    def fetch_submissions(self, after=None, before=None, count=10):
         submissions = []
         try:
-            logging.debug(f"Fetching: GET https://oauth.reddit.com/r/{self.subreddit.display_name}/new with after={after}, before={before}")
-            params = {}
+            logging.debug(f"Fetching: GET https://oauth.reddit.com/r/{self.subreddit.display_name}/new with after={after}, before={before}, count={count}")
+            params = {'limit': count}
             if after:
                 params['after'] = after
             if before:
                 params['before'] = before
-            new_submissions = list(self.subreddit.new(limit=10, params=params))
-            submissions.extend(new_submissions)
-            if new_submissions:
-                self.after = new_submissions[-1].name
+            
+            submissions = list(self.subreddit.new(limit=count, params=params))
+            
+            if submissions:
+                self.after = submissions[-1].name
             else:
-                # If no new submissions are found, reset the 'after' parameter
                 self.after = None
         except prawcore.exceptions.TooManyRequests as e:
             wait_time = int(e.response.headers.get('Retry-After', 60))
@@ -246,14 +246,15 @@ class RedditGalleryModel(QAbstractListModel):
 class SubmissionFetcher(QThread):
     submissionsFetched = pyqtSignal(list, str)
 
-    def __init__(self, model, after=None, before=None, parent=None):
+    def __init__(self, model, after=None, before=None, count=10, parent=None):
         super().__init__(parent)
         self.model = model
         self.after = after
         self.before = before
+        self.count = count
 
     def run(self):
-        submissions, after = self.model.fetch_submissions(after=self.after, before=self.before)
+        submissions, after = self.model.fetch_submissions(after=self.after, before=self.before, count=self.count)
         self.submissionsFetched.emit(submissions, after)
 
 
@@ -268,13 +269,16 @@ class MainWindow(QMainWindow):
         self.load_subreddit_button = QPushButton('Load Subreddit')
         self.load_previous_button = QPushButton('Previous')
         self.load_next_button = QPushButton('Next')
+        self.download_100_button = QPushButton('Download Next 100')
         self.load_subreddit_button.clicked.connect(self.load_subreddit)
         self.load_previous_button.clicked.connect(self.load_previous)
-        self.load_next_button.clicked.connect(self.load_next)
+        self.load_next_button.clicked.connect(lambda: self.load_next(10))
+        self.download_100_button.clicked.connect(lambda: self.load_next(100, download_only=True))
         self.load_previous_button.setEnabled(False)
         buttons_layout = QHBoxLayout()
         buttons_layout.addWidget(self.load_previous_button)
         buttons_layout.addWidget(self.load_next_button)
+        buttons_layout.addWidget(self.download_100_button)
         self.table_widget = QTableWidget(2, 5, self)
         self.table_widget.setHorizontalHeaderLabels(['A', 'B', 'C', 'D', 'E'])
         self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -323,13 +327,17 @@ class MainWindow(QMainWindow):
         self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
         self.fetcher.start()
         
-    def load_next(self):
-        self.current_page += 1
-        self.update_previous_button_state()
-        self.table_widget.clearContents()
+    def load_next(self, count=10, download_only=False):
+        if not download_only:
+            self.current_page += 1
+            self.update_previous_button_state()
+            self.table_widget.clearContents()
         
-        self.fetcher = SubmissionFetcher(self.model, after=self.model.after)
-        self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
+        # Use the 'after' parameter for pagination
+        after = self.model.after if hasattr(self.model, 'after') else None
+        
+        self.fetcher = SubmissionFetcher(self.model, after=after, count=count)
+        self.fetcher.submissionsFetched.connect(lambda submissions, after: self.on_submissions_fetched(submissions, after, download_only))
         self.fetcher.start()
 
     def load_previous(self):
@@ -348,18 +356,22 @@ class MainWindow(QMainWindow):
         self.load_previous_button.setEnabled(self.current_page > 0)
 
 
-    def on_submissions_fetched(self, submissions, after):
+    def on_submissions_fetched(self, submissions, after, download_only=False):
         logging.debug(f"Submissions fetched: {len(submissions)}")
         if submissions:
-            self.model.current_items.extend(submissions)  # Append new submissions to existing ones
-            self.model.after = after
+            self.model.current_items.extend(submissions)
+            self.model.after = after  # Store the 'after' value for next pagination
             self.update_previous_button_state()
-            self.display_current_page_submissions()
+            if not download_only:
+                self.display_current_page_submissions()
+            else:
+                self.download_submissions(submissions)
         else:
             logging.debug("No new submissions found.")
             QMessageBox.information(self, "No More Posts", "There are no more posts to display.")
-            self.current_page -= 1  # Revert the page increment
-            self.update_previous_button_state()
+            if not download_only:
+                self.current_page -= 1
+                self.update_previous_button_state()
         
     def display_current_page_submissions(self):
         items_per_page = 10
@@ -394,47 +406,36 @@ class MainWindow(QMainWindow):
             if row >= 2:  # Only display up to 2 rows
                 break
 
-            title = submission.title if isinstance(submission, praw.models.Submission) else submission['title']
-            post_id = submission.id if isinstance(submission, praw.models.Submission) else submission['id']
+            post_id = submission.id
+            title = submission.title
+            url = submission.url
 
-            image_urls = []
-            if isinstance(submission, praw.models.Submission):
+            logging.debug(f"Adding submission to table: Post ID - {post_id}, Row - {row}, Col - {column_labels[col]}")
+
+            try:
+                image_urls = []
                 if hasattr(submission, 'is_gallery') and submission.is_gallery:
                     if hasattr(submission, 'media_metadata') and submission.media_metadata is not None:
                         image_urls = [html.unescape(media['s']['u'])
                                     for media in submission.media_metadata.values()
                                     if 's' in media and 'u' in media['s']]
                 else:
-                    image_urls = [submission.url]
-            else:
-                image_urls = submission.get('image_urls', [])
-                if not image_urls:
-                    image_urls = submission.get('gallery_urls', [])
+                    image_urls = [url]
 
-            if not image_urls:
-                logging.error(f"No image URLs found for submission: {post_id}")
-                continue
-
-            logging.debug(f"Adding submission to table: Post ID - {post_id}, Row - {row}, Col - {column_labels[col]}")
-
-            try:
                 local_image_paths = [self.download_file(image_url) for image_url in image_urls]
                 local_image_paths = [path for path in local_image_paths if path]
 
                 has_multiple_images = len(image_urls) > 1
-                post_url = f"https://www.reddit.com{submission.permalink}" if isinstance(submission, praw.models.Submission) else submission.get('url', '')
+                post_url = f"https://www.reddit.com{submission.permalink}"
 
-                praw_submission = submission if isinstance(submission, praw.models.Submission) else None
-
-                widget = ThumbnailWidget(local_image_paths, title, image_urls[0], post_id, self.model.subreddit.display_name, has_multiple_images, post_url, praw_submission, self.model)
+                widget = ThumbnailWidget(local_image_paths, title, url, post_id, self.model.subreddit.display_name, has_multiple_images, post_url, submission, self.model)
                 
-
                 self.table_widget.setCellWidget(row, col, widget)
 
                 if has_multiple_images:
                     widget.init_arrow_buttons()
 
-                if praw_submission and widget.check_user_moderation_status():
+                if widget.check_user_moderation_status():
                     widget.create_moderation_buttons()
 
                 col += 1
@@ -452,48 +453,37 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
 
+    def download_submissions(self, submissions):
+        for submission in submissions:
+            image_urls = self.get_image_urls(submission)
+            for url in image_urls:
+                self.download_file(url, log_skip=True)
 
 
-
-    def download_file(self, url):
+    def download_file(self, url, log_skip=False):
         if url.endswith('.gifv'):
-            # Convert .gifv to .mp4
             url = url.replace('.gifv', '.mp4')
 
-        # Check if the URL is a Reddit gallery URL
-        if 'reddit.com/gallery/' in url:
-            return self.download_gallery_images(url)
-
-        # Create 'cache' directory inside the 'src' directory
         cache_dir = os.path.join(os.path.dirname(__file__), 'cache')
         os.makedirs(cache_dir, exist_ok=True)
 
-        # Extract domain name from URL
         domain = urlparse(url).netloc
-
-        # Create a subdirectory for the domain if it doesn't exist
         domain_dir = os.path.join(cache_dir, domain)
         os.makedirs(domain_dir, exist_ok=True)
 
-        # Extract filename and create a path in the domain directory
         parsed_url = urlparse(url)
-        path = unquote(parsed_url.path)  # Decode URL encoding if present
+        path = unquote(parsed_url.path)
         filename = os.path.basename(path)
-
-        # Remove or replace characters that are not allowed in Windows file names
         filename = filename.replace('?', '_').replace('&', '_').replace('=', '_')
-
-        # Construct the file path using the sanitized file name
         file_path = os.path.join(domain_dir, filename)
 
-        # Check if the file already exists to avoid re-downloading
         if os.path.exists(file_path):
-            logging.debug(f"File already exists: {file_path}")
+            if log_skip:
+                logging.debug(f"File already exists, skipping: {file_path}")
             return file_path
 
-        # Retry mechanism for handling rate limiting and redirects
         max_retries = 5
-        retry_delay = 5  # initial delay in seconds
+        retry_delay = 5
 
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -501,23 +491,19 @@ class MainWindow(QMainWindow):
 
         for attempt in range(max_retries):
             try:
-                logging.debug(f"Attempting to download file from URL: {url}")
                 response = requests.get(url, stream=True, allow_redirects=True, headers=headers)
                 if response.status_code == 200 and 'image' in response.headers.get('Content-Type', ''):
                     with open(file_path, 'wb') as local_file:
                         shutil.copyfileobj(response.raw, local_file)
-                        logging.debug(f"File downloaded to: {file_path}")
-                        return file_path
+                    logging.debug(f"File downloaded to: {file_path}")
+                    return file_path
                 elif response.status_code == 429:
                     logging.warning(f"Rate limit exceeded. Retrying in {retry_delay} seconds...")
                     time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    retry_delay *= 2
                     continue
                 elif response.history:
-                    # Handle redirects
-                    final_url = response.url
-                    logging.debug(f"Redirected to {final_url}")
-                    url = final_url
+                    url = response.url
                     continue
                 else:
                     logging.error('Invalid image URL or content type: %s', url)
@@ -529,6 +515,17 @@ class MainWindow(QMainWindow):
         logging.error(f"Failed to download file after {max_retries} attempts: {url}")
         return None
 
+    def get_image_urls(self, submission):
+        if isinstance(submission, praw.models.Submission):
+            if hasattr(submission, 'is_gallery') and submission.is_gallery:
+                if hasattr(submission, 'media_metadata') and submission.media_metadata is not None:
+                    return [html.unescape(media['s']['u'])
+                            for media in submission.media_metadata.values()
+                            if 's' in media and 'u' in media['s']]
+            return [submission.url]
+        else:
+            return submission.get('image_urls', []) or submission.get('gallery_urls', [])
+    
     def download_gallery_images(self, gallery_url):
         try:
             # Extract the submission ID from the gallery URL

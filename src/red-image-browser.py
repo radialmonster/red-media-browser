@@ -180,69 +180,6 @@ class RedditGalleryModel(QAbstractListModel):
         return submissions, self.after
 
 
-
-    def load_cached_data(self):
-        cache_dir = os.path.join(os.path.dirname(__file__), 'cache', self.subreddit.display_name_prefixed)
-        cache_file = os.path.join(cache_dir, "submissions.json")
-
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    cached_data = json.load(f)
-                    self.cached_submissions = [reddit.submission(id=sub['id']) for sub in cached_data.get('submissions', [])]
-                    self.after = cached_data.get('after', None)
-            except json.JSONDecodeError as e:
-                logging.error(f"Error decoding JSON data from {cache_file}: {e}")
-                self.cached_submissions = []
-                self.after = None
-
-                # Print out the exact error and the problematic part of the JSON
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                    error_line = lines[e.lineno - 1] if e.lineno <= len(lines) else "Line not found"
-                    logging.error(f"Error at line {e.lineno}, column {e.colno}: {error_line.strip()}")
-                    logging.error(f"Context: {e.msg}")
-
-                # Handle the case where the corrupted file already exists
-                corrupted_file = cache_file + ".corrupted"
-                if os.path.exists(corrupted_file):
-                    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-                    corrupted_file = f"{corrupted_file}_{timestamp}"
-
-                try:
-                    os.rename(cache_file, corrupted_file)
-                    logging.error(f"Renamed corrupted cache file to {corrupted_file}")
-                except Exception as rename_error:
-                    logging.error(f"Failed to rename corrupted file: {rename_error}")
-        else:
-            self.cached_submissions = []
-            self.after = None
-
-
-    def submission_to_dict(self, submission):
-        submission_dict = {
-            'id': submission.id,
-            'title': submission.title,
-            'url': submission.url,
-            'image_urls': [],
-            'gallery_urls': [],
-            'video_urls': [],
-        }
-
-        if hasattr(submission, 'is_gallery') and submission.is_gallery:
-            if hasattr(submission, 'media_metadata'):
-                submission_dict['gallery_urls'] = [html.unescape(media['s']['u'])
-                                                for media in submission.media_metadata.values()
-                                                if 's' in media and 'u' in media['s']]
-        else:
-            submission_dict['image_urls'].append(submission.url)
-
-        if submission.url.endswith('.mp4'):
-            submission_dict['video_urls'].append(submission.url)
-
-        return submission_dict
-
-
 class SubmissionFetcher(QThread):
     submissionsFetched = pyqtSignal(list, str)
 
@@ -428,7 +365,7 @@ class MainWindow(QMainWindow):
                 has_multiple_images = len(image_urls) > 1
                 post_url = f"https://www.reddit.com{submission.permalink}"
 
-                widget = ThumbnailWidget(local_image_paths, title, url, post_id, self.model.subreddit.display_name, has_multiple_images, post_url, submission, self.model.is_moderator)
+                widget = ThumbnailWidget(local_image_paths, title, url, submission, self.model.subreddit.display_name, has_multiple_images, post_url, self.model.is_moderator)
                 
                 self.table_widget.setCellWidget(row, col, widget)
 
@@ -548,10 +485,10 @@ class MainWindow(QMainWindow):
             return []
 
 class ThumbnailWidget(QWidget):
-    def __init__(self, images, title, source_url, submission_id, subreddit_name, has_multiple_images, post_url, praw_submission, is_moderator):
+    def __init__(self, images, title, source_url, submission, subreddit_name, has_multiple_images, post_url, is_moderator):
         super().__init__(parent=None)
-        self.praw_submission = praw_submission
-        
+        self.praw_submission = submission
+        self.submission_id = submission.id
         
         self.images = images
         self.current_index = 0
@@ -611,8 +548,8 @@ class ThumbnailWidget(QWidget):
         self.approve_button = QPushButton("Approve", self)
         self.remove_button = QPushButton("Remove", self)
         
-        self.approve_button.clicked.connect(lambda: self.approve_submission(self.praw_submission))
-        self.remove_button.clicked.connect(lambda: self.remove_submission(self.praw_submission))
+        self.approve_button.clicked.connect(self.approve_submission)
+        self.remove_button.clicked.connect(self.remove_submission)
         
         moderation_layout = QHBoxLayout()
         moderation_layout.addWidget(self.approve_button)
@@ -693,26 +630,21 @@ class ThumbnailWidget(QWidget):
         self.mediaPlayer.setMedia(QMediaContent(QUrl.fromLocalFile(video_url)))
         self.mediaPlayer.play()
 
-    def approve_submission(self, submission):
-        submission.mod.approve()
-        logging.debug(f"Approved: {submission.id}")  # Log to console when approved
+    def approve_submission(self):
+        self.praw_submission.mod.approve()
+        logging.debug(f"Approved: {self.submission_id}")
         
         # Update button appearance after approval
         self.approve_button.setStyleSheet("background-color: green;")
         self.approve_button.setText("Approved")
 
-    def remove_submission(self, submission):
-        submission.mod.remove()
-        logging.debug(f"Removed: {submission.id}")  # Log to console when removed
+    def remove_submission(self):
+        self.praw_submission.mod.remove()
+        logging.debug(f"Removed: {self.submission_id}")
 
         # Update button appearance after removal
         self.remove_button.setStyleSheet("background-color: red;")
         self.remove_button.setText("Removed")
- 
-    def check_user_moderation_status(self):
-        if self.model:
-            return self.model.is_moderator
-        return False
     
 
 

@@ -372,9 +372,9 @@ class MainWindow(QMainWindow):
                 self.download_submissions(submissions)
         else:
             logging.debug("No new submissions found.")
-            QMessageBox.information(self, "No More Posts", "There are no more posts to display.")
             if not download_only:
-                self.current_page -= 1
+                # Only decrement current page if not in download only mode
+                self.current_page -= 1 
                 self.update_previous_button_state()
         
     def display_current_page_submissions(self):
@@ -383,12 +383,8 @@ class MainWindow(QMainWindow):
         end_index = start_index + items_per_page
         submissions_to_display = self.model.current_items[start_index:end_index]
         
-        if len(submissions_to_display) < items_per_page and self.model.after:
-            self.fetcher = SubmissionFetcher(self.model, after=self.model.after)
-            self.fetcher.submissionsFetched.connect(self.on_submissions_fetched)
-            self.fetcher.start()
-        else:
-            self.fill_table(submissions_to_display)
+        # Removed redundant fetching logic
+        self.fill_table(submissions_to_display)
     
     def update_previous_button_state(self):
         self.load_previous_button.setEnabled(self.current_page > 0)
@@ -459,6 +455,9 @@ class MainWindow(QMainWindow):
             image_urls = self.get_image_urls(submission)
             for url in image_urls:
                 self.download_file(url, log_skip=True)
+        # Update the 'after' attribute after downloading submissions
+        if submissions:
+            self.model.after = submissions[-1].name
 
 
     def download_file(self, url, log_skip=False):

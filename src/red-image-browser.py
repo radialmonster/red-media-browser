@@ -29,34 +29,54 @@ if not logger.hasHandlers():
     )
 
 config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+
 try:
+
     with open(config_path, 'r') as config_file:
+
         config = json.load(config_file)
 
+
     # Initialize Reddit instance
+
+    requested_scopes = ['identity', 'read', 'modconfig', 'modposts', 'mysubreddits', 'modcontributors']
     reddit = praw.Reddit(
         client_id=config['client_id'],
         client_secret=config['client_secret'],
         refresh_token=config['refresh_token'],
         user_agent=config['user_agent'],
+        scopes=requested_scopes,
         log_request=2
     )
+
     logger.info("Successfully initialized Reddit API client.")
+    # Log the requested scopes directly
+    logger.info(f"Requested Reddit API client scopes: {requested_scopes}")
+    logger.info(f"Reddit API client scopes: {reddit.auth.scopes()}")    
+
 
     # Load the default subreddit from the config.json file
+
     default_subreddit = config.get('default_subreddit', 'pics')
+
     logger.info(f"Default subreddit set to: {default_subreddit}")
 
 except FileNotFoundError:
     logger.error(f"config.json not found at {config_path}. Please create a config file with your Reddit API credentials.")
+
     logger.debug(f"Script directory: {os.path.dirname(__file__)}")
+
     logger.debug(f"Contents of script directory: {os.listdir(os.path.dirname(__file__))}")
+
     sys.exit(1)
 except KeyError as e:
+
     logger.error(f"Missing key in config.json: {e}")
     sys.exit(1)
 except Exception as e:
+
     logger.error(f"Error initializing Reddit API client: {e}")
+
     sys.exit(1)
 
 class RedditGalleryModel(QAbstractListModel):

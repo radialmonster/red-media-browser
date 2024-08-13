@@ -19,6 +19,7 @@ import html
 import webbrowser
 
 
+
 # Set up basic logging
 logger = logging.getLogger()
 if not logger.hasHandlers():

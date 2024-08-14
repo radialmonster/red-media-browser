@@ -29,17 +29,37 @@ if not logger.hasHandlers():
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
+def get_new_refresh_token():
+    import webbrowser
+    import prawcore
+
+    logger.info("Requesting new refresh token with proper scopes.")
+    auth_url = reddit.auth.url(requested_scopes, 'uniqueKey', 'permanent')
+    logger.info(f"Please visit this URL to authorize the application: {auth_url}")
+    webbrowser.open(auth_url)
+
+    auth_code = input("Enter the authorization code from the URL: ")
+    try:
+        refresh_token = reddit.auth.authorize(auth_code)
+        logger.info("Successfully obtained new refresh token.")
+        return refresh_token
+    except prawcore.exceptions.PrawcoreException as e:
+        logger.error(f"Error obtaining new refresh token: {e}")
+        return None
+
+def update_config_with_new_token(new_token):
+    config['refresh_token'] = new_token
+    with open(config_path, 'w') as config_file:
+        json.dump(config, config_file, indent=4)
+    logger.info("Updated config.json with new refresh token.")
+
 config_path = os.path.join(os.path.dirname(__file__), 'config.json')
 
 try:
-
     with open(config_path, 'r') as config_file:
-
         config = json.load(config_file)
 
-
     # Initialize Reddit instance
-
     requested_scopes = ['identity', 'read', 'modconfig', 'modposts', 'mysubreddits', 'modcontributors']
     reddit = praw.Reddit(
         client_id=config['client_id'],
@@ -53,31 +73,43 @@ try:
     logger.info("Successfully initialized Reddit API client.")
     # Log the requested scopes directly
     logger.info(f"Requested Reddit API client scopes: {requested_scopes}")
-    logger.info(f"Reddit API client scopes: {reddit.auth.scopes()}")    
+    authorized_scopes = reddit.auth.scopes()
+    logger.info(f"Reddit API client scopes: {authorized_scopes}")
 
+    if set(requested_scopes).issubset(authorized_scopes):
+        logger.info("All requested scopes are authorized.")
+    else:
+        logger.warning("Not all requested scopes are authorized. Initiating process to obtain new refresh token.")
+        new_refresh_token = get_new_refresh_token()
+        if new_refresh_token:
+            update_config_with_new_token(new_refresh_token)
+            reddit = praw.Reddit(
+                client_id=config['client_id'],
+                client_secret=config['client_secret'],
+                refresh_token=new_refresh_token,
+                user_agent=config['user_agent'],
+                scopes=requested_scopes,
+                log_request=2
+            )
+            logger.info("Successfully re-initialized Reddit API client with new refresh token.")
+        else:
+            logger.error("Failed to obtain new refresh token. Exiting.")
+            sys.exit(1)
 
     # Load the default subreddit from the config.json file
-
     default_subreddit = config.get('default_subreddit', 'pics')
-
     logger.info(f"Default subreddit set to: {default_subreddit}")
 
 except FileNotFoundError:
     logger.error(f"config.json not found at {config_path}. Please create a config file with your Reddit API credentials.")
-
     logger.debug(f"Script directory: {os.path.dirname(__file__)}")
-
     logger.debug(f"Contents of script directory: {os.listdir(os.path.dirname(__file__))}")
-
     sys.exit(1)
 except KeyError as e:
-
     logger.error(f"Missing key in config.json: {e}")
     sys.exit(1)
 except Exception as e:
-
     logger.error(f"Error initializing Reddit API client: {e}")
-
     sys.exit(1)
 
 class RedditGalleryModel(QAbstractListModel):
@@ -89,7 +121,7 @@ class RedditGalleryModel(QAbstractListModel):
         self.moderators = None
         self.is_moderator = False
         #self.check_user_moderation_status()
-        self.fetch_initial_submissions()
+        #self.fetch_initial_submissions()
 
     def check_user_moderation_status(self):
         try:
@@ -212,8 +244,10 @@ class MainWindow(QMainWindow):
         
         # Center the window on the screen
         self.center()
+        
         # Start fetching initial submissions
         QApplication.processEvents()
+        self.model.fetch_initial_submissions()  # Ensure this is called only once
         self.on_initial_submissions_fetched(self.model.current_items, self.model.after)
 
     def load_subreddit(self):

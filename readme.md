@@ -25,22 +25,22 @@ A lightweight Python desktop application that allows you to browse images and vi
 
 1. **Clone the Repository:**
 
-   ```bash
-   git clone https://github.com/yourusername/your-repo-name.git
-   cd your-repo-name
+   ```shell
+   git clone https://github.com/radialmonster/red-media-browser.git
+   cd red-media-browser
    ```
 
 2. **Install Dependencies:**
 
    You can install the required packages with pip:
 
-   ```bash
+   ```shell
    pip install PyQt5 praw requests python-vlc
    ```
 
    Alternatively, if a `requirements.txt` file is provided:
 
-   ```bash
+   ```shell
    pip install -r requirements.txt
    ```
 
@@ -48,8 +48,8 @@ A lightweight Python desktop application that allows you to browse images and vi
 
    Navigate to the source directory and run the program:
 
-   ```bash
-   python src/red-image-browser.py
+   ```shell
+   python src/red-media-browser.py
    ```
 
 ## Configuration
@@ -68,7 +68,7 @@ Before running the program, you need to provide your Reddit API credentials thro
   - `default_subreddit` (e.g., `pics`)
 
 - **Manual Setup:**  
-  Alternatively, create a file named `config.json` in the same directory (next to `red-image-browser.py`) with the following format:
+  Alternatively, create a file named `config.json` in the same directory (next to `red-media-browser.py`) with the following format:
 
   ```json
   {
@@ -107,9 +107,9 @@ To work with Reddit’s API, you need to create a Reddit application to obtain y
 
 Run the following command:
 
-bash
-python src/red-image-browser.py
-
+```shell
+python src/red-media-browser.py
+```
 
 ### User Interface Controls
 
@@ -135,7 +135,7 @@ python src/red-image-browser.py
 ## Troubleshooting
 
 - **Configuration Issues:**  
-  Ensure that your `config.json` file is correctly formatted and placed in the same directory as `red-image-browser.py`.
+  Ensure that your `config.json` file is correctly formatted and placed in the same directory as `red-media-browser.py`.
 
 - **Reddit API Errors:**  
   If you encounter errors regarding scopes or authentication, double-check your Reddit app settings and credentials. The program will prompt for a new refresh token if necessary.

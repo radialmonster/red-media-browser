@@ -1,0 +1,6 @@
+# Reddit Image and Video Browser Dependencies
+
+PyQt5>=5.15
+praw>=7.0
+requests>=2.25
+python-vlc>=3.0

@@ -1,7 +1,7 @@
-{
-    "client_id": "abcdefg",
-    "client_secret": "abcdefg",
-    "refresh_token": "abcdefg",
-    "user_agent": "Red Image Browser by RadialMonster",
+    "client_id": "abcd",
+    "client_secret": "abcd",
+    "redirect_uri": "http://localhost:8080",
+    "refresh_token": "abcd",
+    "user_agent": "Red Media Browser",
     "default_subreddit": "pics"
 }

@@ -1,6 +1,6 @@
-# Reddit Image and Video Browser
+# Red Media Browser
 
-A lightweight Python desktop application that allows you to browse images and videos from Reddit. Built with [PyQt5](https://pypi.org/project/PyQt5/), [PRAW](https://praw.readthedocs.io/en/latest/), and [vlc](https://www.olivieraubert.net/vlc/python-bindings-doc/), this app displays media content from subreddits or user profiles and offers basic moderation tools if you’re a moderator.
+A lightweight Python desktop application that allows you to browse images and videos from Reddit. Built with [PyQt5](https://pypi.org/project/PyQt5/), [PRAW](https://praw.readthedocs.io/en/latest/), and [vlc](https://www.olivieraubert.net/vlc/python-bindings-doc/), this app displays media content from subreddits or user profiles and offers basic moderation tools if you’re a moderator. Images and videos downloaded are saved locally in a cached folder for future use, preventing downloading duplicate media in the future.
 
 ## Features
 
@@ -10,6 +10,7 @@ A lightweight Python desktop application that allows you to browse images and vi
 - **Interactive Thumbnails:** Click on thumbnails to open the corresponding Reddit post in your browser.
 - **Moderator Tools:** If you have moderator privileges, approve or remove submissions directly from the app.
 - **Automatic Media Processing:** Handles image, video, GIF, and RedGIFs media URLs, including necessary workarounds for redirects and API calls.
+- **Cached Media** Images and videos downloaded are saved locally in a cache folder for future use, preventing downloading duplicate media in the future.  To clear cache you can  just delete the cache folder.
 
 ## Requirements
 
@@ -142,6 +143,19 @@ python src/red-media-browser.py
 
 - **Media Not Loading:**  
   If images or videos do not load, verify your internet connection and that the provided media URLs are accessible.
+
+
+
+## Known Issues
+
+Not all media is supported, some providers seem to require special use cases programmed.  
+
+Videos are supposed to loop playback, but that does not work.
+
+Sometimes program can crash if you change pages when videos are playing.
+
+I use this on Windows successfully, have not tested on any other Operating System.
+
 
 ## Contributing
 

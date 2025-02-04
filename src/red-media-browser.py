@@ -10,15 +10,13 @@ import webbrowser
 import requests
 import re
 import weakref
-from urllib.parse import urlparse, unquote, quote, parse_qs
+from urllib.parse import urlparse, unquote, quote, parse_qs, urljoin
 
 import praw
 import prawcore.exceptions
 import vlc
 
-# -------------------------------
 # Basic Logging Configuration
-# -------------------------------
 logger = logging.getLogger()
 if not logger.hasHandlers():
     logging.basicConfig(
@@ -27,9 +25,8 @@ if not logger.hasHandlers():
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-# -------------------------------------------------------------------------
-# PyQt6 Imports (instead of PyQt5)
-# -------------------------------------------------------------------------
+
+# PyQt6 Imports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QPushButton, QLineEdit, QWidget,
     QLabel, QTableWidget, QHeaderView, QHBoxLayout, QMessageBox, QSizePolicy
@@ -42,107 +39,21 @@ from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie, QGuiApplication
 
 
 
-
-# INITS
-moderation_statuses = {}
-
+# Import Configuration Manager
+from red_config import load_config, get_new_refresh_token, update_config_with_new_token
 
 
-# -------------------------------------------------------------------------
-# Configuration and API Initialization Helpers
-# -------------------------------------------------------------------------
-def create_config_file(config_path):
-    """
-    Creates a new config.json file with placeholder values.
-    Uses interactive prompts to allow the user to fill in the required values.
-    """
-    print("config.json not found. Let's create one with your Reddit API credentials.")
-    print("Please visit 'https://www.reddit.com/prefs/apps' to create an application if you haven't already.")
-    client_id = input("Enter Reddit client_id: ").strip()
-    client_secret = input("Enter Reddit client_secret: ").strip()
-    redirect_uri = input("Enter redirect URI [default: http://localhost:8080]: ").strip() or "http://localhost:8080"
-    print("If you already have a Reddit refresh token, enter it now. Otherwise, leave this blank.")
-    refresh_token = input("Enter Reddit refresh_token (or leave blank if you don't have one yet): ").strip()
-    user_agent = input("Enter user_agent [default: red-image-browser/1.0]: ").strip() or "red-image-browser/1.0"
-    default_subreddit = input("Enter default subreddit [default: pics]: ").strip() or "pics"
-
-    config_data = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uri": redirect_uri,
-        "refresh_token": refresh_token,
-        "user_agent": user_agent,
-        "default_subreddit": default_subreddit
-    }
-
-    try:
-        with open(config_path, 'w') as config_file:
-            json.dump(config_data, config_file, indent=4)
-        print(f"Created new configuration file at {config_path}.")
-        if not refresh_token:
-            print("Since you left the refresh token blank, the application will now guide you through obtaining one.")
-            print("When a browser window opens, log into Reddit and authorize the app using the provided redirect URI (http://localhost:8080).")
-            print("Then copy the authorization code from your browser back here when prompted.")
-            print("If you encounter any issues, please consult Reddit's OAuth2 documentation.")
-    except Exception as e:
-        logger.exception("Failed to create config.json: " + str(e))
-        sys.exit(1)
-
-def load_config(config_path):
-    """
-    Loads the configuration from config.json.
-    If the file does not exist, creates one interactively.
-    """
-    if not os.path.exists(config_path):
-        create_config_file(config_path)
-    try:
-        with open(config_path, 'r') as config_file:
-            config = json.load(config_file)
-        return config
-    except Exception as e:
-        logger.exception("Error reading configuration file: " + str(e))
-        sys.exit(1)
-
-def get_new_refresh_token(reddit, requested_scopes):
-    logger.info("Requesting new refresh token with proper scopes.")
-    auth_url = reddit.auth.url(requested_scopes, 'uniqueKey', 'permanent')
-    logger.info(f"Please visit this URL to authorize the application: {auth_url}")
-    webbrowser.open(auth_url)
-
-    redirected_url = input("After authorization, paste the full redirected URL here: ")
-
-    parsed_url = urlparse(redirected_url)
-    query_params = parse_qs(parsed_url.query)
-    auth_code = query_params.get("code", [None])[0]
-
-    if not auth_code:
-        logger.error("Authorization code not found in the provided URL.")
-        return None
-
-    try:
-        refresh_token = reddit.auth.authorize(auth_code)
-        logger.info("Successfully obtained new refresh token.")
-        return refresh_token
-    except prawcore.exceptions.PrawcoreException as e:
-        logger.error(f"Error obtaining new refresh token: {e}")
-        return None
-
-def update_config_with_new_token(config, config_path, new_token):
-    config['refresh_token'] = new_token
-    try:
-        with open(config_path, 'w') as config_file:
-            json.dump(config, config_file, indent=4)
-        logger.info("Updated config.json with new refresh token.")
-    except Exception as e:
-        logger.exception("Failed to update config.json: " + str(e))
-
-# -------------------------------------------------------------------------
 # Load Configuration and Initialize Reddit API Client
-# -------------------------------------------------------------------------
+# Use our external configuration module to load or create config.json.
 config_path = os.path.join(os.path.dirname(__file__), 'config.json')
 config = load_config(config_path)
 
 requested_scopes = ['identity', 'read', 'history', 'modconfig', 'modposts', 'mysubreddits', 'modcontributors']
+
+
+# Global dictionary for storing moderation statuses (e.g., "approved" or "removed")
+moderation_statuses = {}
+
 
 try:
     reddit = praw.Reddit(
@@ -193,12 +104,7 @@ except Exception as e:
     logger.error(f"Error initializing Reddit API client: {e}")
     sys.exit(1)
 
-
-
-
-# -------------------------------------------------------------------------
 # Helper Functions for Media URL Processing and RedGIFS
-# -------------------------------------------------------------------------
 def extract_image_urls(submission):
     """
     Given a submission, returns a list of image URLs.
@@ -382,7 +288,7 @@ def process_media_url(url):
         if domain in url:
             new_url = handler(url)
             if new_url != url:
-                logger.debug(f"Handler for {domain} modified URL to: {new_url}")
+                logger.debug(f"Handler for {domain} modified URL to: " + new_url)
                 return new_url
 
     if "reddit.com/r/redgifs/comments/" in url:
@@ -412,9 +318,7 @@ def process_media_url(url):
     logger.debug("No provider-specific processing required for: " + url)
     return url
 
-# -------------------------------------------------------------------------
 # Asynchronous Image/Video Downloader Worker (Using QThreadPool & QRunnable)
-# -------------------------------------------------------------------------
 class WorkerSignals(QObject):
     finished = pyqtSignal(str)  # Emits the downloaded file path
 
@@ -464,11 +368,12 @@ class ImageDownloadWorker(QRunnable):
             response = requests.get(url, stream=True, allow_redirects=False, headers=headers)
             redirect_count = 0
             while response.status_code in (301, 302, 303, 307, 308) and redirect_count < 5:
-                redirect_url = response.headers.get('Location')
-                if not redirect_url:
-                    break
+                redirect_location = response.headers.get('Location')
+                # Use urljoin to convert potential relative URL to an absolute one
+                redirect_url = urljoin(url, redirect_location)
                 logger.debug(f"Redirecting to {redirect_url}")
                 response = requests.get(redirect_url, stream=True, allow_redirects=False, headers=headers)
+                url = redirect_url  # Update the base URL for potential further redirects
                 redirect_count += 1
 
             ctype = response.headers.get('Content-Type', '')
@@ -486,9 +391,8 @@ class ImageDownloadWorker(QRunnable):
             logger.exception(f"Failed to download {url}: {e}")
             return None
 
-# -------------------------------------------------------------------------
-# Reddit Gallery Model and Fetcher with Paginated Pages
-# -------------------------------------------------------------------------
+
+# Reddit Gallery Model and Snapshot Fetching
 class RedditGalleryModel(QAbstractListModel):
     def __init__(self, name, is_user_mode=False, parent=None):
         """
@@ -498,15 +402,12 @@ class RedditGalleryModel(QAbstractListModel):
         super().__init__(parent)
         self.is_user_mode = is_user_mode
         self.is_moderator = False  # Default moderator status
-        self.pages = []            # List of pages, each a list of submissions
-        self.after = None          # Cursor for the next page
-        self.current_page_index = 0
+        self.snapshot = []         # Snapshot of submissions (up to 1000)
+        self.source_name = name
         if self.is_user_mode:
             self.user = reddit.redditor(name)
-            self.source_name = name
         else:
             self.subreddit = reddit.subreddit(name)
-            self.source_name = name
 
     def check_user_moderation_status(self):
         try:
@@ -528,13 +429,12 @@ class RedditGalleryModel(QAbstractListModel):
             return False
 
     def fetch_submissions(self, after=None, count=10):
+        # This method remains available for dynamic fetching if needed.
         submissions = []
         new_after = None
         try:
             if not self.is_user_mode:
-                # Calculate how many submissions we've already fetched.
-                already_fetched = sum(len(page) for page in self.pages) if self.pages else 0
-
+                already_fetched = sum(len(page) for page in self.snapshot) if self.snapshot else 0
                 params = {
                     'limit': count,
                     'raw_json': 1,
@@ -545,8 +445,7 @@ class RedditGalleryModel(QAbstractListModel):
                     params['after'] = after
                 submissions = list(self.subreddit.new(limit=count, params=params))
             else:
-                already_fetched = sum(len(page) for page in self.pages) if self.pages else 0
-
+                already_fetched = sum(len(page) for page in self.snapshot) if self.snapshot else 0
                 user_params = {
                     'limit': count,
                     'count': already_fetched
@@ -558,39 +457,40 @@ class RedditGalleryModel(QAbstractListModel):
                 new_after = submissions[-1].name
             else:
                 new_after = None
-        except prawcore.exceptions.TooManyRequests as e:
-            wait_time = int(e.response.headers.get('Retry-After', 60))
-            logger.warning(f"Rate limit exceeded. Waiting for {wait_time} seconds.")
-            time.sleep(wait_time)
-        except prawcore.exceptions.Forbidden as e:
-            if not self.is_user_mode:
-                logger.error(f"Access denied to subreddit '{self.subreddit.display_name}': {e}")
-            return [], None
-        except prawcore.exceptions.NotFound as e:
-            if not self.is_user_mode:
-                logger.error(f"Subreddit '{self.subreddit.display_name}' not found or is banned: {e}")
-            return [], None
         except Exception as e:
             logger.exception(f"Error fetching submissions: {e}")
         return submissions, new_after
 
-# QThread subclass for asynchronous fetching.
-class SubmissionFetcher(QThread):
-    submissionsFetched = pyqtSignal(list, str)
+    def fetch_snapshot(self, total=1000, after=None):
+        try:
+            params = {'raw_json': 1, 'sort': 'new'}
+            if after:
+                params['after'] = after
+            if self.is_user_mode:
+                snapshot = list(self.user.submissions.new(limit=total, params=params))
+            else:
+                snapshot = list(self.subreddit.new(limit=total, params=params))
+            # Filter out submissions that have been removed (based on our local moderation statuses)
+            snapshot = [s for s in snapshot if moderation_statuses.get(s.id) != "removed"]
+            logger.debug(f"Fetched snapshot of {len(snapshot)} submissions.")
+            return snapshot
+        except Exception as e:
+            logger.exception("Error fetching snapshot: " + str(e))
+            return []
 
-    def __init__(self, model, after=None, count=10):
+# Snapshot Fetcher (Asynchronous Fetching of the Full Snapshot)
+class SnapshotFetcher(QThread):
+    snapshotFetched = pyqtSignal(list)
+    def __init__(self, model, total=1000, after=None):
         super().__init__()
         self.model = model
+        self.total = total
         self.after = after
-        self.count = count
-
     def run(self):
-        submissions, new_after = self.model.fetch_submissions(after=self.after, count=self.count)
-        self.submissionsFetched.emit(submissions, new_after)
+        snapshot = self.model.fetch_snapshot(total=self.total, after=self.after)
+        self.snapshotFetched.emit(snapshot)
 
-# -------------------------------------------------------------------------
 # ClickableLabel for handling clicks on labels
-# -------------------------------------------------------------------------
 class ClickableLabel(QLabel):
     clicked = pyqtSignal()
 
@@ -598,9 +498,7 @@ class ClickableLabel(QLabel):
         super().mousePressEvent(event)
         self.clicked.emit()
 
-# -------------------------------------------------------------------------
 # ThumbnailWidget to Display Each Submission
-# -------------------------------------------------------------------------
 class ThumbnailWidget(QWidget):
     authorClicked = pyqtSignal(str)
 
@@ -779,7 +677,6 @@ class ThumbnailWidget(QWidget):
         self.current_video_path = abs_video_path
         logger.debug(f"VLC: Playing video from file: {abs_video_path}")
 
-        # Hide imageLabel and clean up any existing player
         if hasattr(self, 'imageLabel'):
             self.layout.removeWidget(self.imageLabel)
             self.imageLabel.hide()
@@ -884,9 +781,8 @@ class ThumbnailWidget(QWidget):
         except Exception as e:
             logger.exception(f"Unexpected error while removing submission {self.submission_id}: {e}")
 
-# -------------------------------------------------------------------------
-# Main Window and Gallery View Classes with Pagination
-# -------------------------------------------------------------------------
+
+# Main Window and Gallery View Classes with Snapshot Pagination
 class MainWindow(QMainWindow):
     def __init__(self, subreddit='pics'):
         super().__init__()
@@ -928,7 +824,6 @@ class MainWindow(QMainWindow):
         
         self.table_widget = QTableWidget(2, 5, self)
         self.table_widget.setHorizontalHeaderLabels(['A', 'B', 'C', 'D', 'E'])
-        # Updated header resize mode using PyQt6 enums.
         self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_widget.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_widget.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -937,7 +832,7 @@ class MainWindow(QMainWindow):
         nav_layout = QHBoxLayout()
         self.prev_page_button = QPushButton('Previous Page')
         self.next_page_button = QPushButton('Next Page')
-        self.download_100_button = QPushButton('Download Next 100')
+        self.download_100_button = QPushButton('Refresh Snapshot')
         nav_layout.addWidget(self.prev_page_button)
         nav_layout.addWidget(self.next_page_button)
         nav_layout.addWidget(self.download_100_button)
@@ -949,48 +844,71 @@ class MainWindow(QMainWindow):
         self.subreddit_input.returnPressed.connect(self.load_subreddit)
         self.load_user_button.clicked.connect(lambda: self.load_user_posts(self.user_input.text().strip()))
         self.prev_page_button.clicked.connect(self.load_previous_page)
-        self.next_page_button.clicked.connect(lambda: self.load_next_page(count=self.items_per_page))
-        self.download_100_button.clicked.connect(lambda: self.load_next_page(count=100, download_only=True))
+        self.next_page_button.clicked.connect(self.load_next_page)
+        self.download_100_button.clicked.connect(self.fetch_snapshot_for_model)
         
         self.model = RedditGalleryModel(subreddit)
         self.model.is_moderator = self.model.check_user_moderation_status()
         logger.debug(f"MainWindow initialized with is_moderator: {self.model.is_moderator}")
-        self.update_previous_button_state()
-
         self.setMinimumSize(800, 600)
         self.center()
         
         self.threadpool = QThreadPool()
+        self.after_cursor = None  # To track the "after" cursor for pagination
         
-        # Fetch the first page of submissions asynchronously.
-        self.fetcher = SubmissionFetcher(self.model, after=None, count=self.items_per_page)
-        self.fetcher.submissionsFetched.connect(self.on_initial_submissions_fetched)
-        self.fetcher.start()
-
+        # For snapshot mode, fetch the snapshot from the API once.
+        self.fetch_snapshot_for_model()
+    
     def update_status(self, message):
         full_message = message
-        if self.model.pages:
-            full_message = f"Page {self.model.current_page_index + 1}: " + message
+        if hasattr(self, "paginated_pages") and self.paginated_pages:
+            full_message = f"Page {self.current_page_index + 1}: " + message
         self.status_label.setText(full_message)
         logger.debug("Status updated: " + full_message)
     
+    def fetch_snapshot_for_model(self, append=False, after=None):
+        self.snapshot_fetcher = SnapshotFetcher(self.model, total=1000, after=after)
+        if append:
+            self.snapshot_fetcher.snapshotFetched.connect(self.on_snapshot_appended)
+        else:
+            self.snapshot_fetcher.snapshotFetched.connect(self.on_snapshot_fetched)
+        self.snapshot_fetcher.start()
+    
+    def on_snapshot_fetched(self, snapshot):
+        self.model.snapshot = snapshot
+        if snapshot:
+            self.after_cursor = snapshot[-1].name  # Save the cursor from the last submission
+        self.paginated_pages = [snapshot[i:i+self.items_per_page] for i in range(0, len(snapshot), self.items_per_page)]
+        self.current_page_index = 0
+        self.display_current_page_submissions_snapshot()
+        total_pages = len(self.paginated_pages)
+        self.update_status(f"Snapshot loaded. Showing page 1 of {total_pages}.")
+    
+    def on_snapshot_appended(self, snapshot):
+        if snapshot:
+            self.after_cursor = snapshot[-1].name
+            # Append the new posts to the already loaded snapshot.
+            self.model.snapshot.extend(snapshot)
+            # Recalculate the paginated pages.
+            self.paginated_pages = [self.model.snapshot[i:i+self.items_per_page] for i in range(0, len(self.model.snapshot), self.items_per_page)]
+            self.current_page_index += 1
+            self.display_current_page_submissions_snapshot()
+            self.update_status(f"Displaying snapshot page {self.current_page_index + 1} of {len(self.paginated_pages)}")
+        else:
+            self.update_status("No more older posts available.")
+    
     def load_subreddit(self):
         subreddit_name = self.subreddit_input.text()
-        self.update_status(f"Loading subreddit '{subreddit_name}'...")
+        self.update_status(f"Loading subreddit '{subreddit_name}' snapshot...")
+        self.after_cursor = None  # Reset the cursor when reloading a different subreddit
         try:
             self.model = RedditGalleryModel(subreddit_name)
             self.model.is_moderator = self.model.check_user_moderation_status()
             logger.debug(f"Moderator status for subreddit '{subreddit_name}': {self.model.is_moderator}")
-
-            self.model.pages = []
-            self.model.after = None
-            self.model.current_page_index = 0
-            self.update_previous_button_state()
+            self.paginated_pages = []
+            self.current_page_index = 0
             self.table_widget.clearContents()
-
-            self.fetcher = SubmissionFetcher(self.model, after=None, count=self.items_per_page)
-            self.fetcher.submissionsFetched.connect(self.on_initial_submissions_fetched)
-            self.fetcher.start()
+            self.fetch_snapshot_for_model()
             self.load_subreddit_button.setEnabled(True)
             self.subreddit_input.setEnabled(True)
             self.back_button.hide()
@@ -1002,9 +920,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error loading subreddit: {str(e)}")
             return
-
+    
     def load_user_posts(self, username):
         self.user_input.setText(username)
+        self.after_cursor = None  # Reset the cursor for user posts as well.
         try:
             new_model = RedditGalleryModel(username, is_user_mode=True)
             _ = new_model.user.id  
@@ -1014,155 +933,68 @@ class MainWindow(QMainWindow):
             return
 
         self.saved_subreddit_model = self.model
-        self.saved_page = self.model.current_page_index
-
-        self.update_status(f"Loading posts from user '{username}'...")
+        self.saved_page = self.current_page_index
+        self.update_status(f"Loading posts from user '{username}' snapshot...")
         self.model = new_model
-        self.model.pages = []
-        self.model.after = None
-        self.model.current_page_index = 0
+        self.model.is_moderator = self.model.check_user_moderation_status()
+        self.paginated_pages = []
+        self.current_page_index = 0
         self.table_widget.clearContents()
         self.load_subreddit_button.setEnabled(False)
         self.subreddit_input.setEnabled(False)
         self.back_button.show()
-        self.fetcher = SubmissionFetcher(self.model, after=None, count=self.items_per_page)
-        self.fetcher.submissionsFetched.connect(self.on_initial_submissions_fetched)
-        self.fetcher.start()
-
+        self.fetch_snapshot_for_model()
+    
     def load_default_subreddit(self):
         if self.saved_subreddit_model:
+            # Restore the previously saved subreddit model and page index
             self.model = self.saved_subreddit_model
-            self.model.current_page_index = self.saved_page
-            self.model.is_moderator = self.model.check_user_moderation_status()
+            self.current_page_index = self.saved_page
+            # Rebuild paginated pages using the already fetched snapshot
+            if self.model.snapshot:
+                self.paginated_pages = [
+                    self.model.snapshot[i:i+self.items_per_page] 
+                    for i in range(0, len(self.model.snapshot), self.items_per_page)
+                ]
+                self.display_current_page_submissions_snapshot()
+                self.update_status(f"Returning to subreddit '{self.model.source_name}' snapshot, page {self.current_page_index + 1}.")
+            else:
+                # If for some reason the snapshot is empty, fall back to fetching it.
+                self.fetch_snapshot_for_model()
             self.back_button.hide()
             self.load_subreddit_button.setEnabled(True)
             self.subreddit_input.setEnabled(True)
-            self.table_widget.clearContents()
-            self.display_current_page_submissions()
-            self.update_status(f"Returning to subreddit '{self.model.source_name}' on page {self.model.current_page_index + 1}.")
             self.saved_subreddit_model = None
             self.saved_page = None
         else:
             subreddit_name = self.subreddit_input.text() or default_subreddit
-            self.update_status(f"Loading subreddit '{subreddit_name}'...")
+            self.update_status(f"Loading subreddit '{subreddit_name}' snapshot...")
             self.model = RedditGalleryModel(subreddit_name)
             self.model.is_moderator = self.model.check_user_moderation_status()
-            self.model.pages = []
-            self.model.after = None
-            self.model.current_page_index = 0
-            self.table_widget.clearContents()
+            self.fetch_snapshot_for_model()
             self.load_subreddit_button.setEnabled(True)
             self.subreddit_input.setEnabled(True)
             self.back_button.hide()
-            self.fetcher = SubmissionFetcher(self.model, after=None, count=self.items_per_page)
-            self.fetcher.submissionsFetched.connect(self.on_initial_submissions_fetched)
-            self.fetcher.start()
-
+    
     def center(self):
-        # In PyQt6, QDesktopWidget is removed; we use QGuiApplication.primaryScreen()
         screen = QGuiApplication.primaryScreen()
         if screen:
             screen_geometry = screen.availableGeometry()
             frame_geometry = self.frameGeometry()
             frame_geometry.moveCenter(screen_geometry.center())
             self.move(frame_geometry.topLeft())
-
-    def on_initial_submissions_fetched(self, submissions, new_after):
-        if not submissions:
-            error_msg = f"Subreddit '{self.subreddit_input.text()}' not found or might be banned."
-            logger.error(error_msg)
-            self.update_status(error_msg)
+    
+    def display_current_page_submissions_snapshot(self):
+        if not hasattr(self, "paginated_pages") or not self.paginated_pages:
+            logger.info("No snapshot submissions to display on this page.")
             return
-        self.model.pages.append(submissions)
-        self.model.after = new_after
-        self.model.current_page_index = 0
-        self.update_previous_button_state()
-        self.display_current_page_submissions()
-        self.update_status("Submissions fetched and UI updated.")
-
-    def update_navigation_buttons(self):
-        self.prev_page_button.setEnabled(self.model.current_page_index > 0)
-
-    def load_next_page(self, count=10, download_only=False):
-        logger.debug("Next Page button clicked")
-        if download_only:
-            self.update_status("Bulk download mode: Fetching submissions (100)...")
-            after = self.model.after
-            self.bulk_fetcher = SubmissionFetcher(self.model, after=after, count=count)
-            self.bulk_fetcher.submissionsFetched.connect(
-                lambda submissions, new_after: self.on_bulk_download_fetched(submissions, new_after)
-            )
-            self.bulk_fetcher.finished.connect(lambda: setattr(self, 'bulk_fetcher', None))
-            self.bulk_fetcher.start()
-            return
-
-        if self.model.current_page_index + 1 < len(self.model.pages):
-            self.model.current_page_index += 1
-            self.display_current_page_submissions()
-            self.update_status("Submissions displayed.")
-        else:
-            self.update_status("Fetching additional submissions...")
-            self.fetcher = SubmissionFetcher(self.model, after=self.model.after, count=count)
-            self.fetcher.submissionsFetched.connect(self.on_next_page_fetched)
-            self.fetcher.start()
-
-    def load_previous_page(self):
-        logger.debug("Previous Page button clicked")
-        if self.model.current_page_index > 0:
-            self.model.current_page_index -= 1
-            self.update_navigation_buttons()
-            self.table_widget.clearContents()
-            self.display_current_page_submissions()
-            self.update_status("Switched to previous page. Submissions displayed.")
-    
-    def on_next_page_fetched(self, submissions, new_after):
-        if submissions:
-            self.model.pages.append(submissions)
-            self.model.after = new_after
-            self.model.current_page_index += 1
-        else:
-            logger.info("No new submissions fetched, reached the end?")
-        self.display_current_page_submissions()
-        self.update_status("Submissions updated.")
-    
-    def on_bulk_download_fetched(self, submissions, new_after):
-        for submission in submissions:
-            try:
-                image_urls = extract_image_urls(submission)
-                for url in image_urls:
-                    schedule_media_download(
-                        url,
-                        lambda file_path, processed_url, s=submission: self.handle_bulk_download_result(file_path, processed_url, s),
-                        pool=self.threadpool
-                    )
-            except Exception as e:
-                logger.exception(f"Error scheduling download for submission {submission.id}: {e}")
-        self.model.after = new_after
-
-    def handle_bulk_download_result(self, file_path, processed_url, submission):
-        if file_path:
-            logger.debug(f"Bulk downloaded media for submission {submission.id}: {file_path}")
-            if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                pix = QPixmap(file_path)
-                if not pix.isNull():
-                    QPixmapCache.insert(processed_url, pix)
-        else:
-            logger.error(f"Failed to bulk download media for submission {submission.id}")
-    
-    def log_download_result(self, file_path, submission):
-        if file_path:
-            logger.debug(f"Downloaded media for submission {submission.id}: {file_path}")
-        else:
-            logger.error(f"Failed to download media for submission {submission.id}")
-
-    def display_current_page_submissions(self):
         try:
-            current_page = self.model.pages[self.model.current_page_index]
+            current_page = self.paginated_pages[self.current_page_index]
         except IndexError:
             logger.info("No submissions to display on this page.")
             return
 
-        logger.debug(f"Displaying page {self.model.current_page_index + 1} with {len(current_page)} submissions.")
+        logger.debug(f"Displaying snapshot page {self.current_page_index + 1} with {len(current_page)} submissions.")
         self.table_widget.clearContents()
         row = 0
         col = 0
@@ -1194,8 +1026,33 @@ class MainWindow(QMainWindow):
 
         self.update_navigation_buttons()
     
-    def update_previous_button_state(self):
-        self.prev_page_button.setEnabled(self.model.current_page_index > 0)
+    def update_navigation_buttons(self):
+        self.prev_page_button.setEnabled(self.current_page_index > 0)
+        if hasattr(self, "paginated_pages") and self.paginated_pages:
+            self.next_page_button.setEnabled(self.current_page_index < len(self.paginated_pages) - 1)
+        else:
+            self.next_page_button.setEnabled(False)
+    
+    def load_next_page(self):
+        if hasattr(self, "paginated_pages") and self.paginated_pages:
+            if self.current_page_index + 1 < len(self.paginated_pages):
+                self.current_page_index += 1
+                self.display_current_page_submissions_snapshot()
+                self.update_status(f"Displaying snapshot page {self.current_page_index + 1} of {len(self.paginated_pages)}")
+            else:
+                # At the last page: fetch next 1000 posts if available
+                if self.after_cursor:
+                    self.update_status("Fetching older posts...")
+                    self.fetch_snapshot_for_model(append=True, after=self.after_cursor)
+                else:
+                    self.update_status("No older posts available.")
+    
+    def load_previous_page(self):
+        if hasattr(self, "paginated_pages") and self.paginated_pages:
+            if self.current_page_index > 0:
+                self.current_page_index -= 1
+                self.display_current_page_submissions_snapshot()
+                self.update_status(f"Displaying snapshot page {self.current_page_index + 1} of {len(self.paginated_pages)}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

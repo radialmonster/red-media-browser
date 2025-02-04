@@ -10,14 +10,7 @@ import webbrowser
 import requests
 import re
 import weakref
-from urllib.parse import urlparse, unquote, quote
-
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QPushButton,
-                             QLineEdit, QWidget, QLabel, QTableWidget,
-                             QHeaderView, QHBoxLayout, QMessageBox, QSizePolicy, QDesktopWidget)
-from PyQt5.QtCore import (QAbstractListModel, Qt, QModelIndex, QVariant, QSize,
-                          QThread, pyqtSignal, QThreadPool, QRunnable, pyqtSlot, QObject)
-from PyQt5.QtGui import QPixmap, QPixmapCache
+from urllib.parse import urlparse, unquote, quote, parse_qs
 
 import praw
 import prawcore.exceptions
@@ -33,6 +26,27 @@ if not logger.hasHandlers():
         format='%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
+
+# -------------------------------------------------------------------------
+# PyQt6 Imports (instead of PyQt5)
+# -------------------------------------------------------------------------
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QVBoxLayout, QPushButton, QLineEdit, QWidget,
+    QLabel, QTableWidget, QHeaderView, QHBoxLayout, QMessageBox, QSizePolicy
+)
+from PyQt6.QtCore import (
+    QAbstractListModel, Qt, QSize, QThread, pyqtSignal, QThreadPool, QRunnable,
+    pyqtSlot, QObject
+)
+from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie, QGuiApplication
+
+
+
+
+# INITS
+moderation_statuses = {}
+
+
 
 # -------------------------------------------------------------------------
 # Configuration and API Initialization Helpers
@@ -90,9 +104,6 @@ def load_config(config_path):
         sys.exit(1)
 
 def get_new_refresh_token(reddit, requested_scopes):
-    import webbrowser
-    from urllib.parse import urlparse, parse_qs
-    import prawcore
     logger.info("Requesting new refresh token with proper scopes.")
     auth_url = reddit.auth.url(requested_scopes, 'uniqueKey', 'permanent')
     logger.info(f"Please visit this URL to authorize the application: {auth_url}")
@@ -181,6 +192,9 @@ except KeyError as e:
 except Exception as e:
     logger.error(f"Error initializing Reddit API client: {e}")
     sys.exit(1)
+
+
+
 
 # -------------------------------------------------------------------------
 # Helper Functions for Media URL Processing and RedGIFS
@@ -342,7 +356,6 @@ def redgifs_image_handler(url):
         if 'text/html' in ctype.lower():
             logger.debug("Redgifs handler: received HTML, attempting extraction.")
             html_content = resp.text
-            import re
             m = re.search(
                 r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
                 html_content,
@@ -400,7 +413,7 @@ def process_media_url(url):
     return url
 
 # -------------------------------------------------------------------------
-# Asynchronous Image/Video Downloader Worker
+# Asynchronous Image/Video Downloader Worker (Using QThreadPool & QRunnable)
 # -------------------------------------------------------------------------
 class WorkerSignals(QObject):
     finished = pyqtSignal(str)  # Emits the downloaded file path
@@ -484,12 +497,9 @@ class RedditGalleryModel(QAbstractListModel):
         """
         super().__init__(parent)
         self.is_user_mode = is_user_mode
-        self.is_moderator = False  # Initialize is_moderator to a default value
-        # pages is a list where each entry is a list of submissions (one page)
-        self.pages = []
-        # after is the cursor for fetching the next page
-        self.after = None
-        # current_page_index tracks which page you’re on (0-indexed)
+        self.is_moderator = False  # Default moderator status
+        self.pages = []            # List of pages, each a list of submissions
+        self.after = None          # Cursor for the next page
         self.current_page_index = 0
         if self.is_user_mode:
             self.user = reddit.redditor(name)
@@ -518,20 +528,29 @@ class RedditGalleryModel(QAbstractListModel):
             return False
 
     def fetch_submissions(self, after=None, count=10):
-        """
-        Fetch a page of submissions from Reddit.
-        Returns a tuple (submissions, new_after).
-        """
         submissions = []
         new_after = None
         try:
             if not self.is_user_mode:
-                params = {'limit': count, 'raw_json': 1, 'sort': 'new'}
+                # Calculate how many submissions we've already fetched.
+                already_fetched = sum(len(page) for page in self.pages) if self.pages else 0
+
+                params = {
+                    'limit': count,
+                    'raw_json': 1,
+                    'sort': 'new',
+                    'count': already_fetched
+                }
                 if after:
                     params['after'] = after
                 submissions = list(self.subreddit.new(limit=count, params=params))
             else:
-                user_params = {'limit': count}
+                already_fetched = sum(len(page) for page in self.pages) if self.pages else 0
+
+                user_params = {
+                    'limit': count,
+                    'count': already_fetched
+                }
                 if after:
                     user_params['after'] = after
                 submissions = list(self.user.submissions.new(limit=count, params=user_params))
@@ -555,7 +574,7 @@ class RedditGalleryModel(QAbstractListModel):
             logger.exception(f"Error fetching submissions: {e}")
         return submissions, new_after
 
-# A QThread subclass for asynchronous fetching.
+# QThread subclass for asynchronous fetching.
 class SubmissionFetcher(QThread):
     submissionsFetched = pyqtSignal(list, str)
 
@@ -596,7 +615,7 @@ class ThumbnailWidget(QWidget):
         self.layout = QVBoxLayout(self)
 
         self.titleLabel = QLabel(title)
-        self.titleLabel.setAlignment(Qt.AlignCenter)
+        self.titleLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.titleLabel.setFixedHeight(20)
         self.layout.addWidget(self.titleLabel)
 
@@ -607,20 +626,20 @@ class ThumbnailWidget(QWidget):
             username = "unknown"
         self.authorLabel = ClickableLabel()
         self.authorLabel.setText(username)
-        self.authorLabel.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.authorLabel.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.authorLabel.setFixedHeight(20)
         self.authorLabel.clicked.connect(lambda: self.authorClicked.emit(username))
         self.infoLayout.addWidget(self.authorLabel)
 
         self.postUrlLabel = QLabel(source_url)
-        self.postUrlLabel.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.postUrlLabel.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.postUrlLabel.setFixedHeight(20)
         self.infoLayout.addWidget(self.postUrlLabel)
         self.layout.addLayout(self.infoLayout)
 
         self.imageLabel = ClickableLabel()
-        self.imageLabel.setAlignment(Qt.AlignCenter)
-        self.imageLabel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.imageLabel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self.layout.addWidget(self.imageLabel)
         self.imageLabel.clicked.connect(self.open_post_url)
 
@@ -636,17 +655,25 @@ class ThumbnailWidget(QWidget):
         if self.is_moderator:
             logger.debug("User is a moderator. Creating moderation buttons.")
             self.create_moderation_buttons()
+            self.update_moderation_status_ui()  # Apply any saved state
         else:
             logger.debug("User is not a moderator.")
 
         if self.images:
             self.load_image_async(self.images[self.current_index])
 
+    def update_moderation_status_ui(self):
+        global moderation_statuses
+        status = moderation_statuses.get(self.submission_id)
+        if status == "approved":
+            self.approve_button.setStyleSheet("background-color: green;")
+            self.approve_button.setText("Approved")
+        elif status == "removed":
+            self.remove_button.setStyleSheet("background-color: red;")
+            self.remove_button.setText("Removed")
+
     def open_post_url(self):
-        if self.post_url.startswith("/"):
-            full_url = "https://www.reddit.com" + self.post_url
-        else:
-            full_url = self.post_url
+        full_url = "https://www.reddit.com" + self.post_url if self.post_url.startswith("/") else self.post_url
         logger.debug(f"Opening browser URL: {full_url}")
         webbrowser.open(full_url)
 
@@ -702,7 +729,6 @@ class ThumbnailWidget(QWidget):
                 self.play_video(file_path)
                 return
             elif file_path.lower().endswith('.gif'):
-                from PyQt5.QtGui import QMovie
                 self.movie = QMovie(file_path)
                 self.imageLabel.setMovie(self.movie)
                 self.movie.start()
@@ -727,12 +753,12 @@ class ThumbnailWidget(QWidget):
 
     def update_pixmap(self):
         if self.pixmap and not self.pixmap.isNull():
-            scaled_pixmap = self.pixmap.scaled(self.imageLabel.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            scaled_pixmap = self.pixmap.scaled(self.imageLabel.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.imageLabel.setPixmap(scaled_pixmap)
         else:
             self.imageLabel.clear()
             self.imageLabel.setText("Image not available")
-            self.imageLabel.setAlignment(Qt.AlignCenter)
+            self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -753,7 +779,7 @@ class ThumbnailWidget(QWidget):
         self.current_video_path = abs_video_path
         logger.debug(f"VLC: Playing video from file: {abs_video_path}")
 
-        # Hide the imageLabel and clean up any existing player as before
+        # Hide imageLabel and clean up any existing player
         if hasattr(self, 'imageLabel'):
             self.layout.removeWidget(self.imageLabel)
             self.imageLabel.hide()
@@ -784,12 +810,10 @@ class ThumbnailWidget(QWidget):
         elif sys.platform.startswith('darwin'):
             self.vlc_player.set_nsobject(int(self.vlc_widget.winId()))
 
-        # Create the media and then add a looping option
         media = self.vlc_instance.media_new(abs_video_path)
-        media.add_option('input-repeat=-1')  # This option tells VLC to loop the media
+        media.add_option('input-repeat=-1')
         self.vlc_player.set_media(media)
 
-        # Attach event listeners (as before)
         event_manager = self.vlc_player.event_manager()
         event_manager.event_attach(vlc.EventType.MediaPlayerEncounteredError,
                                 lambda event: self.handle_vlc_error(no_hw))
@@ -810,7 +834,6 @@ class ThumbnailWidget(QWidget):
             self.layout.addLayout(self.moderation_layout)
 
     def on_media_end_reached(self, event):
-        """Separate method to handle media end event with logging"""
         logger.debug("VLC: MediaPlayerEndReached event triggered")
         self.restart_video()
 
@@ -842,6 +865,8 @@ class ThumbnailWidget(QWidget):
 
     def approve_submission(self):
         self.praw_submission.mod.approve()
+        global moderation_statuses
+        moderation_statuses[self.submission_id] = "approved"
         logger.debug(f"Approved: {self.submission_id}")
         self.approve_button.setStyleSheet("background-color: green;")
         self.approve_button.setText("Approved")
@@ -849,6 +874,8 @@ class ThumbnailWidget(QWidget):
     def remove_submission(self):
         try:
             self.praw_submission.mod.remove()
+            global moderation_statuses
+            moderation_statuses[self.submission_id] = "removed"
             logger.debug(f"Removed: {self.submission_id}")
             self.remove_button.setStyleSheet("background-color: red;")
             self.remove_button.setText("Removed")
@@ -864,7 +891,6 @@ class MainWindow(QMainWindow):
     def __init__(self, subreddit='pics'):
         super().__init__()
         self.setWindowTitle("Reddit Image and Video Gallery")
-        # Use items_per_page as the count for each page.
         self.items_per_page = 10
         self.central_widget = QWidget()
         self.layout = QVBoxLayout(self.central_widget)
@@ -875,6 +901,7 @@ class MainWindow(QMainWindow):
         self.saved_subreddit_model = None
         self.saved_page = None
 
+        # Input layouts for subreddit and user posts.
         input_layout = QHBoxLayout()
         subreddit_layout = QHBoxLayout()
         self.subreddit_input = QLineEdit(subreddit)
@@ -901,9 +928,10 @@ class MainWindow(QMainWindow):
         
         self.table_widget = QTableWidget(2, 5, self)
         self.table_widget.setHorizontalHeaderLabels(['A', 'B', 'C', 'D', 'E'])
-        self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_widget.verticalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_widget.setEditTriggers(QTableWidget.NoEditTriggers)
+        # Updated header resize mode using PyQt6 enums.
+        self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_widget.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_widget.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.layout.addWidget(self.table_widget)
         
         nav_layout = QHBoxLayout()
@@ -954,7 +982,6 @@ class MainWindow(QMainWindow):
             self.model.is_moderator = self.model.check_user_moderation_status()
             logger.debug(f"Moderator status for subreddit '{subreddit_name}': {self.model.is_moderator}")
 
-            # Reset pagination state
             self.model.pages = []
             self.model.after = None
             self.model.current_page_index = 0
@@ -1032,11 +1059,14 @@ class MainWindow(QMainWindow):
             self.fetcher.start()
 
     def center(self):
-        qr = self.frameGeometry()
-        cp = QDesktopWidget().availableGeometry().center()
-        qr.moveCenter(cp)
-        self.move(qr.topLeft())
-    
+        # In PyQt6, QDesktopWidget is removed; we use QGuiApplication.primaryScreen()
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            screen_geometry = screen.availableGeometry()
+            frame_geometry = self.frameGeometry()
+            frame_geometry.moveCenter(screen_geometry.center())
+            self.move(frame_geometry.topLeft())
+
     def on_initial_submissions_fetched(self, submissions, new_after):
         if not submissions:
             error_msg = f"Subreddit '{self.subreddit_input.text()}' not found or might be banned."
@@ -1058,12 +1088,10 @@ class MainWindow(QMainWindow):
         if download_only:
             self.update_status("Bulk download mode: Fetching submissions (100)...")
             after = self.model.after
-            # Store the bulk fetcher in an instance variable so it isn't garbage collected.
             self.bulk_fetcher = SubmissionFetcher(self.model, after=after, count=count)
             self.bulk_fetcher.submissionsFetched.connect(
                 lambda submissions, new_after: self.on_bulk_download_fetched(submissions, new_after)
             )
-            # Optionally, clear the reference when finished:
             self.bulk_fetcher.finished.connect(lambda: setattr(self, 'bulk_fetcher', None))
             self.bulk_fetcher.start()
             return
@@ -1085,7 +1113,7 @@ class MainWindow(QMainWindow):
             self.update_navigation_buttons()
             self.table_widget.clearContents()
             self.display_current_page_submissions()
-            self.update_status(f"Switched to previous page. Submissions displayed.")
+            self.update_status("Switched to previous page. Submissions displayed.")
     
     def on_next_page_fetched(self, submissions, new_after):
         if submissions:
@@ -1098,11 +1126,6 @@ class MainWindow(QMainWindow):
         self.update_status("Submissions updated.")
     
     def on_bulk_download_fetched(self, submissions, new_after):
-        """
-        Process submissions fetched in bulk (Download Next 100 mode). For each submission,
-        extract media URLs and schedule their download. Once downloaded, add images to the
-        in-memory QPixmapCache so that future requests for that image don’t trigger another download.
-        """
         for submission in submissions:
             try:
                 image_urls = extract_image_urls(submission)
@@ -1117,22 +1140,14 @@ class MainWindow(QMainWindow):
         self.model.after = new_after
 
     def handle_bulk_download_result(self, file_path, processed_url, submission):
-        """
-        Callback function for bulk downloads. If the file was downloaded successfully and it is an
-        image, load it into the QPixmapCache. This ensures that when a new ThumbnailWidget is created
-        later, it will find the pixmap in the in-memory cache rather than triggering a new download.
-        """
         if file_path:
             logger.debug(f"Bulk downloaded media for submission {submission.id}: {file_path}")
-            # Check if the file is an image.
             if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                from PyQt5.QtGui import QPixmap, QPixmapCache
                 pix = QPixmap(file_path)
                 if not pix.isNull():
                     QPixmapCache.insert(processed_url, pix)
         else:
             logger.error(f"Failed to bulk download media for submission {submission.id}")
-    
     
     def log_download_result(self, file_path, submission):
         if file_path:
@@ -1223,4 +1238,4 @@ if __name__ == '__main__':
     main_win.show()
     main_win.update()
     QApplication.processEvents()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

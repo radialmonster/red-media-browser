@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     QAbstractListModel, Qt, QSize, QThread, pyqtSignal, QThreadPool, QRunnable,
-    pyqtSlot, QObject
+    pyqtSlot, QObject, QTimer
 )
 from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie, QGuiApplication
 
@@ -402,7 +402,7 @@ class RedditGalleryModel(QAbstractListModel):
         super().__init__(parent)
         self.is_user_mode = is_user_mode
         self.is_moderator = False  # Default moderator status
-        self.snapshot = []         # Snapshot of submissions (up to 1000)
+        self.snapshot = []         # Snapshot of submissions (up to 100)
         self.source_name = name
         if self.is_user_mode:
             self.user = reddit.redditor(name)
@@ -461,7 +461,7 @@ class RedditGalleryModel(QAbstractListModel):
             logger.exception(f"Error fetching submissions: {e}")
         return submissions, new_after
 
-    def fetch_snapshot(self, total=1000, after=None):
+    def fetch_snapshot(self, total=100, after=None):
         try:
             params = {'raw_json': 1, 'sort': 'new'}
             if after:
@@ -481,7 +481,7 @@ class RedditGalleryModel(QAbstractListModel):
 # Snapshot Fetcher (Asynchronous Fetching of the Full Snapshot)
 class SnapshotFetcher(QThread):
     snapshotFetched = pyqtSignal(list)
-    def __init__(self, model, total=1000, after=None):
+    def __init__(self, model, total=100, after=None):
         super().__init__()
         self.model = model
         self.total = total
@@ -537,7 +537,9 @@ class ThumbnailWidget(QWidget):
 
         self.imageLabel = ClickableLabel()
         self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.imageLabel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.imageLabel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # Disable auto-scaling so that we control letterboxing via setScaledSize
+        self.imageLabel.setScaledContents(False)
         self.layout.addWidget(self.imageLabel)
         self.imageLabel.clicked.connect(self.open_post_url)
 
@@ -621,6 +623,18 @@ class ThumbnailWidget(QWidget):
             pool=QThreadPool.globalInstance()
         )
 
+    def resize_gif_first_frame(self, frame_number):
+        """
+        This slot is called for the very first frame of the GIF.
+        We update the scale and then disconnect so that subsequent frames are not re-scaled.
+        """
+        self.update_movie_scale()
+        try:
+            self.movie.frameChanged.disconnect(self.resize_gif_first_frame)
+        except Exception:
+            # In case the signal is already disconnected.
+            pass
+    
     def on_image_downloaded(self, file_path, url):
         if file_path:
             if file_path.endswith('.mp4'):
@@ -628,6 +642,8 @@ class ThumbnailWidget(QWidget):
                 return
             elif file_path.lower().endswith('.gif'):
                 self.movie = QMovie(file_path)
+                # Connect only once for the very first frame.
+                self.movie.frameChanged.connect(self.resize_gif_first_frame)
                 self.imageLabel.setMovie(self.movie)
                 self.movie.start()
                 domain = os.path.basename(os.path.dirname(file_path))
@@ -658,9 +674,50 @@ class ThumbnailWidget(QWidget):
             self.imageLabel.setText("Image not available")
             self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+    def update_movie_scale(self):
+        if self.movie:
+            # Use the current pixmap's size for a reliable natural size
+            current_pixmap = self.movie.currentPixmap()
+            if current_pixmap.isNull():
+                logger.warning("update_movie_scale: current pixmap is null.")
+                return
+            orig_width = current_pixmap.width()
+            orig_height = current_pixmap.height()
+            label_width = self.imageLabel.width()
+            label_height = self.imageLabel.height()
+            logger.debug("update_movie_scale: label dimensions: %d x %d", label_width, label_height)
+            logger.debug("update_movie_scale: original movie dimensions: %d x %d", orig_width, orig_height)
+            scale_factor = min(label_width / orig_width, label_height / orig_height)
+            new_width = int(orig_width * scale_factor)
+            new_height = int(orig_height * scale_factor)
+            new_size = QSize(new_width, new_height)
+            logger.debug("update_movie_scale: setting new scaled size: %s", new_size)
+            self.movie.setScaledSize(new_size)
+            
     def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.update_pixmap()
+       super().resizeEvent(event)
+       # Log the image label dimensions for debugging.
+       size = self.imageLabel.size()
+       logger.debug(f"resizeEvent: imageLabel size: {size.width()}x{size.height()}")
+       
+       # Update the QMovie scaling if a movie is active.
+       if hasattr(self, 'movie') and self.movie:
+           self.update_movie_scale()
+       # Otherwise, if a static image is displayed, update the pixmap scaling.
+       elif self.pixmap and not self.pixmap.isNull():
+           scaled_pixmap = self.pixmap.scaled(
+               self.imageLabel.size(),
+               Qt.AspectRatioMode.KeepAspectRatio,
+               Qt.TransformationMode.SmoothTransformation
+           )
+           self.imageLabel.setPixmap(scaled_pixmap)
+       
+       # If you’re using VLC playback, handle that as needed.
+       if hasattr(self, 'vlc_player') and self.vlc_player:
+           native_size = self.vlc_player.video_get_size(0)
+           if native_size[0] > 0 and native_size[1] > 0:
+               aspect_ratio_str = f"{native_size[0]}:{native_size[1]}"
+               self.vlc_player.video_set_aspect_ratio(aspect_ratio_str)
 
     def show_next_image(self):
         if self.images:
@@ -725,6 +782,15 @@ class ThumbnailWidget(QWidget):
 
         self.vlc_player.play()
         self.vlc_player.audio_set_mute(True)
+        # Let VLC automatically scale the video (scale 0 means “auto”)
+        self.vlc_player.video_set_scale(0)
+        
+        # Allow a brief moment for the video to start so native size becomes available.
+        time.sleep(0.1)  # Consider using a timer or signal for a robust implementation
+        native_size = self.vlc_player.video_get_size(0)
+        if native_size[0] > 0 and native_size[1] > 0:
+            aspect_ratio_str = f"{native_size[0]}:{native_size[1]}"
+            self.vlc_player.video_set_aspect_ratio(aspect_ratio_str)
 
         if self.is_moderator and hasattr(self, 'moderation_layout'):
             self.layout.removeItem(self.moderation_layout)
@@ -804,6 +870,7 @@ class MainWindow(QMainWindow):
         self.load_subreddit_button = QPushButton('Load Subreddit')
         subreddit_layout.addWidget(self.subreddit_input)
         subreddit_layout.addWidget(self.load_subreddit_button)
+        
         self.back_button = QPushButton("Back to Subreddit")
         self.back_button.clicked.connect(self.load_default_subreddit)
         self.back_button.hide()
@@ -815,6 +882,12 @@ class MainWindow(QMainWindow):
         self.load_user_button = QPushButton("Load User")
         user_layout.addWidget(self.user_input)
         user_layout.addWidget(self.load_user_button)
+                
+        # New Filter by Subreddit button for user posts view.
+        self.filter_by_subreddit_button = QPushButton("Filter by Subreddit")
+        self.filter_by_subreddit_button.clicked.connect(self.filter_user_posts)
+        self.filter_by_subreddit_button.hide()
+        subreddit_layout.addWidget(self.filter_by_subreddit_button)
         
         input_layout.addLayout(subreddit_layout)
         input_layout.addStretch()
@@ -867,7 +940,7 @@ class MainWindow(QMainWindow):
         logger.debug("Status updated: " + full_message)
     
     def fetch_snapshot_for_model(self, append=False, after=None):
-        self.snapshot_fetcher = SnapshotFetcher(self.model, total=1000, after=after)
+        self.snapshot_fetcher = SnapshotFetcher(self.model, total=100, after=after)
         if append:
             self.snapshot_fetcher.snapshotFetched.connect(self.on_snapshot_appended)
         else:
@@ -932,25 +1005,70 @@ class MainWindow(QMainWindow):
             self.update_status(f"Error: User '{username}' does not exist or cannot be loaded.")
             return
 
-        self.saved_subreddit_model = self.model
+        # Save the currently loaded subreddit model.
+        self.saved_subreddit_model = self.model  
         self.saved_page = self.current_page_index
         self.update_status(f"Loading posts from user '{username}' snapshot...")
+        
+        # Switch model to user mode.
         self.model = new_model
         self.model.is_moderator = self.model.check_user_moderation_status()
         self.paginated_pages = []
         self.current_page_index = 0
         self.table_widget.clearContents()
         self.load_subreddit_button.setEnabled(False)
-        self.subreddit_input.setEnabled(False)
+        
+        # Enable the subreddit input (for filtering) and show our added buttons.
+        self.subreddit_input.setEnabled(True)  
         self.back_button.show()
+        self.filter_by_subreddit_button.show()
+        
+        # Pre-fill the subreddit input with the subreddit you came from.
+        if self.saved_subreddit_model:
+            self.subreddit_input.setText(self.saved_subreddit_model.source_name)
         self.fetch_snapshot_for_model()
+    
+    
+    def filter_user_posts(self):
+        """
+        Filters the current user's posts to display only posts from the specified subreddit.
+        If the input is empty, it resets the filter to show all posts.
+        """
+        filter_subreddit = self.subreddit_input.text().strip()
+        if filter_subreddit == "":
+            # Reset filter: show all user posts.
+            self.paginated_pages = [
+                self.model.snapshot[i:i+self.items_per_page]
+                for i in range(0, len(self.model.snapshot), self.items_per_page)
+            ]
+            self.current_page_index = 0
+            self.display_current_page_submissions_snapshot()
+            self.update_status(f"Showing all posts by {self.model.user.name}.")
+            return
+        
+        # Filter the snapshot to only those submissions in the specified subreddit.
+        filtered_snapshot = [
+            s for s in self.model.snapshot 
+            if s.subreddit.display_name.lower() == filter_subreddit.lower()
+        ]
+        if not filtered_snapshot:
+            self.update_status(f"No posts found in subreddit r/{filter_subreddit} by user {self.model.user.name}.")
+        else:
+            self.paginated_pages = [
+                filtered_snapshot[i:i+self.items_per_page]
+                for i in range(0, len(filtered_snapshot), self.items_per_page)
+            ]
+            self.current_page_index = 0
+            self.display_current_page_submissions_snapshot()
+            self.update_status(f"Filtered posts for user {self.model.user.name} in subreddit r/{filter_subreddit}.")
+    
     
     def load_default_subreddit(self):
         if self.saved_subreddit_model:
-            # Restore the previously saved subreddit model and page index
+            # Restore the previously saved subreddit model and page index.
             self.model = self.saved_subreddit_model
             self.current_page_index = self.saved_page
-            # Rebuild paginated pages using the already fetched snapshot
+            # Rebuild paginated pages using the already fetched snapshot.
             if self.model.snapshot:
                 self.paginated_pages = [
                     self.model.snapshot[i:i+self.items_per_page] 
@@ -959,9 +1077,9 @@ class MainWindow(QMainWindow):
                 self.display_current_page_submissions_snapshot()
                 self.update_status(f"Returning to subreddit '{self.model.source_name}' snapshot, page {self.current_page_index + 1}.")
             else:
-                # If for some reason the snapshot is empty, fall back to fetching it.
                 self.fetch_snapshot_for_model()
             self.back_button.hide()
+            self.filter_by_subreddit_button.hide()  # Hide filter button in subreddit view.
             self.load_subreddit_button.setEnabled(True)
             self.subreddit_input.setEnabled(True)
             self.saved_subreddit_model = None
@@ -975,6 +1093,7 @@ class MainWindow(QMainWindow):
             self.load_subreddit_button.setEnabled(True)
             self.subreddit_input.setEnabled(True)
             self.back_button.hide()
+            self.filter_by_subreddit_button.hide()
     
     def center(self):
         screen = QGuiApplication.primaryScreen()
@@ -1040,7 +1159,7 @@ class MainWindow(QMainWindow):
                 self.display_current_page_submissions_snapshot()
                 self.update_status(f"Displaying snapshot page {self.current_page_index + 1} of {len(self.paginated_pages)}")
             else:
-                # At the last page: fetch next 1000 posts if available
+                # At the last page: fetch next 100 posts if available
                 if self.after_cursor:
                     self.update_status("Fetching older posts...")
                     self.fetch_snapshot_for_model(append=True, after=self.after_cursor)

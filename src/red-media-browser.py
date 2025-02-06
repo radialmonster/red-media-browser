@@ -1108,6 +1108,9 @@ class MainWindow(QMainWindow):
         if self.saved_subreddit_model:
             self.subreddit_input.setText(self.saved_subreddit_model.source_name)
         self.fetch_snapshot_for_model()
+
+        # Update ban button visibility and text for the new user.
+        self.update_ban_button_visibility()
     
     
     def filter_user_posts(self):

@@ -29,7 +29,7 @@ if not logger.hasHandlers():
 # PyQt6 Imports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QPushButton, QLineEdit, QWidget,
-    QLabel, QTableWidget, QHeaderView, QHBoxLayout, QMessageBox, QSizePolicy
+    QLabel, QTableWidget, QHeaderView, QHBoxLayout, QMessageBox, QSizePolicy, QInputDialog, QDialog
 )
 from PyQt6.QtCore import (
     QAbstractListModel, Qt, QSize, QThread, pyqtSignal, QThreadPool, QRunnable,
@@ -617,12 +617,29 @@ class ThumbnailWidget(QWidget):
             self.update_pixmap()
             return
 
+        import weakref
         weak_self = weakref.ref(self)
-        schedule_media_download(url,
-            lambda file_path, purl, weak_self=weak_self: weak_self() is not None and weak_self().on_image_downloaded(file_path, purl),
+
+        def safe_on_image_downloaded(file_path, purl):
+            widget = weak_self()
+            if widget is None:
+                # The widget has been garbage collected.
+                return
+            try:
+                widget.on_image_downloaded(file_path, purl)
+            except RuntimeError as e:
+                # Catch errors caused by the underlying C++ object being deleted.
+                print("Caught RuntimeError in safe_on_image_downloaded:", e)
+
+        schedule_media_download(
+            url,
+            safe_on_image_downloaded,
             pool=QThreadPool.globalInstance()
         )
-
+    #------ safe on image downloaded above is tabbed under def load image async
+    
+    
+    
     def resize_gif_first_frame(self, frame_number):
         """
         This slot is called for the very first frame of the GIF.
@@ -848,6 +865,60 @@ class ThumbnailWidget(QWidget):
             logger.exception(f"Unexpected error while removing submission {self.submission_id}: {e}")
 
 
+
+class BanUserDialog(QDialog):
+    def __init__(self, username, subreddit, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Ban User")
+        self.result = None  # Will be "share" or "private"
+        self.reason = ""
+        
+        # Main layout
+        layout = QVBoxLayout(self)
+        
+        # Instruction label
+        label = QLabel(f"Enter the reason for banning {username} from r/{subreddit}:", self)
+        layout.addWidget(label)
+        
+        # Ban reason input
+        self.reason_input = QLineEdit(self)
+        layout.addWidget(self.reason_input)
+        
+        # Buttons layout
+        button_layout = QHBoxLayout()
+        self.share_button = QPushButton("Ban and Share Reason with User", self)
+        self.private_button = QPushButton("Ban and Set Private Reason", self)
+        self.cancel_button = QPushButton("Cancel", self)
+        
+        button_layout.addWidget(self.share_button)
+        button_layout.addWidget(self.private_button)
+        button_layout.addWidget(self.cancel_button)
+        layout.addLayout(button_layout)
+        
+        # Connections
+        self.share_button.clicked.connect(self.share_clicked)
+        self.private_button.clicked.connect(self.private_clicked)
+        self.cancel_button.clicked.connect(self.reject)  # Simply close dialog
+        
+    def share_clicked(self):
+        text = self.reason_input.text().strip()
+        if not text:
+            QMessageBox.warning(self, "Warning", "You must enter a ban reason.")
+            return
+        self.reason = text
+        self.result = "share"
+        self.accept()
+    
+    def private_clicked(self):
+        text = self.reason_input.text().strip()
+        if not text:
+            QMessageBox.warning(self, "Warning", "You must enter a ban reason.")
+            return
+        self.reason = text
+        self.result = "private"
+        self.accept()
+
+
 # Main Window and Gallery View Classes with Snapshot Pagination
 class MainWindow(QMainWindow):
     def __init__(self, subreddit='pics'):
@@ -867,6 +938,7 @@ class MainWindow(QMainWindow):
         input_layout = QHBoxLayout()
         subreddit_layout = QHBoxLayout()
         self.subreddit_input = QLineEdit(subreddit)
+        self.subreddit_input.textChanged.connect(lambda: self.update_ban_button_visibility() if self.saved_subreddit_model else None)
         self.load_subreddit_button = QPushButton('Load Subreddit')
         subreddit_layout.addWidget(self.subreddit_input)
         subreddit_layout.addWidget(self.load_subreddit_button)
@@ -888,6 +960,15 @@ class MainWindow(QMainWindow):
         self.filter_by_subreddit_button.clicked.connect(self.filter_user_posts)
         self.filter_by_subreddit_button.hide()
         subreddit_layout.addWidget(self.filter_by_subreddit_button)
+
+        # Ban button; it will be visible only in user mode when filtering by a subreddit 
+        # and if you are a moderator of that subreddit.
+        self.ban_user_button = QPushButton()
+        self.ban_user_button.clicked.connect(self.ban_user)
+        self.ban_user_button.hide()
+        subreddit_layout.addWidget(self.ban_user_button)
+
+
         
         input_layout.addLayout(subreddit_layout)
         input_layout.addStretch()
@@ -1044,8 +1125,9 @@ class MainWindow(QMainWindow):
             self.current_page_index = 0
             self.display_current_page_submissions_snapshot()
             self.update_status(f"Showing all posts by {self.model.user.name}.")
+            self.ban_user_button.hide()  # Hide the ban button when no filter is set.
             return
-        
+
         # Filter the snapshot to only those submissions in the specified subreddit.
         filtered_snapshot = [
             s for s in self.model.snapshot 
@@ -1061,6 +1143,58 @@ class MainWindow(QMainWindow):
             self.current_page_index = 0
             self.display_current_page_submissions_snapshot()
             self.update_status(f"Filtered posts for user {self.model.user.name} in subreddit r/{filter_subreddit}.")
+        
+        # Update the ban button visibility since we are in user mode with a filter.
+        self.update_ban_button_visibility()
+
+
+    def update_ban_button_visibility(self):
+        """
+        Show the ban button only when:
+        - We are in user mode (i.e. a saved_subreddit_model exists)
+        - The saved subreddit model indicates the current account is a moderator
+        - A subreddit filter is applied (i.e. the subreddit_input text is nonempty)
+        """
+        if self.saved_subreddit_model and self.saved_subreddit_model.is_moderator:
+            filter_subreddit = self.subreddit_input.text().strip()
+            if filter_subreddit:
+                self.ban_user_button.setText(f"Ban {self.model.user.name} from r/{filter_subreddit}")
+                self.ban_user_button.show()
+                # Re-enable the ban button for the new user view.
+                self.ban_user_button.setEnabled(True)
+            else:
+                self.ban_user_button.hide()
+        else:
+            self.ban_user_button.hide()
+
+    def ban_user(self):
+        """
+        Uses the Reddit API to ban the user from the filtered subreddit,
+        after prompting for a ban reason and letting the moderator choose
+        to share the reason with the user or keep it private (or cancel the operation).
+        """
+        filter_subreddit = self.subreddit_input.text().strip()
+        username = self.model.user.name
+
+        # Create and show the custom ban dialog
+        dialog = BanUserDialog(username, filter_subreddit, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            ban_reason = dialog.reason
+            action = dialog.result  # "share" or "private"
+            try:
+                target_subreddit = reddit.subreddit(filter_subreddit)
+                if action == "share":
+                    target_subreddit.banned.add(username, ban_reason=ban_reason, ban_message=ban_reason, note=ban_reason)
+                elif action == "private":
+                    target_subreddit.banned.add(username, ban_reason=ban_reason, note=ban_reason)
+                QMessageBox.information(self, "User Banned", f"{username} has been banned from r/{filter_subreddit}.")
+                self.ban_user_button.setEnabled(False)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to ban {username} from r/{filter_subreddit}.\nError: {str(e)}")
+        else:
+            # Dialog was canceled – no further action is taken.
+            return
+
     
     
     def load_default_subreddit(self):

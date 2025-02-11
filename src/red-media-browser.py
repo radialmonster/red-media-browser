@@ -746,6 +746,17 @@ class ThumbnailWidget(QWidget):
             self.current_index = (self.current_index - 1) % len(self.images)
             self.load_image_async(self.images[self.current_index])
 
+
+    def attach_vlc_event_handlers(self, no_hw):
+        # Only attach basic logging events; custom restart/looping logic removed.
+        event_manager = self.vlc_player.event_manager()
+        event_manager.event_attach(vlc.EventType.MediaPlayerPlaying,
+                                   lambda event: logger.debug("VLC: Media started playing"))
+        event_manager.event_attach(vlc.EventType.MediaPlayerPaused,
+                                   lambda event: logger.debug("VLC: Media paused"))
+        event_manager.event_attach(vlc.EventType.MediaPlayerStopped,
+                                   lambda event: logger.debug("VLC: Media stopped"))
+
     def play_video(self, video_url, no_hw=False):
         abs_video_path = os.path.abspath(video_url)
         self.current_video_path = abs_video_path
@@ -762,11 +773,9 @@ class ThumbnailWidget(QWidget):
             self.vlc_widget.deleteLater()
             del self.vlc_player
 
-        self.restart_attempts = 0
-
-        instance_args = (['--vout=directx', '--no-video-title-show', '--input-repeat=-1', '--verbose=0']
+        instance_args = (['--loop', '--vout=directx', '--no-video-title-show', '--verbose=0']
                         if not no_hw else
-                        ['--no-hw-decoding', '--vout=directx', '--no-video-title-show', '--input-repeat=-1', '--verbose=0'])
+                        ['--loop', '--no-hw-decoding', '--vout=directx', '--no-video-title-show', '--verbose=0'])
         logger.debug(f"VLC: Creating instance with args: {instance_args}")
         self.vlc_instance = vlc.Instance(*instance_args)
         self.vlc_player = self.vlc_instance.media_player_new()
@@ -782,28 +791,17 @@ class ThumbnailWidget(QWidget):
             self.vlc_player.set_nsobject(int(self.vlc_widget.winId()))
 
         media = self.vlc_instance.media_new(abs_video_path)
-        media.add_option('input-repeat=-1')
+        # Removed auto-repeat option to avoid conflict:
+        # media.add_option('input-repeat=-1')
         self.vlc_player.set_media(media)
 
-        event_manager = self.vlc_player.event_manager()
-        event_manager.event_attach(vlc.EventType.MediaPlayerEncounteredError,
-                                lambda event: self.handle_vlc_error(no_hw))
-        event_manager.event_attach(vlc.EventType.MediaPlayerEndReached,
-                                self.on_media_end_reached)
-        event_manager.event_attach(vlc.EventType.MediaPlayerPlaying,
-                                lambda event: logger.debug("VLC: Media started playing"))
-        event_manager.event_attach(vlc.EventType.MediaPlayerPaused,
-                                lambda event: logger.debug("VLC: Media paused"))
-        event_manager.event_attach(vlc.EventType.MediaPlayerStopped,
-                                lambda event: logger.debug("VLC: Media stopped"))
+        # (Custom event handlers for restarting/looping have been removed)
 
         self.vlc_player.play()
         self.vlc_player.audio_set_mute(True)
-        # Let VLC automatically scale the video (scale 0 means “auto”)
         self.vlc_player.video_set_scale(0)
-        
-        # Allow a brief moment for the video to start so native size becomes available.
-        time.sleep(0.1)  # Consider using a timer or signal for a robust implementation
+
+        time.sleep(0.1)  # Consider non-blocking timer
         native_size = self.vlc_player.video_get_size(0)
         if native_size[0] > 0 and native_size[1] > 0:
             aspect_ratio_str = f"{native_size[0]}:{native_size[1]}"
@@ -812,36 +810,6 @@ class ThumbnailWidget(QWidget):
         if self.is_moderator and hasattr(self, 'moderation_layout'):
             self.layout.removeItem(self.moderation_layout)
             self.layout.addLayout(self.moderation_layout)
-
-    def on_media_end_reached(self, event):
-        logger.debug("VLC: MediaPlayerEndReached event triggered")
-        self.restart_video()
-
-    def restart_video(self):
-        logger.debug("VLC: Attempting to restart video playback...")
-        if not hasattr(self, 'restart_attempts'):
-            self.restart_attempts = 0
-        self.restart_attempts += 1
-
-        if self.restart_attempts > 3:
-            logger.error("VLC: Too many playback restart attempts; stopping video playback.")
-            return
-
-        if hasattr(self, 'vlc_player'):
-            logger.debug("VLC: Resetting position to 0 and playing")
-            self.vlc_player.set_position(0)
-            self.vlc_player.play()
-            logger.debug(f"VLC: Player state after restart: {self.vlc_player.get_state()}")
-        else:
-            logger.error("VLC: No vlc_player instance found during restart attempt")
-
-    def handle_vlc_error(self, current_no_hw):
-        logger.error("VLC encountered an error during playback.")
-        if not current_no_hw:
-            logger.debug("Retrying video playback without hardware acceleration.")
-            self.play_video(self.current_video_path, no_hw=True)
-        else:
-            logger.error("Playback failed even without hardware acceleration.")
 
     def approve_submission(self):
         self.praw_submission.mod.approve()
@@ -1040,11 +1008,19 @@ class MainWindow(QMainWindow):
     
     def on_snapshot_appended(self, snapshot):
         if snapshot:
-            self.after_cursor = snapshot[-1].name
+            new_after = snapshot[-1].name if snapshot[-1].name else None
+            logger.debug(f"Fetched {len(snapshot)} new posts. New after_cursor: {new_after}")
+            if new_after and new_after != self.after_cursor:
+                self.after_cursor = new_after
+            else:
+                logger.warning("after_cursor unchanged; API may have returned duplicate or no new posts.")
             # Append the new posts to the already loaded snapshot.
             self.model.snapshot.extend(snapshot)
             # Recalculate the paginated pages.
-            self.paginated_pages = [self.model.snapshot[i:i+self.items_per_page] for i in range(0, len(self.model.snapshot), self.items_per_page)]
+            self.paginated_pages = [
+                self.model.snapshot[i:i + self.items_per_page]
+                for i in range(0, len(self.model.snapshot), self.items_per_page)
+            ]
             self.current_page_index += 1
             self.display_current_page_submissions_snapshot()
             self.update_status(f"Displaying snapshot page {self.current_page_index + 1} of {len(self.paginated_pages)}")

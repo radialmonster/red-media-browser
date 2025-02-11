@@ -1010,10 +1010,8 @@ class MainWindow(QMainWindow):
         if snapshot:
             new_after = snapshot[-1].name if snapshot[-1].name else None
             logger.debug(f"Fetched {len(snapshot)} new posts. New after_cursor: {new_after}")
-            if new_after and new_after != self.after_cursor:
-                self.after_cursor = new_after
-            else:
-                logger.warning("after_cursor unchanged; API may have returned duplicate or no new posts.")
+            # Always update after_cursor, regardless of equality.
+            self.after_cursor = new_after
             # Append the new posts to the already loaded snapshot.
             self.model.snapshot.extend(snapshot)
             # Recalculate the paginated pages.
@@ -1261,7 +1259,11 @@ class MainWindow(QMainWindow):
     def update_navigation_buttons(self):
         self.prev_page_button.setEnabled(self.current_page_index > 0)
         if hasattr(self, "paginated_pages") and self.paginated_pages:
-            self.next_page_button.setEnabled(self.current_page_index < len(self.paginated_pages) - 1)
+            # Enable next page if there is another page OR an after_cursor is available for fetching more posts.
+            if self.current_page_index < len(self.paginated_pages) - 1 or self.after_cursor:
+                self.next_page_button.setEnabled(True)
+            else:
+                self.next_page_button.setEnabled(False)
         else:
             self.next_page_button.setEnabled(False)
     

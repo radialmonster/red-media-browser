@@ -48,7 +48,7 @@ from red_config import load_config, get_new_refresh_token, update_config_with_ne
 config_path = os.path.join(os.path.dirname(__file__), 'config.json')
 config = load_config(config_path)
 
-requested_scopes = ['identity', 'read', 'history', 'modconfig', 'modposts', 'mysubreddits', 'modcontributors']
+requested_scopes = ['identity', 'read', 'history', 'modconfig', 'modposts', 'mysubreddits', 'modcontributors','modlog']
 
 
 # Global dictionary for storing moderation statuses (e.g., "approved" or "removed")
@@ -429,22 +429,10 @@ class RedditGalleryModel(QAbstractListModel):
             return False
 
     def fetch_submissions(self, after=None, count=10):
-        # This method remains available for dynamic fetching if needed.
         submissions = []
         new_after = None
         try:
-            if not self.is_user_mode:
-                already_fetched = sum(len(page) for page in self.snapshot) if self.snapshot else 0
-                params = {
-                    'limit': count,
-                    'raw_json': 1,
-                    'sort': 'new',
-                    'count': already_fetched
-                }
-                if after:
-                    params['after'] = after
-                submissions = list(self.subreddit.new(limit=count, params=params))
-            else:
+            if self.is_user_mode:
                 already_fetched = sum(len(page) for page in self.snapshot) if self.snapshot else 0
                 user_params = {
                     'limit': count,
@@ -453,6 +441,39 @@ class RedditGalleryModel(QAbstractListModel):
                 if after:
                     user_params['after'] = after
                 submissions = list(self.user.submissions.new(limit=count, params=user_params))
+            else:
+                if self.is_moderator:
+                    already_fetched = sum(len(page) for page in self.snapshot) if self.snapshot else 0
+                    params = {
+                        'limit': count,
+                        'raw_json': 1,
+                        'sort': 'new',
+                        'count': already_fetched
+                    }
+                    if after:
+                        params['after'] = after
+                    # Fetch new submissions and modqueue submissions
+                    new_subs = list(self.subreddit.new(limit=count, params=params))
+                    mod_subs = list(self.subreddit.mod.modqueue(limit=count))
+                    # Fetch removed submissions from the mod log (using removelink action)
+                    mod_log_entries = list(self.subreddit.mod.log(action="removelink", limit=count))
+                    removed_fullnames = {entry.target_fullname for entry in mod_log_entries if entry.target_fullname.startswith("t3_")}
+                    removed_subs = list(reddit.info(fullnames=list(removed_fullnames)))
+                    # Merge submissions by unique id
+                    merged = {s.id: s for s in new_subs + mod_subs + removed_subs}
+                    submissions = list(merged.values())
+                    submissions.sort(key=lambda s: s.created_utc, reverse=True)
+                else:
+                    already_fetched = sum(len(page) for page in self.snapshot) if self.snapshot else 0
+                    params = {
+                        'limit': count,
+                        'raw_json': 1,
+                        'sort': 'new',
+                        'count': already_fetched
+                    }
+                    if after:
+                        params['after'] = after
+                    submissions = list(self.subreddit.new(limit=count, params=params))
             if submissions:
                 new_after = submissions[-1].name
             else:
@@ -469,9 +490,27 @@ class RedditGalleryModel(QAbstractListModel):
             if self.is_user_mode:
                 snapshot = list(self.user.submissions.new(limit=total, params=params))
             else:
-                snapshot = list(self.subreddit.new(limit=total, params=params))
-            # Filter out submissions that have been removed (based on our local moderation statuses)
-            snapshot = [s for s in snapshot if moderation_statuses.get(s.id) != "removed"]
+                if self.is_moderator:
+                    # Fetch new submissions, modqueue submissions, and removed submissions from mod log
+                    new_subs = list(self.subreddit.new(limit=total, params=params))
+                    mod_subs = list(self.subreddit.mod.modqueue(limit=total))
+                    mod_log_entries = list(self.subreddit.mod.log(action="removelink", limit=total))
+                    removed_fullnames = {entry.target_fullname for entry in mod_log_entries if entry.target_fullname.startswith("t3_")}
+                    removed_subs = list(reddit.info(fullnames=list(removed_fullnames)))
+                    
+                    # Mark submissions as removed in our moderation_statuses dictionary.
+                    for sub in removed_subs:
+                        moderation_statuses[sub.id] = "removed"
+                    
+                    merged = {s.id: s for s in new_subs + mod_subs + removed_subs}
+                    snapshot = list(merged.values())
+                    snapshot.sort(key=lambda s: s.created_utc, reverse=True)
+                    # Filter out objects without a title (e.g. comments)
+                    snapshot = [s for s in snapshot if hasattr(s, 'title')]
+                else:
+                    snapshot = list(self.subreddit.new(limit=total, params=params))
+                    # Ensure removed posts are not shown in non-mod view
+                    snapshot = [s for s in snapshot if moderation_statuses.get(s.id) != "removed"]
             logger.debug(f"Fetched snapshot of {len(snapshot)} submissions.")
             return snapshot
         except Exception as e:

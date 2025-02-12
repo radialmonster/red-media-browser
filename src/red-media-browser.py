@@ -512,10 +512,12 @@ class ThumbnailWidget(QWidget):
         self.post_url = post_url
         self.layout = QVBoxLayout(self)
 
-        self.titleLabel = QLabel(title)
+        self.titleLabel = ClickableLabel()
+        self.titleLabel.setText(title)
         self.titleLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.titleLabel.setFixedHeight(20)
         self.layout.addWidget(self.titleLabel)
+        self.titleLabel.clicked.connect(self.open_post_url)
 
         self.infoLayout = QHBoxLayout()
         try:

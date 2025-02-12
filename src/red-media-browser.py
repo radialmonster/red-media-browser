@@ -543,7 +543,7 @@ class ThumbnailWidget(QWidget):
         # Disable auto-scaling so that we control letterboxing via setScaledSize
         self.imageLabel.setScaledContents(False)
         self.layout.addWidget(self.imageLabel)
-        self.imageLabel.clicked.connect(self.open_post_url)
+        self.imageLabel.clicked.connect(self.open_fullscreen_view)
 
         self.has_multiple_images = has_multiple_images
         if self.has_multiple_images:
@@ -578,6 +578,22 @@ class ThumbnailWidget(QWidget):
         full_url = "https://www.reddit.com" + self.post_url if self.post_url.startswith("/") else self.post_url
         logger.debug(f"Opening browser URL: {full_url}")
         webbrowser.open(full_url)
+
+
+    def open_fullscreen_view(self):
+        logger.debug("open_fullscreen_view triggered.")
+        if hasattr(self, 'movie') and self.movie:
+            logger.debug("FullScreenViewer will use QMovie.")
+            viewer = FullScreenViewer(movie=self.movie)
+        elif self.pixmap and not self.pixmap.isNull():
+            logger.debug("FullScreenViewer will use QPixmap.")
+            viewer = FullScreenViewer(pixmap=self.pixmap)
+        else:
+            logger.debug("No valid media (movie/pixmap) available for full screen view.")
+            return  # No media available; do nothing.
+        # Keep a reference so viewer isn’t garbage collected.
+        self.fullscreen_viewer = viewer
+        viewer.showFullScreen()
 
     def create_moderation_buttons(self):
         logger.debug("Creating moderation buttons.")
@@ -1289,6 +1305,42 @@ class MainWindow(QMainWindow):
                 self.current_page_index -= 1
                 self.display_current_page_submissions_snapshot()
                 self.update_status(f"Displaying snapshot page {self.current_page_index + 1} of {len(self.paginated_pages)}")
+
+
+class FullScreenViewer(QDialog):
+    def __init__(self, pixmap=None, movie=None, parent=None):
+        super().__init__(parent)
+        self.pixmap = pixmap
+        self.movie = movie
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)  # Updated flags
+        self.setStyleSheet("background-color: black;")
+        self.label = QLabel(self)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.label)
+        if self.movie:
+            self.label.setMovie(self.movie)
+            self.movie.start()
+        elif self.pixmap:
+            self.label.setPixmap(self.pixmap.scaled(
+                QGuiApplication.primaryScreen().availableGeometry().size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+    
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+    
+    def mousePressEvent(self, event):
+        self.close()
+        super().mousePressEvent(event)
+
+
+
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

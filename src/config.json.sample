@@ -1,7 +1,8 @@
-    "client_id": "abcd",
-    "client_secret": "abcd",
+{
+    "client_id": "xxxxxxxxxxxxxxxxxx",
+    "client_secret": "xxxxxxxxxxxxxxxxxxx",
     "redirect_uri": "http://localhost:8080",
-    "refresh_token": "abcd",
-    "user_agent": "Red Media Browser",
+    "refresh_token": "xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "user_agent": "red-image-browser/1.0",
     "default_subreddit": "pics"
 }

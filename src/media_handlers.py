@@ -50,7 +50,7 @@ def extract_redgifs_url_from_reddit(json_data):
             
         # Try to extract from secure_media or media
         secure_media = post_data.get("secure_media") or post_data.get("media")
-        if secure_media and "oembed" in secure_media:
+        if (secure_media and "oembed" in secure_media):
             oembed_data = secure_media["oembed"]
             
             # Try to extract from thumbnail_url
@@ -281,15 +281,25 @@ def get_redgifs_mp4_url(url):
 def redgifs_image_handler(url):
     """
     Special handling for i.redgifs.com image URLs.
+    Preserves the file extension for proper media type detection.
     """
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         "Referer": "https://redgifs.com/",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
+    
+    # Get file extension from original URL (preserve it for type detection)
+    ext = os.path.splitext(url.lower())[1]
+    is_image_extension = ext in ['.jpg', '.jpeg', '.png', '.webp']
+    
     try:
         resp = requests.get(url, stream=True, allow_redirects=True, headers=headers, timeout=10)
         ctype = resp.headers.get('Content-Type', '')
+        
+        # If content-type confirms it's an image, ensure we preserve that information
+        is_image_content = 'image/' in ctype.lower()
+        
         if 'text/html' in ctype.lower():
             logger.debug("Redgifs handler: received HTML, attempting extraction.")
             html_content = resp.text
@@ -301,11 +311,23 @@ def redgifs_image_handler(url):
             if m:
                 extracted_url = m.group(1)
                 logger.debug(f"Redgifs handler: extracted image URL: {extracted_url}")
+                
+                # Preserve the image extension if we had one originally
+                if is_image_extension and not any(extracted_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                    logger.debug(f"Preserving original image extension: {ext}")
+                    extracted_url = f"{extracted_url}{ext}"
+                
                 return extracted_url
             else:
                 logger.error("Redgifs handler: No og:image tag found.")
+        elif is_image_content:
+            # It's already an image and content type confirms it - keep URL as is
+            logger.debug(f"Redgifs handler: URL confirmed as image via content-type: {ctype}")
+            return url
     except Exception as e:
         logger.exception(f"Redgifs handler exception: {e}")
+    
+    # Return original URL as fallback
     return url
 
 # Register the RedGIFs handler
@@ -572,13 +594,41 @@ class MediaDownloadWorker(QRunnable):
             
             # Special handling for RedGIFs content
             if "redgifs.com" in url:
-                # Force .mp4 extension
-                if not cache_path.lower().endswith('.mp4'):
+                # Check content type to determine if it's an image or video
+                content_type = response.headers.get('Content-Type', '').lower()
+                ext = os.path.splitext(url.lower())[1]
+                
+                if 'image/' in content_type or ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                    # For images, make sure we preserve the image extension
+                    logger.debug(f"RedGifs image detected, preserving extension: {ext}")
+                    
+                    # If no extension or wrong extension, try to get correct one from content-type
+                    if not ext or ext == '.mp4':
+                        if 'image/jpeg' in content_type:
+                            ext = '.jpg'
+                        elif 'image/png' in content_type:
+                            ext = '.png'
+                        elif 'image/webp' in content_type:
+                            ext = '.webp'
+                        else:
+                            ext = '.jpg'  # Default to jpg
+                        
+                        # Rename the file with the correct extension
+                        base_path = os.path.splitext(cache_path)[0]
+                        new_cache_path = base_path + ext
+                        try:
+                            shutil.move(cache_path, new_cache_path)
+                            cache_path = new_cache_path
+                            logger.debug(f"Renamed RedGifs image file to use correct extension: {cache_path}")
+                        except Exception as e:
+                            logger.error(f"Error renaming file to use correct extension: {e}")
+                elif not cache_path.lower().endswith('.mp4'):
+                    # For videos, force .mp4 extension
                     new_cache_path = cache_path + ".mp4"
                     try:
                         shutil.move(cache_path, new_cache_path)
                         cache_path = new_cache_path
-                        logger.debug(f"Renamed RedGIFs file to ensure .mp4 extension: {cache_path}")
+                        logger.debug(f"Renamed RedGifs file to ensure .mp4 extension: {cache_path}")
                     except Exception as e:
                         logger.error(f"Error renaming file to add .mp4 extension: {e}")
             

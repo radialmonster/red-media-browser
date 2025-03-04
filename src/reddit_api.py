@@ -249,6 +249,14 @@ def remove_submission(submission):
     except prawcore.exceptions.Forbidden:
         logger.error(f"Forbidden: You do not have permission to remove submission {submission.id}")
         return False
+    except prawcore.exceptions.RequestException as e:
+        if "ConnectTimeout" in str(e) or "ConnectionError" in str(e):
+            logger.error(f"Network connection error while removing submission {submission.id}: {e}")
+            # Still mark as "removal_pending" so the UI can show appropriate state
+            moderation_statuses[submission.id] = "removal_pending"
+        else:
+            logger.error(f"API request error while removing submission {submission.id}: {e}")
+        return False
     except Exception as e:
         logger.exception(f"Unexpected error while removing submission {submission.id}: {e}")
         return False

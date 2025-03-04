@@ -101,11 +101,19 @@ def is_animated_image(file_path):
 
 def get_media_type(file_path):
     """Determine the media type of a file."""
-    # Special case for RedGifs videos - they should always be treated as videos
+    # Special case for RedGifs content - check extension first
     if 'redgifs.com' in file_path.lower():
-        # All RedGifs content should be treated as video regardless of extension
-        logger.debug(f"RedGifs media forced to be detected as video: {file_path}")
-        return "video"
+        # Check file extension to determine if it's an image or video
+        ext = os.path.splitext(file_path.lower())[1]
+        if ext in ['.jpg', '.jpeg', '.png', '.webp']:
+            logger.debug(f"RedGifs image detected: {file_path}")
+            return "image"
+        elif ext in ['.gif']:
+            logger.debug(f"RedGifs animated image detected: {file_path}")
+            return "animated_image"
+        elif ext in ['.mp4', '.webm', '']:  # Empty extension might be a video
+            logger.debug(f"RedGifs video detected: {file_path}")
+            return "video"
     
     # Normal file type detection
     if is_image_file(file_path):

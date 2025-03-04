@@ -404,6 +404,7 @@ class ThumbnailWidget(QWidget):
         self.remove_button.setStyleSheet("")
         self.approve_button.setText("Approve")
         self.remove_button.setText("Remove")
+        self.remove_button.setToolTip("Remove this submission")
         
         # Apply status-specific styling
         if status == "approved":
@@ -412,6 +413,12 @@ class ThumbnailWidget(QWidget):
         elif status == "removed":
             self.remove_button.setStyleSheet("background-color: red; color: white;")
             self.remove_button.setText("Removed")
+        elif status == "removal_pending":
+            self.remove_button.setStyleSheet("background-color: orange; color: white;")
+            self.remove_button.setText("Retry Remove")
+            self.remove_button.setToolTip("Network error occurred. Click to retry removing this submission")
+            # Re-enable the button to allow retrying
+            self.remove_button.setEnabled(True)
     
     def load_image_async(self, url):
         """
@@ -439,18 +446,48 @@ class ThumbnailWidget(QWidget):
         worker = MediaDownloadWorker(url)
         
         # Connect signals with safety checks
-        # Use lambda functions that check if the widget still exists
+        # Use lambda functions with try/except to prevent crashes if widget is deleted
         worker.signals.progress.connect(lambda progress: 
-            weak_self().loadingBar.setValue(progress) if weak_self() and hasattr(weak_self(), 'loadingBar') and not weak_self().loadingBar.isHidden() else None)
+            self._safe_update_progress(weak_self, progress))
         
         worker.signals.finished.connect(lambda file_path: 
-            weak_self().on_media_downloaded(file_path, processed_url) if weak_self() and hasattr(weak_self(), 'on_media_downloaded') else None)
+            self._safe_call_finished(weak_self, file_path, processed_url))
         
         worker.signals.error.connect(lambda error_msg: 
-            weak_self().on_media_error(error_msg) if weak_self() and hasattr(weak_self(), 'on_media_error') else None)
+            self._safe_call_error(weak_self, error_msg))
         
         # Start the worker
         QThreadPool.globalInstance().start(worker)
+    
+    @staticmethod
+    def _safe_update_progress(weak_ref, progress):
+        try:
+            instance = weak_ref()
+            if instance is not None and hasattr(instance, 'loadingBar'):
+                instance.loadingBar.setValue(progress)
+        except RuntimeError:
+            # Widget was deleted between the check and the call
+            pass
+    
+    @staticmethod
+    def _safe_call_finished(weak_ref, file_path, url):
+        try:
+            instance = weak_ref()
+            if instance is not None and hasattr(instance, 'on_media_downloaded'):
+                instance.on_media_downloaded(file_path, url)
+        except RuntimeError:
+            # Widget was deleted between the check and the call
+            pass
+    
+    @staticmethod
+    def _safe_call_error(weak_ref, error_msg):
+        try:
+            instance = weak_ref()
+            if instance is not None and hasattr(instance, 'on_media_error'):
+                instance.on_media_error(error_msg)
+        except RuntimeError:
+            # Widget was deleted between the check and the call
+            pass
     
     def on_media_downloaded(self, file_path, url):
         """Handle completed media download."""

@@ -24,7 +24,7 @@ from PyQt6.QtCore import Qt, QSize, QThreadPool, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QIcon, QPixmapCache
 
 from red_config import load_config, get_new_refresh_token, update_config_with_new_token
-from reddit_api import RedditGalleryModel, SnapshotFetcher, ban_user
+from reddit_api import RedditGalleryModel, SnapshotFetcher, ban_user, ModeratedSubredditsFetcher
 from ui_components import ThumbnailWidget, BanUserDialog
 from utils import get_cache_dir, ensure_directory
 from media_handlers import process_media_url
@@ -65,6 +65,10 @@ class RedMediaBrowser(QMainWindow):
         self.previous_offset = 0
         self.back_button = None
         
+        # For moderated subreddits
+        self.moderated_subreddits = []
+        self.mod_subreddits_fetched = False
+        
         # Set up the UI
         self.init_ui()
         
@@ -88,6 +92,12 @@ class RedMediaBrowser(QMainWindow):
         
         # Navigation panel
         nav_layout = QHBoxLayout()
+        
+        # Moderated subreddits dropdown button (moved to far left)
+        self.mod_subreddits_button = QPushButton("My Mod Subreddits")
+        self.mod_subreddits_button.setToolTip("View and select from subreddits you moderate")
+        self.mod_subreddits_button.clicked.connect(self.show_mod_subreddits_menu)
+        nav_layout.addWidget(self.mod_subreddits_button)
         
         # Subreddit/User selector
         self.source_type_combo = QComboBox()
@@ -208,6 +218,9 @@ class RedMediaBrowser(QMainWindow):
                 logger.info(f"Authenticated as {username}")
                 self.statusBar.showMessage(f"Authenticated as {username}")
                 
+                # Fetch moderated subreddits
+                self.fetch_moderated_subreddits()
+                
                 # Load default subreddit if specified
                 if "default_subreddit" in config and config["default_subreddit"]:
                     self.source_input.setText(config["default_subreddit"])
@@ -223,6 +236,79 @@ class RedMediaBrowser(QMainWindow):
         except Exception as e:
             logger.error(f"Error initializing Reddit API: {e}")
             QMessageBox.critical(self, "Error", f"Failed to initialize Reddit API: {str(e)}")
+    
+    def fetch_moderated_subreddits(self):
+        """Fetch the list of subreddits moderated by the current user."""
+        self.mod_subreddits_button.setEnabled(False)
+        self.mod_subreddits_button.setText("Loading Mod Subreddits...")
+        
+        # Create a thread to fetch moderated subreddits
+        self.mod_subreddits_fetcher = ModeratedSubredditsFetcher(self.reddit)
+        self.mod_subreddits_fetcher.subredditsFetched.connect(self.on_mod_subreddits_fetched)
+        self.mod_subreddits_fetcher.start()
+    
+    def on_mod_subreddits_fetched(self, mod_subreddits):
+        """Handle the fetched list of moderated subreddits."""
+        self.moderated_subreddits = mod_subreddits
+        self.mod_subreddits_fetched = True
+        
+        # Update button to show count
+        count = len(mod_subreddits)
+        self.mod_subreddits_button.setText(f"My Mod Subreddits ({count})")
+        self.mod_subreddits_button.setEnabled(True)
+        
+        if count == 0:
+            self.mod_subreddits_button.setToolTip("You don't moderate any subreddits")
+        else:
+            self.mod_subreddits_button.setToolTip(f"You moderate {count} subreddits")
+    
+    def show_mod_subreddits_menu(self):
+        """Show a dropdown menu of moderated subreddits."""
+        if not self.mod_subreddits_fetched:
+            self.fetch_moderated_subreddits()
+            return
+            
+        if not self.moderated_subreddits:
+            QMessageBox.information(self, "No Moderated Subreddits", 
+                                   "You don't moderate any subreddits.")
+            return
+            
+        # Create a menu of moderated subreddits
+        menu = QMenu(self)
+        
+        # Add a header/title (as a disabled action)
+        title_action = QAction("Select a Subreddit:", self)
+        title_action.setEnabled(False)
+        menu.addAction(title_action)
+        menu.addSeparator()
+        
+        # Add each moderated subreddit
+        for subreddit in self.moderated_subreddits:
+            display_name = subreddit["display_name"]
+            subscribers = subreddit.get("subscribers", 0)
+            
+            # Format menu item text with subscriber count if available
+            if subscribers:
+                text = f"{display_name} ({subscribers:,} subscribers)"
+            else:
+                text = display_name
+                
+            action = QAction(text, self)
+            action.setData(display_name)  # Store the subreddit name as data
+            menu.addAction(action)
+        
+        # Show the menu below the button
+        action = menu.exec(self.mod_subreddits_button.mapToGlobal(
+            self.mod_subreddits_button.rect().bottomLeft()))
+        
+        # Handle menu selection
+        if action and action.isEnabled():
+            subreddit_name = action.data()
+            if subreddit_name:
+                # Set the input field and load the subreddit
+                self.source_type_combo.setCurrentIndex(0)  # Switch to Subreddit mode
+                self.source_input.setText(subreddit_name)
+                self.load_content()
     
     def handle_invalid_token(self, config, config_path):
         """Handle invalid refresh token by requesting a new one."""
@@ -260,8 +346,12 @@ class RedMediaBrowser(QMainWindow):
         """Handle change between subreddit and user mode."""
         if index == 0:  # Subreddit mode
             self.source_input.setPlaceholderText("Enter subreddit name...")
+            # Only show mod subreddits button in subreddit mode
+            self.mod_subreddits_button.setVisible(True)
         else:  # User mode
             self.source_input.setPlaceholderText("Enter username...")
+            # Hide mod subreddits button in user mode
+            self.mod_subreddits_button.setVisible(False)
     
     def load_content(self):
         """Load content from the specified subreddit or user."""

@@ -18,6 +18,64 @@ logger = logging.getLogger(__name__)
 # Global dictionary for storing moderation statuses (e.g., "approved" or "removed")
 moderation_statuses = {}
 
+def get_moderated_subreddits(reddit_instance) -> List[Dict[str, str]]:
+    """
+    Get a list of subreddits moderated by the authenticated user.
+    
+    Args:
+        reddit_instance: PRAW Reddit instance
+        
+    Returns:
+        List of dictionaries with subreddit information (name, display_name, subscribers, etc.)
+        Sorted alphabetically by display_name
+    """
+    try:
+        user = reddit_instance.user.me()
+        if not user:
+            logger.error("Failed to get user information. User may not be authenticated.")
+            return []
+            
+        # Get moderated subreddits
+        logger.debug(f"Fetching moderated subreddits for user: {user.name}")
+        mod_subreddits = []
+        
+        # Use a try-except block to handle any API errors
+        try:
+            for subreddit in reddit_instance.user.moderator_subreddits(limit=None):
+                mod_subreddits.append({
+                    "name": subreddit.display_name.lower(),
+                    "display_name": subreddit.display_name,
+                    "subscribers": getattr(subreddit, 'subscribers', 0),
+                    "url": subreddit.url,
+                    "description": getattr(subreddit, 'public_description', '')
+                })
+        except prawcore.exceptions.PrawcoreException as e:
+            logger.error(f"PRAW error while fetching moderated subreddits: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error while fetching moderated subreddits: {e}")
+            
+        # Sort alphabetically by display_name
+        mod_subreddits.sort(key=lambda x: x["display_name"].lower())
+        logger.debug(f"Found {len(mod_subreddits)} moderated subreddits")
+        return mod_subreddits
+    except Exception as e:
+        logger.exception(f"Error getting moderated subreddits: {e}")
+        return []
+
+class ModeratedSubredditsFetcher(QThread):
+    """
+    Worker thread for asynchronous fetching of moderated subreddits.
+    """
+    subredditsFetched = pyqtSignal(list)
+    
+    def __init__(self, reddit_instance):
+        super().__init__()
+        self.reddit_instance = reddit_instance
+        
+    def run(self):
+        mod_subreddits = get_moderated_subreddits(self.reddit_instance)
+        self.subredditsFetched.emit(mod_subreddits)
+
 class RedditGalleryModel:
     """
     Model class for Reddit gallery data.

@@ -19,7 +19,7 @@ import vlc
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSizePolicy,
-    QDialog, QMessageBox, QLineEdit, QProgressBar
+    QDialog, QMessageBox, QLineEdit, QProgressBar, QScrollArea, QTextBrowser
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QThreadPool
 from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie, QIcon
@@ -230,6 +230,52 @@ class BanUserDialog(QDialog):
         self.result_type = "private"
         self.accept()
 
+class ReportsDialog(QDialog):
+    """
+    Dialog for displaying reports on a Reddit submission.
+    """
+    def __init__(self, report_reasons, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Post Reports")
+        self.setMinimumSize(400, 300)
+        
+        # Create layout
+        layout = QVBoxLayout(self)
+        
+        # Create text browser for displaying reports with scrolling
+        self.reports_browser = QTextBrowser()
+        self.reports_browser.setOpenExternalLinks(False)
+        self.reports_browser.setReadOnly(True)
+        
+        try:
+            # Format and set the report reasons with proper error handling
+            if report_reasons and isinstance(report_reasons, list):
+                html_content = "<h3>Report Reasons:</h3><ul>"
+                for reason in report_reasons:
+                    try:
+                        # Check if reason is a valid string
+                        if isinstance(reason, str):
+                            html_content += f"<li>{html.escape(reason)}</li>"
+                        else:
+                            html_content += f"<li>Invalid report format: {type(reason)}</li>"
+                    except Exception as e:
+                        logger.error(f"Error formatting report reason: {e}")
+                        html_content += "<li>Error formatting report</li>"
+                html_content += "</ul>"
+                self.reports_browser.setHtml(html_content)
+            else:
+                self.reports_browser.setHtml("<p>No detailed report information available.</p>")
+        except Exception as e:
+            logger.error(f"Error creating reports dialog content: {e}")
+            self.reports_browser.setHtml(f"<p>Error displaying reports: {html.escape(str(e))}</p>")
+        
+        layout.addWidget(self.reports_browser)
+        
+        # Add close button
+        self.close_button = QPushButton("Close")
+        self.close_button.clicked.connect(self.accept)
+        layout.addWidget(self.close_button)
+
 class ThumbnailWidget(QWidget):
     """
     Widget for displaying a single Reddit post with thumbnail image/video.
@@ -269,6 +315,10 @@ class ThumbnailWidget(QWidget):
         self.is_fullscreen_open = False
         self.fullscreen_viewer = None
         
+        # Reports data
+        self.reports_count = 0
+        self.report_reasons = []
+        
         # Set size policy to ensure equal cell sizes in grid
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         
@@ -278,6 +328,10 @@ class ThumbnailWidget(QWidget):
         # Start loading the first image
         if self.images:
             self.load_image_async(self.images[self.current_index])
+        
+        # Fetch reports if we're a moderator
+        if self.is_moderator:
+            self.fetch_reports()
     
     def init_ui(self):
         """Initialize the UI layout and components."""
@@ -380,19 +434,76 @@ class ThumbnailWidget(QWidget):
     def create_moderation_buttons(self):
         """Initialize moderation buttons for moderators."""
         self.moderation_layout = QHBoxLayout()
+        self.moderation_layout.setSpacing(5)
         
         # Approve button
         self.approve_button = QPushButton("Approve", self)
         self.approve_button.clicked.connect(self.approve_submission)
         self.approve_button.setToolTip("Approve this submission")
+        # Remove fixed width to allow stretching
+        self.approve_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         
         # Remove button
         self.remove_button = QPushButton("Remove", self)
         self.remove_button.clicked.connect(self.remove_submission)
         self.remove_button.setToolTip("Remove this submission")
+        # Remove fixed width to allow stretching
+        self.remove_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        
+        # Reports button 
+        self.reports_button = QPushButton("Reports", self)
+        self.reports_button.clicked.connect(self.show_reports)
+        self.reports_button.setToolTip("View reports for this submission")
+        self.reports_button.setStyleSheet("background-color: yellow; color: black;")
+        # Remove fixed width to allow stretching
+        self.reports_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        
+        # Check right away if there are reports directly available, with safer handling
+        try:
+            mod_reports = getattr(self.praw_submission, 'mod_reports', [])
+            user_reports = getattr(self.praw_submission, 'user_reports', [])
+            
+            # Safely calculate report count
+            mod_report_count = len(mod_reports)
+            user_report_count = 0
+            
+            # Handle user reports safely regardless of format
+            if user_reports:
+                for report_item in user_reports:
+                    # Check if it's a tuple/list with at least 2 items and second is an int
+                    if isinstance(report_item, (list, tuple)) and len(report_item) >= 2:
+                        if isinstance(report_item[1], int):
+                            user_report_count += report_item[1]
+                        else:
+                            # If second item isn't an int, just count each item as 1
+                            user_report_count += 1
+                    else:
+                        # If it's not in expected format, just count each item as 1
+                        user_report_count += 1
+            
+            direct_report_count = mod_report_count + user_report_count
+            
+            if direct_report_count > 0:
+                # Use a shorter format for report count to avoid width issues
+                if direct_report_count > 999:
+                    self.reports_button.setText(f"Rep(999+)")
+                else:
+                    self.reports_button.setText(f"Rep({direct_report_count})")
+                logger.debug(f"Found reports during button creation: {direct_report_count} for post {self.praw_submission.id}")
+            else:
+                # Initially hide until we fetch reports and confirm they exist
+                self.reports_button.hide()
+        except Exception as e:
+            logger.error(f"Error detecting reports in button creation: {e}")
+            # If there's any error, hide the reports button
+            self.reports_button.hide()
+        
+        # Remove the spacer widget - no longer needed as the buttons will expand naturally
         
         self.moderation_layout.addWidget(self.approve_button)
         self.moderation_layout.addWidget(self.remove_button)
+        self.moderation_layout.addWidget(self.reports_button)
+        # No spacer widget needed
         self.layout.addLayout(self.moderation_layout)
     
     def update_moderation_status_ui(self):
@@ -419,6 +530,122 @@ class ThumbnailWidget(QWidget):
             self.remove_button.setToolTip("Network error occurred. Click to retry removing this submission")
             # Re-enable the button to allow retrying
             self.remove_button.setEnabled(True)
+    
+    def fetch_reports(self):
+        """Fetch reports for the current submission."""
+        try:
+            # Direct access to reports attributes for faster detection
+            mod_reports = getattr(self.praw_submission, 'mod_reports', [])
+            user_reports = getattr(self.praw_submission, 'user_reports', [])
+            
+            # Safely calculate report count
+            mod_report_count = len(mod_reports)
+            user_report_count = 0
+            
+            # Handle user reports safely regardless of format
+            if user_reports:
+                for report_item in user_reports:
+                    # Check if it's a tuple/list with at least 2 items and second is an int
+                    if isinstance(report_item, (list, tuple)) and len(report_item) >= 2:
+                        if isinstance(report_item[1], int):
+                            user_report_count += report_item[1]
+                        else:
+                            # If second item isn't an int, just count each item as 1
+                            user_report_count += 1
+                    else:
+                        # If it's not in expected format, just count each item as 1
+                        user_report_count += 1
+            
+            direct_report_count = mod_report_count + user_report_count
+            
+            if direct_report_count > 0:
+                logger.debug(f"Direct report detection: Post {self.praw_submission.id} has {direct_report_count} reports")
+                formatted_reports = []
+                
+                # Format the mod reports
+                for reason, moderator in mod_reports:
+                    formatted_reports.append(f"Moderator {moderator}: {reason}")
+                
+                # Format the user reports - safely handle different formats
+                for report_item in user_reports:
+                    try:
+                        if isinstance(report_item, (list, tuple)):
+                            if len(report_item) >= 2:
+                                reason = report_item[0]
+                                if isinstance(report_item[1], int) and report_item[1] > 1:
+                                    formatted_reports.append(f"Users ({report_item[1]}): {reason}")
+                                else:
+                                    formatted_reports.append(f"User: {reason}")
+                            else:
+                                formatted_reports.append(f"Report: {report_item}")
+                        else:
+                            # Handle any other format
+                            formatted_reports.append(f"Report: {report_item}")
+                    except Exception as e:
+                        logger.error(f"Error formatting report item: {e}")
+                
+                self.reports_count = direct_report_count
+                self.report_reasons = formatted_reports
+                self.reports_button.setText(f"Reports ({direct_report_count})")
+                self.reports_button.show()
+                return
+            
+            # Fallback to API function if direct detection didn't find reports
+            report_count, report_reasons = reddit_api.get_submission_reports(self.praw_submission)
+            self.reports_count = report_count
+            self.report_reasons = report_reasons
+            
+            # Update UI to show reports button if there are reports
+            if report_count > 0:
+                self.reports_button.setText(f"Reports ({report_count})")
+                self.reports_button.show()
+            else:
+                self.reports_button.hide()
+        except Exception as e:
+            logger.exception(f"Error fetching reports: {e}")
+            # If there's any error, hide the reports button
+            if hasattr(self, 'reports_button'):
+                self.reports_button.hide()
+    
+    def show_reports(self):
+        """Show dialog with report details."""
+        try:
+            # Make a clean copy of report reasons to avoid possible reference issues
+            report_reasons_copy = []
+            
+            # Safely copy each report reason
+            if self.report_reasons and isinstance(self.report_reasons, list):
+                for reason in self.report_reasons:
+                    if isinstance(reason, str):
+                        report_reasons_copy.append(reason)
+                    else:
+                        # Convert non-string reasons to safe strings
+                        try:
+                            report_reasons_copy.append(f"Report: {str(reason)}")
+                        except Exception:
+                            report_reasons_copy.append("Unreadable report")
+            
+            # Create and show the dialog with the cleaned report data
+            logger.debug(f"Showing reports dialog with {len(report_reasons_copy)} reports")
+            dialog = ReportsDialog(report_reasons_copy, self)
+            
+            # Use non-blocking show instead of exec if there are many reports
+            if len(report_reasons_copy) > 20:
+                # For many reports, using non-modal dialog can prevent UI locking
+                dialog.setModal(False)
+                dialog.show()
+            else:
+                # For fewer reports, a modal dialog is fine
+                dialog.exec()
+                
+        except Exception as e:
+            # Display an error message if showing the reports fails
+            logger.exception(f"Error showing reports dialog: {e}")
+            QMessageBox.warning(
+                self, 
+                "Error Showing Reports",
+                f"Could not display reports: {str(e)}"
+            )
     
     def load_image_async(self, url):
         """
@@ -491,13 +718,26 @@ class ThumbnailWidget(QWidget):
     
     def on_media_downloaded(self, file_path, url):
         """Handle completed media download."""
+        # First check if this widget has been deleted
+        try:
+            # Simple property access test to detect if this object is still valid
+            test = self.is_media_loaded
+        except RuntimeError:
+            # Object has been deleted, silently abort
+            logger.debug("Widget was deleted before media download completed")
+            return
+        
         if not file_path:
             self.on_media_error("Download failed")
             return
             
         # Hide loading indicator
-        self.loadingBar.hide()
-        self.loadingStateChanged.emit(False)
+        try:
+            self.loadingBar.hide()
+            self.loadingStateChanged.emit(False)
+        except RuntimeError:
+            # Object has been deleted during operation
+            return
         
         try:
             # Determine media type and load appropriately
@@ -520,8 +760,21 @@ class ThumbnailWidget(QWidget):
                         logger.error(f"RedGifs video file too small: {file_size} bytes")
                         self.imageLabel.setText("Invalid video file")
                     else:
+                        # Create a weak reference to self before scheduling the delayed play
+                        self_ref = weakref.ref(self)
+                        
+                        # Use the weak reference in the lambda
+                        def safe_play_video():
+                            widget = self_ref()
+                            if widget is not None:
+                                try:
+                                    widget.play_video(file_path)
+                                except RuntimeError:
+                                    # Widget was deleted
+                                    logger.debug("Widget was deleted before delayed video play")
+                        
                         # Add a short delay to ensure file is fully ready
-                        QTimer.singleShot(200, lambda: self.play_video(file_path))
+                        QTimer.singleShot(200, safe_play_video)
                 else:
                     # Regular video
                     self.play_video(file_path)
@@ -584,10 +837,17 @@ class ThumbnailWidget(QWidget):
             # Signal that media is ready
             self.is_media_loaded = True
             self.mediaReady.emit()
-            
+        
+        except RuntimeError as e:
+            # Widget was deleted during processing
+            logger.debug(f"Widget was deleted during media processing: {e}")
         except Exception as e:
             logger.exception(f"Error handling downloaded media: {e}")
-            self.imageLabel.setText(f"Error loading media: {str(e)}")
+            try:
+                self.imageLabel.setText(f"Error loading media: {str(e)}")
+            except RuntimeError:
+                # Widget already deleted
+                pass
 
     def pre_scale_movie(self):
         """Pre-scale the movie based on the label size before displaying."""
@@ -640,8 +900,26 @@ class ThumbnailWidget(QWidget):
         logger.error(f"Media error: {error_msg}")
         self.loadingBar.hide()
         self.loadingStateChanged.emit(False)
+        
+        # Set constrained width for error messages to prevent layout stretching
+        self.imageLabel.setMaximumWidth(300)  # Limit width to prevent stretching
         self.imageLabel.setText("Media loading failed")
-        self.postUrlLabel.setText(f"Error: {error_msg}")
+        self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # Set a fixed height to maintain consistent grid layout
+        self.imageLabel.setMinimumHeight(200)
+        self.imageLabel.setMaximumHeight(200)
+        
+        # Truncate long error messages to prevent layout issues
+        if len(error_msg) > 50:
+            short_error = error_msg[:47] + "..."
+        else:
+            short_error = error_msg
+        self.postUrlLabel.setText(f"Error: {short_error}")
+        
+        # Ensure we emit mediaReady so the grid layout can properly arrange widgets
+        self.is_media_loaded = True
+        self.mediaReady.emit()
     
     def update_pixmap(self):
         """Update the displayed image with proper scaling."""
@@ -824,45 +1102,59 @@ class ThumbnailWidget(QWidget):
 
     def cleanup_current_media(self):
         """Clean up current media before loading a new one."""
-        # Stop the playback monitor if active
-        if hasattr(self, 'playback_monitor') and self.playback_monitor:
-            self.playback_monitor.stop()
-        
-        # Stop any playing video
-        if hasattr(self, 'vlc_player') and self.vlc_player:
-            try:
-                self.vlc_player.stop()
-                self.vlc_player.release()
-                self.vlc_instance.release()
-                
-                if hasattr(self, 'vlc_widget'):
-                    self.vlc_widget.setParent(None)  # Properly detach from parent
-                    self.vlc_widget.deleteLater()
+        try:
+            # First check if this widget has been deleted
+            test = self.is_media_loaded  # Simple property access to test if object is still valid
+        except RuntimeError:
+            # Widget has been deleted, nothing to clean up
+            logger.debug("Widget was deleted before cleanup_current_media could complete")
+            return
+            
+        try:
+            # Stop the playback monitor if active
+            if hasattr(self, 'playback_monitor') and self.playback_monitor:
+                self.playback_monitor.stop()
+            
+            # Stop any playing video
+            if hasattr(self, 'vlc_player') and self.vlc_player:
+                try:
+                    self.vlc_player.stop()
+                    self.vlc_player.release()
+                    self.vlc_instance.release()
                     
-                delattr(self, 'vlc_player')
-                delattr(self, 'vlc_instance')
-                if hasattr(self, 'vlc_widget'):
-                    delattr(self, 'vlc_widget')
-            except Exception as e:
-                logger.exception(f"Error during VLC cleanup: {e}")
-        
-        # Clean up the AnimatedGifDisplay
-        if hasattr(self, 'gifDisplay') and self.gifDisplay is not None:
-            try:
-                self.gifDisplay.cleanup()
-                self.gifDisplay.hide()
-            except Exception as e:
-                logger.exception(f"Error cleaning up AnimatedGifDisplay: {e}")
-        
-        # Stop any playing animation using standard QMovie
-        if hasattr(self, 'movie') and self.movie:
-            self.movie.stop()
-            self.movie = None
-        
-        # Show the image label again if it exists
-        if hasattr(self, 'imageLabel'):
-            self.imageLabel.clear()
-            self.imageLabel.show()  # Make sure it's visible
+                    if hasattr(self, 'vlc_widget'):
+                        self.vlc_widget.setParent(None)  # Properly detach from parent
+                        self.vlc_widget.deleteLater()
+                        
+                    delattr(self, 'vlc_player')
+                    delattr(self, 'vlc_instance')
+                    if hasattr(self, 'vlc_widget'):
+                        delattr(self, 'vlc_widget')
+                except Exception as e:
+                    logger.exception(f"Error during VLC cleanup: {e}")
+            
+            # Clean up the AnimatedGifDisplay
+            if hasattr(self, 'gifDisplay') and self.gifDisplay is not None:
+                try:
+                    self.gifDisplay.cleanup()
+                    self.gifDisplay.hide()
+                except Exception as e:
+                    logger.exception(f"Error cleaning up AnimatedGifDisplay: {e}")
+            
+            # Stop any playing animation using standard QMovie
+            if hasattr(self, 'movie') and self.movie:
+                self.movie.stop()
+                self.movie = None
+            
+            # Show the image label again if it exists
+            if hasattr(self, 'imageLabel'):
+                self.imageLabel.clear()
+                self.imageLabel.show()  # Make sure it's visible
+        except RuntimeError as e:
+            # Widget was deleted during cleanup
+            logger.debug(f"Widget was deleted during cleanup_current_media: {e}")
+        except Exception as e:
+            logger.exception(f"Error during cleanup_current_media: {e}")
     
     def open_post_url(self):
         """Open the Reddit post URL in the default web browser."""

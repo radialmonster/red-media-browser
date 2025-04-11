@@ -570,12 +570,64 @@ class MediaDownloadWorker(QRunnable):
             headers['Referer'] = 'https://www.redgifs.com/'
         elif "imgur.com" in url:
             headers['Referer'] = 'https://imgur.com/'
-        
-        # Download the file
-        response = requests.get(url, stream=True, headers=headers, timeout=30)
-        
+
+        # --- Initial Download Attempt ---
+        logger.debug(f"Attempting download from: {url}")
+        response = requests.get(url, stream=True, headers=headers, timeout=30, allow_redirects=True)
+        logger.debug(f"Initial response status: {response.status_code}, Final URL: {response.url}")
+
+        # --- Handle RedGifs Image Redirect ---
+        # Check if an i.redgifs.com image URL redirected to a www.redgifs.com/watch page returning HTML
+        original_domain = urlparse(url).netloc
+        final_domain = urlparse(response.url).netloc
+        content_type = response.headers.get('Content-Type', '').lower()
+
+        if (original_domain == "i.redgifs.com" and
+            final_domain == "www.redgifs.com" and
+            "/watch/" in response.url and
+            response.status_code == 200 and
+            'text/html' in content_type):
+
+            logger.debug("Detected i.redgifs.com image redirect to HTML watch page. Parsing for actual image URL.")
+            html_content = response.text
+            # Try extracting og:image meta tag
+            og_image_match = re.search(
+                r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+                html_content,
+                re.IGNORECASE
+            )
+            # Try extracting twitter:image meta tag as fallback
+            twitter_image_match = re.search(
+                 r'<meta\s+name=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']',
+                 html_content,
+                 re.IGNORECASE
+            )
+
+            actual_image_url = None
+            if og_image_match:
+                actual_image_url = og_image_match.group(1)
+                logger.debug(f"Found og:image URL: {actual_image_url}")
+            elif twitter_image_match:
+                 actual_image_url = twitter_image_match.group(1)
+                 logger.debug(f"Found twitter:image URL: {actual_image_url}")
+            else:
+                logger.error("Could not find image URL (og:image or twitter:image) in redirected HTML.")
+                raise Exception("Failed to extract actual image URL from RedGifs watch page HTML.")
+
+            # --- Second Download Attempt (Actual Image) ---
+            if actual_image_url:
+                logger.debug(f"Attempting second download for actual image: {actual_image_url}")
+                # Use same headers, maybe update Referer?
+                headers['Referer'] = response.url # Referer is the watch page
+                response = requests.get(actual_image_url, stream=True, headers=headers, timeout=30)
+                logger.debug(f"Second download response status: {response.status_code}")
+                # Update URL variable to reflect the actual downloaded content for later extension logic
+                url = actual_image_url
+                content_type = response.headers.get('Content-Type', '').lower() # Update content_type too
+
+        # --- Process Final Response ---
         if response.status_code == 200:
-            # Get content length for progress reporting
+            # Get content length for progress reporting (use final response)
             content_length = int(response.headers.get('Content-Length', 0))
             
             # Setup progress tracking
@@ -596,42 +648,63 @@ class MediaDownloadWorker(QRunnable):
             if "redgifs.com" in url:
                 # Check content type to determine if it's an image or video
                 content_type = response.headers.get('Content-Type', '').lower()
-                ext = os.path.splitext(url.lower())[1]
-                
-                if 'image/' in content_type or ext in ['.jpg', '.jpeg', '.png', '.webp']:
-                    # For images, make sure we preserve the image extension
-                    logger.debug(f"RedGifs image detected, preserving extension: {ext}")
-                    
-                    # If no extension or wrong extension, try to get correct one from content-type
-                    if not ext or ext == '.mp4':
-                        if 'image/jpeg' in content_type:
-                            ext = '.jpg'
-                        elif 'image/png' in content_type:
-                            ext = '.png'
-                        elif 'image/webp' in content_type:
-                            ext = '.webp'
-                        else:
-                            ext = '.jpg'  # Default to jpg
-                        
-                        # Rename the file with the correct extension
+                # Use the URL *passed to download_file* to check the extension
+                original_ext = os.path.splitext(url.lower())[1]
+                is_image_url = original_ext in ['.jpg', '.jpeg', '.png', '.webp']
+                is_image_content = 'image/' in content_type
+
+                if is_image_url or is_image_content:
+                    # If the URL looked like an image OR content type confirms it's an image
+                    logger.debug(f"RedGifs image detected (URL: {is_image_url}, Content: {is_image_content}), ensuring correct extension.")
+
+                    # Determine the correct extension
+                    correct_ext = original_ext # Default to original URL extension if it was an image type
+                    if not is_image_url: # If original URL didn't have image ext, use content type
+                         if 'image/jpeg' in content_type:
+                             correct_ext = '.jpg'
+                         elif 'image/png' in content_type:
+                             correct_ext = '.png'
+                         elif 'image/webp' in content_type:
+                             correct_ext = '.webp'
+                         else:
+                             correct_ext = '.jpg' # Fallback
+
+                    # Ensure the cached file has the correct extension
+                    current_ext = os.path.splitext(cache_path.lower())[1]
+                    if current_ext != correct_ext:
                         base_path = os.path.splitext(cache_path)[0]
-                        new_cache_path = base_path + ext
+                        new_cache_path = base_path + correct_ext
                         try:
-                            shutil.move(cache_path, new_cache_path)
-                            cache_path = new_cache_path
-                            logger.debug(f"Renamed RedGifs image file to use correct extension: {cache_path}")
+                            # Only move if the target doesn't already exist (avoid race conditions)
+                            if not os.path.exists(new_cache_path):
+                                shutil.move(cache_path, new_cache_path)
+                                cache_path = new_cache_path
+                                logger.debug(f"Renamed RedGifs image file to use correct extension: {cache_path}")
+                            elif cache_path != new_cache_path:
+                                # Target exists, likely another thread handled it, remove the duplicate
+                                os.remove(cache_path)
+                                cache_path = new_cache_path # Point to the existing correct file
+                                logger.debug(f"Correctly named RedGifs image file already exists: {cache_path}")
                         except Exception as e:
                             logger.error(f"Error renaming file to use correct extension: {e}")
-                elif not cache_path.lower().endswith('.mp4'):
-                    # For videos, force .mp4 extension
-                    new_cache_path = cache_path + ".mp4"
+
+                # Only force .mp4 if the URL *didn't* look like an image initially
+                elif not is_image_url and not cache_path.lower().endswith('.mp4'):
+                    # For non-image URLs (likely videos), force .mp4 extension if needed
+                    new_cache_path = os.path.splitext(cache_path)[0] + ".mp4"
                     try:
-                        shutil.move(cache_path, new_cache_path)
-                        cache_path = new_cache_path
-                        logger.debug(f"Renamed RedGifs file to ensure .mp4 extension: {cache_path}")
+                         # Only move if the target doesn't already exist
+                        if not os.path.exists(new_cache_path):
+                            shutil.move(cache_path, new_cache_path)
+                            cache_path = new_cache_path
+                            logger.debug(f"Renamed RedGifs file to ensure .mp4 extension: {cache_path}")
+                        elif cache_path != new_cache_path:
+                            os.remove(cache_path)
+                            cache_path = new_cache_path
+                            logger.debug(f"Correctly named RedGifs video file already exists: {cache_path}")
                     except Exception as e:
                         logger.error(f"Error renaming file to add .mp4 extension: {e}")
-            
+
             # Success
             return cache_path
         else:

@@ -171,31 +171,38 @@ def get_cache_path_for_url(url):
         path = unquote(parsed_url.path)
         filename = os.path.basename(path)
         
-        # Special handling for RedGifs URLs that might not have a clear filename
-        if "redgifs.com" in domain:
-            # Extract ID from URL patterns like redgifs.com/watch/someid or media.redgifs.com/SomeId.mp4
-            if "media.redgifs.com" in domain and filename.endswith(".mp4"):
-                # For direct media URLs, just use the filename as is
-                pass
-            elif "/watch/" in url:
-                match = re.search(r'/watch/([A-Za-z]+)', url)
-                if match:
-                    redgifs_id = match.group(1)
-                    filename = f"{redgifs_id}.mp4"  # Explicitly add .mp4 extension
-            elif not filename or not filename.endswith(".mp4"):
-                # Try to extract ID from the path
-                match = re.search(r'([A-Za-z]+)(?:\.mp4)?$', path)
-                if match:
-                    redgifs_id = match.group(1)
-                    filename = f"{redgifs_id}.mp4"  # Explicitly add .mp4 extension
-                else:
-                    # Fallback for other RedGifs URL patterns
-                    import hashlib
-                    url_hash = hashlib.md5(url.encode()).hexdigest()
-                    filename = f"redgif_{url_hash}.mp4"  # Add .mp4 extension
-        
-        if not filename:
-            # Handle URLs without a filename
+        # Special handling for RedGifs domains
+        if "redgifs.com" in domain: # Changed from elif to if
+            original_ext = os.path.splitext(filename)[1].lower()
+            # If it already has a valid media extension, keep it.
+            if original_ext in ['.jpg', '.jpeg', '.png', 'gif', '.webp', '.mp4', '.webm']:
+                pass # Keep filename as is
+            # Handle watch/ifr URLs -> should become .mp4
+            elif "/watch/" in url or "/ifr/" in url:
+                 match = re.search(r'(?:watch|ifr)/([A-Za-z0-9]+)', url) # Allow numeric IDs too
+                 if match:
+                     redgifs_id = match.group(1)
+                     filename = f"{redgifs_id}.mp4" # Force .mp4 for watch/ifr pages
+                 else: # Fallback hash if ID extraction fails
+                     import hashlib
+                     url_hash = hashlib.md5(url.encode()).hexdigest()
+                     filename = f"redgif_watch_hash_{url_hash}.mp4"
+            # Handle URLs like i.redgifs.com/i/xyz (no extension) -> use hash, no assumed extension
+            elif not original_ext and "i.redgifs.com" in domain:
+                 import hashlib
+                 url_hash = hashlib.md5(url.encode()).hexdigest()
+                 logger.warning(f"RedGifs URL has no extension, using hash: {url}")
+                 filename = f"redgif_noext_hash_{url_hash}" # Don't assume extension
+            # Fallback for other unexpected RedGifs URLs - use hash, don't assume extension
+            else:
+                 import hashlib
+                 url_hash = hashlib.md5(url.encode()).hexdigest()
+                 logger.warning(f"Unhandled RedGifs URL format for cache path, using hash: {url}")
+                 # Preserve original extension if it exists, otherwise no extension
+                 filename = f"redgif_fallback_hash_{url_hash}{original_ext}"
+
+        # Handle URLs without a filename (e.g., root path '/') AFTER domain-specific logic
+        if not filename or filename == '/':
             extension = ""
             if url.endswith('.mp4'):
                 extension = ".mp4"

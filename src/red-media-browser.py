@@ -28,10 +28,11 @@ from reddit_api import RedditGalleryModel, SnapshotFetcher, ban_user, ModeratedS
 from ui_components import ThumbnailWidget, BanUserDialog
 from utils import get_cache_dir, ensure_directory
 from media_handlers import process_media_url
+import reddit_api # Import the module itself for accessing moderation_statuses
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG, # Changed to DEBUG for more detailed startup info
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -39,6 +40,79 @@ logger = logging.getLogger(__name__)
 
 # Set QPixmapCache size to 100MB to cache more thumbnails
 QPixmapCache.setCacheLimit(100 * 1024)
+
+# --- Background Thread for Mod Log Fetching ---
+class ModLogFetcher(QThread):
+    """
+    Worker thread for asynchronous fetching of moderator logs.
+    """
+    modLogsReady = pyqtSignal(dict)
+    progressUpdate = pyqtSignal(str)
+
+    def __init__(self, reddit_instance, moderated_subreddits):
+        super().__init__()
+        self.reddit_instance = reddit_instance
+        self.moderated_subreddits = moderated_subreddits
+        self.prefetched_mod_logs = {}
+
+    def run(self):
+        total_subs = len(self.moderated_subreddits)
+        logger.info(f"Starting background fetch for mod logs of {total_subs} subreddits...")
+        self.progressUpdate.emit(f"Fetching mod logs (0/{total_subs})...")
+
+        for i, subreddit_info in enumerate(self.moderated_subreddits):
+            sub_name = subreddit_info['name']
+            display_name = subreddit_info['display_name']
+            logger.debug(f"Fetching mod log for r/{display_name} ({i+1}/{total_subs})")
+            try:
+                log_entries = list(self.reddit_instance.subreddit(sub_name).mod.log(action="removelink", limit=1000))
+                # Store only necessary info efficiently
+                self.prefetched_mod_logs[sub_name] = [
+                    {'author': entry.target_author.lower() if entry.target_author else None,
+                     'fullname': entry.target_fullname}
+                    for entry in log_entries if entry.target_fullname and entry.target_fullname.startswith('t3_')
+                ]
+                logger.debug(f"Fetched {len(log_entries)} log entries for r/{display_name}, stored {len(self.prefetched_mod_logs[sub_name])} relevant entries.")
+            except Exception as e:
+                logger.error(f"Error fetching mod log for r/{display_name}: {e}")
+                self.prefetched_mod_logs[sub_name] = [] # Store empty list on error
+
+            # Update progress
+            self.progressUpdate.emit(f"Fetching mod logs ({i+1}/{total_subs})...")
+
+        logger.info(f"Finished fetching mod logs for {total_subs} subreddits.")
+        self.modLogsReady.emit(self.prefetched_mod_logs)
+
+# --- Background Thread for Filtering ---
+class FilterWorker(QThread):
+    """
+    Worker thread for filtering posts by subreddit.
+    """
+    filteringComplete = pyqtSignal(list)
+
+    def __init__(self, snapshot, subreddit_name_lower):
+        super().__init__()
+        self.snapshot = snapshot
+        self.subreddit_name_lower = subreddit_name_lower
+
+    def run(self):
+        logger.debug(f"FilterWorker started for r/{self.subreddit_name_lower} with {len(self.snapshot)} posts.")
+        filtered_snapshot = []
+        try:
+            # Perform the filtering
+            filtered_snapshot = [
+                post for post in self.snapshot
+                if hasattr(post, 'subreddit') and
+                post.subreddit.display_name.lower() == self.subreddit_name_lower
+            ]
+            logger.debug(f"FilterWorker finished. Found {len(filtered_snapshot)} posts.")
+        except Exception as e:
+            logger.exception(f"Error during background filtering: {e}")
+            # Emit empty list on error? Or handle differently? Emitting empty for now.
+            filtered_snapshot = []
+        finally:
+            self.filteringComplete.emit(filtered_snapshot)
+
 
 class RedMediaBrowser(QMainWindow):
     """
@@ -68,7 +142,11 @@ class RedMediaBrowser(QMainWindow):
         # For moderated subreddits
         self.moderated_subreddits = []
         self.mod_subreddits_fetched = False
-        
+        self.prefetched_mod_logs = {}
+        self.mod_logs_ready = False
+        self.mod_log_fetcher_thread = None # To keep a reference
+        self.filter_worker_thread = None # To keep reference to filter worker
+
         # Set up the UI
         self.init_ui()
         
@@ -192,10 +270,12 @@ class RedMediaBrowser(QMainWindow):
         # Status bar at bottom
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
-        
+        self.mod_log_status_label = QLabel("") # Label for mod log status
+        self.statusBar.addPermanentWidget(self.mod_log_status_label)
+
         # Set initial values
         self.on_source_type_changed(0)  # Default to subreddit mode
-        
+
     def init_reddit(self):
         """Initialize Reddit API connection."""
         try:
@@ -246,12 +326,12 @@ class RedMediaBrowser(QMainWindow):
         self.mod_subreddits_fetcher = ModeratedSubredditsFetcher(self.reddit)
         self.mod_subreddits_fetcher.subredditsFetched.connect(self.on_mod_subreddits_fetched)
         self.mod_subreddits_fetcher.start()
-    
+
     def on_mod_subreddits_fetched(self, mod_subreddits):
-        """Handle the fetched list of moderated subreddits."""
+        """Handle the fetched list of moderated subreddits and start mod log fetching."""
         self.moderated_subreddits = mod_subreddits
         self.mod_subreddits_fetched = True
-        
+
         # Update button to show count
         count = len(mod_subreddits)
         self.mod_subreddits_button.setText(f"My Mod Subreddits ({count})")
@@ -261,7 +341,32 @@ class RedMediaBrowser(QMainWindow):
             self.mod_subreddits_button.setToolTip("You don't moderate any subreddits")
         else:
             self.mod_subreddits_button.setToolTip(f"You moderate {count} subreddits")
-    
+
+        # If user moderates subreddits, start fetching mod logs in the background
+        if count > 0 and not self.mod_logs_ready and (self.mod_log_fetcher_thread is None or not self.mod_log_fetcher_thread.isRunning()):
+            logger.info("Moderated subreddits found. Starting background mod log fetch.")
+            self.mod_log_fetcher_thread = ModLogFetcher(self.reddit, self.moderated_subreddits)
+            self.mod_log_fetcher_thread.modLogsReady.connect(self.on_mod_logs_ready)
+            self.mod_log_fetcher_thread.progressUpdate.connect(self.update_mod_log_status)
+            self.mod_log_fetcher_thread.start()
+        elif count == 0:
+            self.mod_log_status_label.setText("No mod logs to fetch.")
+            self.mod_logs_ready = True # Mark as ready even if empty
+
+    def on_mod_logs_ready(self, prefetched_logs):
+        """Handle the fetched moderator logs."""
+        logger.info("Background mod log fetching complete.")
+        self.prefetched_mod_logs = prefetched_logs
+        self.mod_logs_ready = True
+        self.mod_log_status_label.setText("Mod logs loaded.")
+        # Optionally hide the progress label after a delay
+        QTimer.singleShot(5000, lambda: self.mod_log_status_label.setText("Mod logs loaded.") if self.mod_logs_ready else None)
+
+
+    def update_mod_log_status(self, status_message):
+        """Update the status bar with mod log fetching progress."""
+        self.mod_log_status_label.setText(status_message)
+
     def show_mod_subreddits_menu(self):
         """Show a dropdown menu of moderated subreddits."""
         if not self.mod_subreddits_fetched:
@@ -392,9 +497,15 @@ class RedMediaBrowser(QMainWindow):
         # Update the status label
         self.source_label.setText(f"Loading {source_type}: {source}")
         
-        # Create a new gallery model
-        self.current_model = RedditGalleryModel(source, is_user_mode=is_user_mode, reddit_instance=self.reddit)
-        
+        # Create a new gallery model, passing the pre-fetched logs and status
+        self.current_model = RedditGalleryModel(
+            source,
+            is_user_mode=is_user_mode,
+            reddit_instance=self.reddit,
+            prefetched_mod_logs=self.prefetched_mod_logs,
+            mod_logs_ready=self.mod_logs_ready
+        )
+
         # Check if user is a moderator (only in subreddit mode)
         if not is_user_mode:
             is_mod = self.current_model.check_user_moderation_status()
@@ -495,12 +606,19 @@ class RedMediaBrowser(QMainWindow):
             # Get the image URLs
             from utils import extract_image_urls
             image_urls = extract_image_urls(submission)
-            
+
             # Skip submissions without any images
             if not image_urls:
                 logger.warning(f"No images found for submission ID {submission.id}")
                 return
-                
+
+            # Determine if the app user can moderate THIS post's subreddit
+            # Use the list stored in the model (fetched during model init)
+            can_moderate_this_post = False
+            if self.current_model and hasattr(self.current_model, 'moderated_subreddit_names'):
+                 post_subreddit_name = submission.subreddit.display_name.lower()
+                 can_moderate_this_post = post_subreddit_name in self.current_model.moderated_subreddit_names
+
             # Create the thumbnail widget
             thumbnail = ThumbnailWidget(
                 images=image_urls,
@@ -510,9 +628,9 @@ class RedMediaBrowser(QMainWindow):
                 subreddit_name=subreddit_name,
                 has_multiple_images=has_multiple_images,
                 post_url=permalink,
-                is_moderator=self.current_model.is_moderator if self.current_model else False
+                is_moderator=can_moderate_this_post # Pass the pre-calculated flag
             )
-            
+
             # Connect signals
             thumbnail.authorClicked.connect(self.on_author_clicked)
             
@@ -595,15 +713,39 @@ class RedMediaBrowser(QMainWindow):
         msg = QMessageBox()
         msg.setWindowTitle("Author Options")
         msg.setText(f"What would you like to do with u/{username}?")
-        
         view_button = msg.addButton("View Posts", QMessageBox.ButtonRole.ActionRole)
-        
-        # Only show moderation options if we're in a subreddit and user is a moderator
+
+        # Determine if the Ban button should be shown and the relevant subreddit context
+        can_ban = False
+        ban_subreddit_name = None
+        ban_subreddit_obj = None # Store the PRAW subreddit object if available
+
+        # Case 1: Viewing a subreddit directly as a mod
+        if (self.current_model and not self.current_model.is_user_mode and
+            hasattr(self.current_model, 'is_moderator') and self.current_model.is_moderator):
+            can_ban = True
+            ban_subreddit_name = self.current_model.source_name
+            ban_subreddit_obj = self.current_model.subreddit # Use the existing subreddit object
+            logger.debug(f"Ban context: Direct subreddit view r/{ban_subreddit_name}")
+        # Case 2: Viewing a user's posts, filtered by a subreddit the app user mods
+        elif (self.current_model and self.current_model.is_user_mode and
+              self.is_filtered and self.previous_subreddit and
+              hasattr(self.current_model, 'moderated_subreddit_names') and
+              self.previous_subreddit.lower() in self.current_model.moderated_subreddit_names):
+            can_ban = True
+            ban_subreddit_name = self.previous_subreddit
+            # We need to get the subreddit object here
+            try:
+                ban_subreddit_obj = self.reddit.subreddit(ban_subreddit_name)
+                logger.debug(f"Ban context: Filtered user view, target sub r/{ban_subreddit_name}")
+            except Exception as e:
+                logger.error(f"Error getting subreddit object for {ban_subreddit_name} in on_author_clicked: {e}")
+                can_ban = False # Cannot ban if we can't get the subreddit object
+
         ban_button = None
-        if (self.current_model and not self.current_model.is_user_mode and 
-            self.current_model.is_moderator):
+        if can_ban and ban_subreddit_obj: # Ensure we have the subreddit object
             ban_button = msg.addButton("Ban User", QMessageBox.ButtonRole.DestructiveRole)
-        
+
         cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         
         msg.exec()
@@ -645,12 +787,13 @@ class RedMediaBrowser(QMainWindow):
             # Use a brief delay to allow the UI to update before loading content
             QTimer.singleShot(100, lambda: self.load_content())
                     
-        elif clicked_button == ban_button:
-            # Open ban user dialog
-            self.open_ban_dialog(username)
-        
+        elif clicked_button == ban_button and ban_subreddit_obj: # Check if ban button was clicked and we have the object
+            # Open ban user dialog, passing the correct subreddit object
+            self.open_ban_dialog(username, ban_subreddit_obj)
+
         # Reset the flag when we're done (in case load_content wasn't called)
-        if clicked_button != view_button:
+        # Important: Reset flag *after* potential call to open_ban_dialog
+        if clicked_button != view_button: # This condition might need review if ban dialog is complex
             self.is_author_navigation = False
     
     def go_back_to_subreddit(self):
@@ -681,15 +824,21 @@ class RedMediaBrowser(QMainWindow):
         self.source_type_combo.setCurrentIndex(0)  # Switch to Subreddit mode
         self.source_input.setText(subreddit_name)
         
-        # Create the model manually instead of using load_content
-        self.current_model = RedditGalleryModel(subreddit_name, is_user_mode=False, reddit_instance=self.reddit)
-        
+        # Create the model manually, passing logs/status
+        self.current_model = RedditGalleryModel(
+            subreddit_name,
+            is_user_mode=False,
+            reddit_instance=self.reddit,
+            prefetched_mod_logs=self.prefetched_mod_logs,
+            mod_logs_ready=self.mod_logs_ready
+        )
+
         # Check moderation status
         is_mod = self.current_model.check_user_moderation_status()
         mod_status = "Moderator" if is_mod else "Not a moderator"
         self.mod_status_label.setText(mod_status)
         
-        # Update status
+         # Update status
         self.source_label.setText(f"Loading Subreddit: {subreddit_name}")
         
         # Create a special version of on_snapshot_fetched that will restore the page

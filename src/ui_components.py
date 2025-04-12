@@ -314,7 +314,8 @@ class ThumbnailWidget(QWidget):
         self.is_media_loaded = False
         self.is_fullscreen_open = False
         self.fullscreen_viewer = None
-        
+        self.original_title = title # Store original title
+
         # Reports data
         self.reports_count = 0
         self.report_reasons = []
@@ -375,7 +376,14 @@ class ThumbnailWidget(QWidget):
         self.postUrlLabel.setFixedHeight(20)
         self.infoLayout.addWidget(self.postUrlLabel)
         self.layout.addLayout(self.infoLayout)
-        
+
+        # Subreddit label section
+        self.subredditLabel = QLabel(f"r/{self.subreddit_name}")
+        self.subredditLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.subredditLabel.setStyleSheet("font-size: 9pt; color: grey;") # Example styling
+        self.subredditLabel.setFixedHeight(20)
+        self.layout.addWidget(self.subredditLabel) # Add below info layout
+
         # Image/video display section - give it more space in the layout
         self.imageLabel = ClickableLabel()
         self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -516,7 +524,9 @@ class ThumbnailWidget(QWidget):
         self.approve_button.setText("Approve")
         self.remove_button.setText("Remove")
         self.remove_button.setToolTip("Remove this submission")
-        
+        # Ensure title is reset to original in case it was modified elsewhere (shouldn't happen now)
+        self.titleLabel.setText(self.original_title)
+
         # Apply status-specific styling
         if status == "approved":
             self.approve_button.setStyleSheet("background-color: green; color: white;")
@@ -524,6 +534,7 @@ class ThumbnailWidget(QWidget):
         elif status == "removed":
             self.remove_button.setStyleSheet("background-color: red; color: white;")
             self.remove_button.setText("Removed")
+            # Do NOT modify the title here
         elif status == "removal_pending":
             self.remove_button.setStyleSheet("background-color: orange; color: white;")
             self.remove_button.setText("Retry Remove")

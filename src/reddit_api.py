@@ -12,6 +12,9 @@ import praw
 import prawcore.exceptions
 from PyQt6.QtCore import QThread, pyqtSignal
 
+# Import the main app's ModLogFetcher for type hinting if needed, or just use dict
+# from red_media_browser import ModLogFetcher # Avoid circular import if possible
+
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -84,26 +87,50 @@ class RedditGalleryModel:
     Model class for Reddit gallery data.
     Handles fetching and storing submissions from subreddits or user profiles.
     """
-    def __init__(self, name: str, is_user_mode: bool = False, reddit_instance=None):
+    def __init__(self, name: str, is_user_mode: bool = False, reddit_instance=None,
+                 prefetched_mod_logs: Optional[Dict[str, List[Dict]]] = None,
+                 mod_logs_ready: bool = False):
         """
         Initialize the gallery model.
-        
+
         Args:
             name: Subreddit name or username
             is_user_mode: If True, name is treated as a username
             reddit_instance: PRAW Reddit instance to use
+            prefetched_mod_logs: Dictionary of pre-fetched mod logs keyed by subreddit name.
+            mod_logs_ready: Flag indicating if pre-fetched logs are ready.
         """
         self.is_user_mode = is_user_mode
-        self.is_moderator = False
+        self.is_moderator = False # Specific to subreddit view, determined later
         self.snapshot = []  # Snapshot of submissions (up to 100)
         self.source_name = name
         self.reddit = reddit_instance
-        
+        self.prefetched_logs = prefetched_mod_logs if prefetched_mod_logs is not None else {}
+        self.logs_ready = mod_logs_ready
+        self.moderated_subreddit_names = set() # Store names of subs the app user mods
+
         if self.reddit:
+            # Fetch moderated subreddit names immediately for use later
+            try:
+                mod_subs_info = get_moderated_subreddits(self.reddit)
+                self.moderated_subreddit_names = {sub['name'] for sub in mod_subs_info}
+                logger.debug(f"Model initialized with {len(self.moderated_subreddit_names)} moderated subreddit names.")
+            except Exception as e:
+                logger.error(f"Error fetching moderated subreddits during model init: {e}")
+
+            # Set up user or subreddit object
             if self.is_user_mode:
-                self.user = self.reddit.redditor(name)
+                try:
+                    self.user = self.reddit.redditor(name)
+                except Exception as e:
+                    logger.error(f"Error getting redditor object for {name}: {e}")
+                    self.user = None # Handle potential errors
             else:
-                self.subreddit = self.reddit.subreddit(name)
+                try:
+                    self.subreddit = self.reddit.subreddit(name)
+                except Exception as e:
+                    logger.error(f"Error getting subreddit object for {name}: {e}")
+                    self.subreddit = None # Handle potential errors
 
     def check_user_moderation_status(self) -> bool:
         """
@@ -223,11 +250,81 @@ class RedditGalleryModel:
                 params['after'] = after
             
             if self.is_user_mode:
+                if not self.user:
+                    logger.error("Cannot fetch user submissions, user object is None.")
+                    return []
                 # Fetch user submissions
-                snapshot = list(self.user.submissions.new(limit=total, params=params))
+                user_submissions = list(self.user.submissions.new(limit=total, params=params))
+                logger.debug(f"Fetched {len(user_submissions)} initial posts for user {self.source_name}")
+
+                # --- Logic to find and merge removed posts using pre-fetched logs ---
+                removed_post_fullnames = set()
+                target_username_lower = self.source_name.lower()
+
+                if not self.logs_ready:
+                    logger.warning("Mod logs not yet loaded. Removed posts might be missing from user view.")
+                else:
+                    logger.debug(f"Checking pre-fetched logs for removed posts by {target_username_lower} across {len(self.moderated_subreddit_names)} moderated subs.")
+                    for sub_name in self.moderated_subreddit_names:
+                        log_entries = self.prefetched_logs.get(sub_name, [])
+                        found_in_sub = 0
+                        for entry in log_entries:
+                            # Check if the author matches the target user
+                            if entry.get('author') == target_username_lower:
+                                fullname = entry.get('fullname')
+                                if fullname:
+                                    removed_post_fullnames.add(fullname)
+                                    found_in_sub += 1
+                        if found_in_sub > 0:
+                             logger.debug(f"Found {found_in_sub} potential removed posts by {target_username_lower} in r/{sub_name} log.")
+
+                if removed_post_fullnames:
+                    logger.info(f"Found {len(removed_post_fullnames)} potential removed posts across all moderated logs for user {target_username_lower}.")
+                    try:
+                        # Fetch the actual submission objects for removed posts
+                        # Filter fullnames that might already be in user_submissions to avoid redundant fetch
+                        existing_fullnames = {sub.fullname for sub in user_submissions}
+                        fullnames_to_fetch = list(removed_post_fullnames - existing_fullnames)
+
+                        removed_submissions = []
+                        if fullnames_to_fetch:
+                             removed_submissions = list(self.reddit.info(fullnames=fullnames_to_fetch))
+                             logger.debug(f"Fetched {len(removed_submissions)} submission objects for removed posts.")
+                        else:
+                             logger.debug("All potential removed posts were already in the initial user fetch.")
+
+
+                        # Mark these as removed in the global status dict
+                        for sub in removed_submissions:
+                            moderation_statuses[sub.id] = "removed"
+                            logger.debug(f"Marked {sub.id} as removed based on mod log.")
+
+                        # Merge removed_submissions with user_submissions
+                        merged_dict = {sub.id: sub for sub in user_submissions}
+                        # Add/overwrite with removed submissions (ensures they are included)
+                        for sub in removed_submissions:
+                             merged_dict[sub.id] = sub
+
+                        snapshot = list(merged_dict.values())
+                        # Sort the final list by creation time
+                        snapshot.sort(key=lambda s: s.created_utc, reverse=True)
+                        logger.debug(f"Merged snapshot size after adding removed posts: {len(snapshot)}")
+
+                    except Exception as e:
+                        logger.exception(f"Error fetching or merging removed posts for user {target_username_lower}: {e}")
+                        # Fallback to just the initially fetched user submissions
+                        snapshot = user_submissions
+                else:
+                    # No removed posts found in logs, use original list
+                    snapshot = user_submissions
+                # --- End of removed posts logic ---
+
             else:
-                # Fetch subreddit submissions
-                if self.is_moderator:
+                # Fetch subreddit submissions (existing logic)
+                if not self.subreddit:
+                    logger.error("Cannot fetch subreddit submissions, subreddit object is None.")
+                    return []
+                if self.check_user_moderation_status(): # Check mod status here
                     # For moderators, fetch a mix of submissions including modqueue and reported posts
                     new_subs = list(self.subreddit.new(limit=total, params=params))
                     logger.debug(f"Fetched {len(new_subs)} new posts from subreddit")

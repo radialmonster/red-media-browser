@@ -1218,6 +1218,15 @@ class ThumbnailWidget(QWidget):
     
     def remove_submission(self):
         """Remove the current submission (moderator action)."""
+        # Stop playback and cleanup media *before* blocking API call
+        logger.debug(f"Remove clicked for {self.submission_id}. Cleaning up media first.")
+        if hasattr(self, 'playback_monitor') and self.playback_monitor:
+            self.playback_monitor.stop()
+            logger.debug("Stopped playback monitor.")
+        self.cleanup_current_media()
+        logger.debug("Media cleanup complete.")
+        
+        # Now attempt the removal
         if reddit_api.remove_submission(self.praw_submission):
             self.update_moderation_status_ui()
     

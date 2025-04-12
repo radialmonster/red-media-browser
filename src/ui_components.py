@@ -356,33 +356,36 @@ class ThumbnailWidget(QWidget):
         title_layout.addWidget(self.titleLabel)
         
         self.layout.addWidget(title_container)
-        
-        # Author and URL info section
+
+        # Subreddit label section (Defined early so it can be added to infoLayout)
+        self.subredditLabel = QLabel(f"r/{self.subreddit_name}")
+        self.subredditLabel.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter) # Center align vertically too
+        self.subredditLabel.setStyleSheet("font-size: 9pt; color: grey;") # Example styling
+        self.subredditLabel.setFixedHeight(20)
+        # self.layout.addWidget(self.subredditLabel) # Removed: Now added to infoLayout below
+
+        # Author, Subreddit, and URL info section
         self.infoLayout = QHBoxLayout()
         try:
             username = self.praw_submission.author.name if self.praw_submission.author else "unknown"
         except Exception:
             username = "unknown"
-            
+
         self.authorLabel = ClickableLabel()
         self.authorLabel.setText(username)
         self.authorLabel.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.authorLabel.setFixedHeight(20)
         self.authorLabel.clicked.connect(lambda: self.authorClicked.emit(username))
-        self.infoLayout.addWidget(self.authorLabel)
-        
+        self.infoLayout.addWidget(self.authorLabel) # Add author
+        self.infoLayout.addSpacing(10) # Add space
+        self.infoLayout.addWidget(self.subredditLabel) # Add subreddit (defined above)
+        self.infoLayout.addSpacing(10) # Add space
+
         self.postUrlLabel = QLabel(self.source_url)
         self.postUrlLabel.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.postUrlLabel.setFixedHeight(20)
         self.infoLayout.addWidget(self.postUrlLabel)
         self.layout.addLayout(self.infoLayout)
-
-        # Subreddit label section
-        self.subredditLabel = QLabel(f"r/{self.subreddit_name}")
-        self.subredditLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.subredditLabel.setStyleSheet("font-size: 9pt; color: grey;") # Example styling
-        self.subredditLabel.setFixedHeight(20)
-        self.layout.addWidget(self.subredditLabel) # Add below info layout
 
         # Image/video display section - give it more space in the layout
         self.imageLabel = ClickableLabel()

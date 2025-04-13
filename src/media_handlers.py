@@ -20,7 +20,7 @@ from PyQt6.QtCore import QObject, QRunnable, pyqtSignal, pyqtSlot
 
 from utils import (
     normalize_redgifs_url, ensure_json_url, get_cache_path_for_url,
-    file_exists_in_cache, get_domain_cache_dir
+    file_exists_in_cache, get_domain_cache_dir, update_metadata_cache
 )
 
 # Set up logging
@@ -493,49 +493,73 @@ def process_media_url(url):
 
 # Signal class for worker communication
 class WorkerSignals(QObject):
-    finished = pyqtSignal(str)  # Emits the downloaded file path
+    # Emits the downloaded file path and the original submission object/dict
+    finished = pyqtSignal(str, object) 
     progress = pyqtSignal(int)  # Emits download progress percentage
-    error = pyqtSignal(str)     # Emits error message if download fails
+    error = pyqtSignal(str, object)     # Emits error message and the submission object/dict
 
 # Asynchronous media downloader
 class MediaDownloadWorker(QRunnable):
     """
     Worker for downloading media files asynchronously.
-    Includes progress reporting and error handling.
+    Includes progress reporting, error handling, and metadata caching.
     """
-    def __init__(self, url):
+    def __init__(self, url, submission_data):
         super().__init__()
         self.original_url = url
-        self.processed_url = process_media_url(url)
+        # Store the submission data (could be PRAW object or filtered dict)
+        self.submission_data = submission_data 
+        # Process the URL immediately to get the target for caching/download
+        self.processed_url = process_media_url(url) 
         self.signals = WorkerSignals()
-        logger.debug(f"MediaDownloadWorker initialized: original={self.original_url}, processed={self.processed_url}")
+        submission_id = getattr(submission_data, 'id', 'UnknownID')
+        logger.debug(f"MediaDownloadWorker initialized for {submission_id}: original={self.original_url}, processed={self.processed_url}")
         
     @pyqtSlot()
     def run(self):
         """
         Entry point for the worker.
-        Downloads the media file and reports progress.
+        Downloads the media file, reports progress, and updates metadata cache.
         """
+        cache_path = None # Initialize cache_path
+        submission_id = getattr(self.submission_data, 'id', 'UnknownID')
         try:
             # Skip empty URLs
             if not self.processed_url:
-                logger.error("Empty URL provided to MediaDownloadWorker")
-                self.signals.error.emit("Empty URL provided")
+                logger.error(f"Empty processed URL for submission {submission_id}")
+                self.signals.error.emit("Empty processed URL", self.submission_data)
                 return
-                
-            # Check if already cached
+
+            # Determine cache path based on the *processed* URL
             cache_path = get_cache_path_for_url(self.processed_url)
-            if cache_path and os.path.exists(cache_path):
-                logger.debug(f"File already cached: {cache_path}")
-                self.signals.finished.emit(cache_path)
+            if not cache_path:
+                 logger.error(f"Could not determine cache path for processed URL: {self.processed_url} (Submission: {submission_id})")
+                 raise ValueError("Could not determine cache path")
+
+            # Check if already cached
+            if os.path.exists(cache_path):
+                logger.debug(f"File already cached for submission {submission_id}: {cache_path}")
+                # Update metadata even if file is cached (submission data might be newer)
+                update_metadata_cache(self.submission_data, cache_path, self.processed_url)
+                self.signals.finished.emit(cache_path, self.submission_data)
                 return
-                
-            # Download the file
-            file_path = self.download_file(self.processed_url)
-            self.signals.finished.emit(file_path)
+
+            # Download the file using the processed URL
+            logger.debug(f"Starting download for submission {submission_id} from {self.processed_url}")
+            file_path = self.download_file(self.processed_url) # This returns the final cache_path
+
+            # Update metadata cache after successful download
+            if file_path and os.path.exists(file_path):
+                 update_metadata_cache(self.submission_data, file_path, self.processed_url)
+                 self.signals.finished.emit(file_path, self.submission_data)
+            else:
+                 # This case should ideally not happen if download_file doesn't raise error
+                 logger.error(f"Download completed but file path is invalid or file doesn't exist: {file_path} (Submission: {submission_id})")
+                 self.signals.error.emit("Download finished but file invalid", self.submission_data)
+
         except Exception as e:
-            logger.exception(f"Error downloading media: {e}")
-            self.signals.error.emit(str(e))
+            logger.exception(f"Error downloading media for submission {submission_id}: {e}")
+            self.signals.error.emit(str(e), self.submission_data)
 
     def download_file(self, url):
         """

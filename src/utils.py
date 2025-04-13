@@ -13,9 +13,18 @@ import html
 from urllib.parse import urlparse, unquote, quote, parse_qs, urljoin
 import shutil
 import requests
+import json
+import time
+import threading
+from praw.models import Redditor, Subreddit # For type checking in filtering
 
 # Basic Logging Configuration
 logger = logging.getLogger(__name__)
+
+# --- Metadata Cache Globals ---
+_submission_index = None
+_index_lock = threading.Lock()
+_index_path = None
 
 def ensure_directory(directory):
     """Ensure that the specified directory exists."""
@@ -224,3 +233,341 @@ def get_cache_path_for_url(url):
     except Exception as e:
         logger.exception(f"Error determining cache path for URL {url}: {e}")
         return None
+
+# --- Metadata Cache Functions ---
+
+def get_metadata_dir():
+    """Return the directory for storing metadata JSON files."""
+    metadata_dir = os.path.join(get_cache_dir(), 'metadata')
+    return ensure_directory(metadata_dir)
+
+def get_metadata_file_path(submission_id):
+    """
+    Generate the structured path for a submission's metadata JSON file.
+    Example: cache/metadata/t3/ab/cd/ef/t3_abcdef.json
+    """
+    if not submission_id or not isinstance(submission_id, str):
+        logger.error(f"Invalid submission_id provided: {submission_id}")
+        return None
+        
+    # Remove prefix like 't3_' if present for directory structure
+    base_id = submission_id.split('_')[-1]
+    if len(base_id) < 6: # Ensure we have enough characters for subdirs
+        logger.warning(f"Submission ID too short for standard directory structure: {submission_id}")
+        # Use a fallback structure or just place it directly? For now, place directly under prefix.
+        prefix = submission_id.split('_')[0] if '_' in submission_id else 'unknown'
+        subdir = os.path.join(get_metadata_dir(), prefix)
+    else:
+        # Use parts of the ID for subdirectories: e.g., /t3/ab/cd/ef/
+        prefix = submission_id.split('_')[0] if '_' in submission_id else 'unknown'
+        subdir = os.path.join(get_metadata_dir(), prefix, base_id[0:2], base_id[2:4], base_id[4:6])
+
+    ensure_directory(subdir)
+    return os.path.join(subdir, f"{submission_id}.json")
+
+def _get_index_path():
+    """Get the path to the submission index file."""
+    global _index_path
+    if _index_path is None:
+        _index_path = os.path.join(get_cache_dir(), 'submission_index.json')
+    return _index_path
+
+def load_submission_index(force_reload=False):
+    """
+    Load the submission index from JSON file.
+    Uses a cached version unless force_reload is True.
+    Thread-safe access to the global index cache.
+    """
+    global _submission_index
+    index_path = _get_index_path()
+
+    with _index_lock:
+        if _submission_index is not None and not force_reload:
+            return _submission_index
+
+        if os.path.exists(index_path):
+            try:
+                with open(index_path, 'r', encoding='utf-8') as f:
+                    _submission_index = json.load(f)
+                logger.debug(f"Loaded submission index with {len(_submission_index)} entries.")
+                return _submission_index
+            except json.JSONDecodeError:
+                logger.error(f"Error decoding submission index file: {index_path}. Starting fresh.")
+                _submission_index = {}
+                return _submission_index
+            except Exception as e:
+                logger.exception(f"Error loading submission index: {e}")
+                _submission_index = {} # Fallback to empty dict on error
+                return _submission_index
+        else:
+            logger.debug("Submission index file not found. Initializing empty index.")
+            _submission_index = {}
+            return _submission_index
+
+def save_submission_index():
+    """
+    Save the current submission index to JSON file.
+    Thread-safe. Writes to a temporary file first.
+    """
+    global _submission_index
+    index_path = _get_index_path()
+    temp_path = index_path + ".tmp"
+
+    with _index_lock:
+        if _submission_index is None:
+            logger.warning("Attempted to save submission index, but it's not loaded.")
+            return # Or maybe load it first? For now, just return.
+
+        try:
+            # Write to temporary file
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(_submission_index, f, indent=2) # Use indent for readability
+
+            # Rename temporary file to actual index file (atomic on most systems)
+            os.replace(temp_path, index_path)
+            logger.debug(f"Saved submission index with {len(_submission_index)} entries.")
+        except Exception as e:
+            logger.exception(f"Error saving submission index: {e}")
+            # Clean up temp file if it exists
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass # Ignore error during cleanup
+
+def read_metadata_file(metadata_path):
+    """Read and parse a specific metadata JSON file."""
+    if not metadata_path or not os.path.exists(metadata_path):
+        return None
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        logger.error(f"Error decoding metadata file: {metadata_path}")
+        return None # Or raise? For now return None
+    except Exception as e:
+        logger.exception(f"Error reading metadata file {metadata_path}: {e}")
+        return None
+
+def write_metadata_file(metadata_path, metadata):
+    """Write metadata to a specific JSON file."""
+    if not metadata_path or not metadata:
+        logger.error("Missing metadata_path or metadata for writing.")
+        return False
+    try:
+        # Ensure directory exists (should be handled by get_metadata_file_path, but double check)
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        
+        temp_path = metadata_path + ".tmp"
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2) # Use indent for readability
+        os.replace(temp_path, metadata_path)
+        return True
+    except Exception as e:
+        logger.exception(f"Error writing metadata file {metadata_path}: {e}")
+        # Clean up temp file if it exists
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        return False
+
+def _filter_submission_data(submission):
+    """
+    Filters a PRAW Submission object's attributes for caching.
+    Removes internal PRAW objects, comments, and simplifies complex objects.
+    """
+    if not submission:
+        return {}
+
+    # Attributes to explicitly exclude
+    exclude_keys = {
+        'comments', '_reddit', '_mod', '_fetched', '_info_params',
+        'comment_limit', 'comment_sort', # Related to comments
+        # Potentially others depending on PRAW version and usage
+    }
+
+    # Attributes to simplify (store identifier instead of object)
+    simplify_keys = {
+        'author': lambda obj: getattr(obj, 'name', None) if isinstance(obj, Redditor) else str(obj),
+        'subreddit': lambda obj: getattr(obj, 'display_name', None) if isinstance(obj, Subreddit) else str(obj),
+        # Add others if needed, e.g., 'approved_by', 'banned_by'
+    }
+
+    data = {}
+    # Use vars() or __dict__ cautiously, prefer iterating known attributes if possible
+    # PRAW objects might not have a clean __dict__
+    # Let's try iterating dir() and getattr, filtering as we go
+    for attr in dir(submission):
+        if attr.startswith('_') or attr in exclude_keys:
+            continue # Skip private/internal and excluded keys
+
+        try:
+            value = getattr(submission, attr)
+
+            # Skip methods
+            if callable(value):
+                continue
+
+            # Simplify complex objects
+            if attr in simplify_keys:
+                data[attr] = simplify_keys[attr](value)
+            # Basic types that are safe for JSON
+            elif isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                 # Basic check for list/dict contents (optional, can be slow)
+                 # if isinstance(value, (list, dict)):
+                 #     try:
+                 #         json.dumps(value) # Quick check if serializable
+                 #     except TypeError:
+                 #         logger.warning(f"Skipping non-serializable attribute '{attr}' in submission {submission.id}")
+                 #         continue
+                 data[attr] = value
+            # Log other types we might be missing
+            # else:
+            #     logger.debug(f"Skipping attribute '{attr}' of type {type(value)} for submission {submission.id}")
+
+        except Exception as e:
+            # Handle potential errors accessing attributes (e.g., prawcore exceptions)
+            logger.warning(f"Could not access attribute '{attr}' for submission {submission.id}: {e}")
+            continue
+
+    # Ensure essential fields are present even if getattr failed (shouldn't happen often)
+    essential = ['id', 'name', 'title', 'permalink', 'url']
+    for key in essential:
+        if key not in data:
+            try:
+                data[key] = getattr(submission, key, None)
+            except: # Catch broad exception as fallback
+                 data[key] = None
+
+    return data
+
+
+def update_metadata_cache(submission, media_cache_path, final_media_url):
+    """
+    Updates the metadata cache for a given submission.
+    Writes the filtered submission data to its JSON file and updates the index.
+    """
+    if not submission or not hasattr(submission, 'id'):
+        logger.error("Invalid submission object provided to update_metadata_cache.")
+        return False
+
+    submission_id = submission.id
+    metadata_path = get_metadata_file_path(submission_id)
+    if not metadata_path:
+        logger.error(f"Could not determine metadata path for submission {submission_id}.")
+        return False
+
+    # Filter the submission data
+    metadata = _filter_submission_data(submission)
+
+    # Add/Update our custom fields
+    metadata['cache_path'] = media_cache_path # Absolute path to media
+    metadata['media_url'] = final_media_url # The URL that was actually downloaded
+    metadata['last_checked_utc'] = time.time()
+
+    # Determine initial moderation status from PRAW object attributes
+    initial_mod_status = None
+    try:
+        if getattr(submission, 'approved', False):
+            initial_mod_status = "approved"
+        elif getattr(submission, 'removed', False) or getattr(submission, 'banned_by', None) is not None:
+            # Check 'removed' or if 'banned_by' is set (indicating removal)
+            initial_mod_status = "removed"
+        # Add more checks if needed, e.g., spam status
+        # elif getattr(submission, 'spam', False):
+        #     initial_mod_status = "spam" # Or maybe just "removed"?
+    except Exception as e:
+        logger.warning(f"Could not determine initial mod status for {submission_id}: {e}")
+
+    # Only add moderation_status if it's determined (approved/removed)
+    # Otherwise, leave it out or set to None, indicating neutral/unknown initial state
+    if initial_mod_status:
+         metadata['moderation_status'] = initial_mod_status
+    elif 'moderation_status' in metadata:
+         # Ensure we don't carry over an old status if the new check is neutral
+         del metadata['moderation_status']
+
+
+    # Write the individual metadata file
+    if not write_metadata_file(metadata_path, metadata):
+        logger.error(f"Failed to write metadata file for submission {submission_id}.")
+        return False # Stop if writing the main data fails
+
+    # Update the index
+    index = load_submission_index() # Load current index (might be cached)
+    # Store relative path from cache_dir for portability
+    relative_metadata_path = os.path.relpath(metadata_path, get_cache_dir())
+    
+    # Use posix path separators for consistency across OS
+    relative_metadata_path = relative_metadata_path.replace(os.sep, '/') 
+    
+    index[submission_id] = relative_metadata_path
+    # No need to set _submission_index globally here, save_submission_index reads it
+
+    # Save the updated index
+    save_submission_index()
+    logger.debug(f"Updated metadata cache and index for submission {submission_id}")
+    return True
+
+def clear_metadata_cache():
+    """Deletes all cached metadata JSON files and the index."""
+    metadata_dir = get_metadata_dir()
+    index_path = _get_index_path()
+    
+    logger.info("Clearing metadata cache...")
+    try:
+        if os.path.exists(metadata_dir):
+            shutil.rmtree(metadata_dir)
+            logger.debug(f"Removed metadata directory: {metadata_dir}")
+        # Recreate the base metadata directory
+        ensure_directory(metadata_dir)
+        
+        if os.path.exists(index_path):
+            os.remove(index_path)
+            logger.debug(f"Removed submission index file: {index_path}")
+            
+        # Clear the in-memory cache
+        global _submission_index
+        with _index_lock:
+             _submission_index = {}
+             
+        logger.info("Metadata cache cleared.")
+        return True
+    except Exception as e:
+        logger.exception(f"Error clearing metadata cache: {e}")
+        return False
+
+def clear_full_cache():
+    """Deletes all cached media files AND metadata."""
+    cache_dir = get_cache_dir()
+    logger.info("Clearing full cache (media and metadata)...")
+    try:
+        # List contents *before* deleting the main dir
+        items = os.listdir(cache_dir)
+        for item in items:
+            item_path = os.path.join(cache_dir, item)
+            try:
+                if os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                    logger.debug(f"Removed directory: {item_path}")
+                else:
+                    os.remove(item_path)
+                    logger.debug(f"Removed file: {item_path}")
+            except Exception as item_e:
+                 logger.error(f"Error removing cache item {item_path}: {item_e}")
+                 
+        # Ensure cache dir exists after clearing
+        ensure_directory(cache_dir)
+        
+        # Clear the in-memory index cache
+        global _submission_index
+        with _index_lock:
+             _submission_index = {}
+             
+        logger.info("Full cache cleared.")
+        return True
+    except Exception as e:
+        logger.exception(f"Error clearing full cache: {e}")
+        return False

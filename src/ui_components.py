@@ -24,7 +24,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QThreadPool
 from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie, QIcon
 
-from utils import get_media_type
+# Import caching utilities needed for moderation status
+from utils import get_media_type, get_metadata_file_path, read_metadata_file
 from media_handlers import process_media_url, MediaDownloadWorker
 import reddit_api
 
@@ -289,12 +290,13 @@ class ThumbnailWidget(QWidget):
     
     # Signal emitted when media is ready for display
     mediaReady = pyqtSignal()
-    
-    def __init__(self, images, title, source_url, submission, 
-                 subreddit_name, has_multiple_images, post_url, is_moderator):
+
+    def __init__(self, images, title, source_url, submission,
+                 subreddit_name, has_multiple_images, post_url, is_moderator, reddit_instance): # Added reddit_instance
         super().__init__()
-        
+
         # Store submission data
+        self.reddit_instance = reddit_instance # Store the reddit instance
         self.praw_submission = submission
         self.submission_id = submission.id
         self.images = images
@@ -366,16 +368,38 @@ class ThumbnailWidget(QWidget):
 
         # Author, Subreddit, and URL info section
         self.infoLayout = QHBoxLayout()
+
+        username = "unknown" # Default
         try:
-            username = self.praw_submission.author.name if self.praw_submission.author else "unknown"
-        except Exception:
+            author_data = self.praw_submission.author
+            if author_data:
+                # Check if it's a PRAW Redditor object (live data)
+                if hasattr(author_data, 'name'):
+                    username = author_data.name
+                # Check if it's a string (cached data)
+                elif isinstance(author_data, str):
+                    username = author_data
+                # Add any other potential types if necessary, otherwise stays "unknown"
+        except AttributeError:
+            # Catch potential AttributeError if author_data itself doesn't exist on praw_submission
+            # (Shouldn't happen with current caching, but good practice)
+            logger.warning(f"Submission {self.submission_id} missing 'author' attribute entirely.")
+            username = "unknown"
+        except Exception as e:
+            # Catch any other unexpected errors
+            logger.error(f"Error accessing author for {self.submission_id}: {e}")
+            username = "unknown"
+
+        # Ensure username is not None before setting text
+        if username is None:
             username = "unknown"
 
         self.authorLabel = ClickableLabel()
         self.authorLabel.setText(username)
         self.authorLabel.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.authorLabel.setFixedHeight(20)
-        self.authorLabel.clicked.connect(lambda: self.authorClicked.emit(username))
+        # Use a lambda to capture the *current* value of username when connecting the signal
+        self.authorLabel.clicked.connect(lambda u=username: self.authorClicked.emit(u) if u != "unknown" else None)
         self.infoLayout.addWidget(self.authorLabel) # Add author
         self.infoLayout.addSpacing(10) # Add space
         self.infoLayout.addWidget(self.subredditLabel) # Add subreddit (defined above)
@@ -518,9 +542,20 @@ class ThumbnailWidget(QWidget):
         self.layout.addLayout(self.moderation_layout)
     
     def update_moderation_status_ui(self):
-        """Update the moderation button appearance based on the current status."""
-        status = reddit_api.moderation_statuses.get(self.submission_id)
-        
+        """Update the moderation button appearance based on the current status from cache."""
+        # Fetch status from cached metadata
+        status = None
+        metadata_path = get_metadata_file_path(self.submission_id)
+        if metadata_path:
+            metadata = read_metadata_file(metadata_path)
+            if metadata:
+                status = metadata.get('moderation_status')
+                logger.debug(f"Moderation status for {self.submission_id} from cache: {status}")
+            else:
+                logger.debug(f"No metadata found for {self.submission_id} at {metadata_path}")
+        else:
+            logger.debug(f"Could not determine metadata path for {self.submission_id}")
+
         # Reset styles first
         self.approve_button.setStyleSheet("")
         self.remove_button.setStyleSheet("")
@@ -546,77 +581,29 @@ class ThumbnailWidget(QWidget):
             self.remove_button.setEnabled(True)
     
     def fetch_reports(self):
-        """Fetch reports for the current submission."""
+        """Fetch reports for the current submission using the dedicated API function."""
         try:
-            # Direct access to reports attributes for faster detection
-            mod_reports = getattr(self.praw_submission, 'mod_reports', [])
-            user_reports = getattr(self.praw_submission, 'user_reports', [])
-            
-            # Safely calculate report count
-            mod_report_count = len(mod_reports)
-            user_report_count = 0
-            
-            # Handle user reports safely regardless of format
-            if user_reports:
-                for report_item in user_reports:
-                    # Check if it's a tuple/list with at least 2 items and second is an int
-                    if isinstance(report_item, (list, tuple)) and len(report_item) >= 2:
-                        if isinstance(report_item[1], int):
-                            user_report_count += report_item[1]
-                        else:
-                            # If second item isn't an int, just count each item as 1
-                            user_report_count += 1
-                    else:
-                        # If it's not in expected format, just count each item as 1
-                        user_report_count += 1
-            
-            direct_report_count = mod_report_count + user_report_count
-            
-            if direct_report_count > 0:
-                logger.debug(f"Direct report detection: Post {self.praw_submission.id} has {direct_report_count} reports")
-                formatted_reports = []
-                
-                # Format the mod reports
-                for reason, moderator in mod_reports:
-                    formatted_reports.append(f"Moderator {moderator}: {reason}")
-                
-                # Format the user reports - safely handle different formats
-                for report_item in user_reports:
-                    try:
-                        if isinstance(report_item, (list, tuple)):
-                            if len(report_item) >= 2:
-                                reason = report_item[0]
-                                if isinstance(report_item[1], int) and report_item[1] > 1:
-                                    formatted_reports.append(f"Users ({report_item[1]}): {reason}")
-                                else:
-                                    formatted_reports.append(f"User: {reason}")
-                            else:
-                                formatted_reports.append(f"Report: {report_item}")
-                        else:
-                            # Handle any other format
-                            formatted_reports.append(f"Report: {report_item}")
-                    except Exception as e:
-                        logger.error(f"Error formatting report item: {e}")
-                
-                self.reports_count = direct_report_count
-                self.report_reasons = formatted_reports
-                self.reports_button.setText(f"Reports ({direct_report_count})")
-                self.reports_button.show()
-                return
-            
-            # Fallback to API function if direct detection didn't find reports
-            report_count, report_reasons = reddit_api.get_submission_reports(self.praw_submission)
+            # Directly call the API function which handles caching and fetching
+            # Pass the stored reddit_instance
+            report_count, report_reasons = reddit_api.get_submission_reports(self.praw_submission, self.reddit_instance)
             self.reports_count = report_count
             self.report_reasons = report_reasons
-            
+
             # Update UI to show reports button if there are reports
             if report_count > 0:
-                self.reports_button.setText(f"Reports ({report_count})")
+                # Use a shorter format for report count to avoid width issues
+                if report_count > 999:
+                    self.reports_button.setText(f"Rep(999+)")
+                else:
+                    self.reports_button.setText(f"Reports ({report_count})")
                 self.reports_button.show()
+                logger.debug(f"Fetched reports via API function: {report_count} for post {self.praw_submission.id}")
             else:
                 self.reports_button.hide()
+                logger.debug(f"No reports found via API function for post {self.praw_submission.id}")
+
         except Exception as e:
-            logger.exception(f"Error fetching reports: {e}")
+            logger.exception(f"Error fetching reports via API function: {e}")
             # If there's any error, hide the reports button
             if hasattr(self, 'reports_button'):
                 self.reports_button.hide()
@@ -683,8 +670,9 @@ class ThumbnailWidget(QWidget):
         # Create a weak reference to avoid memory leaks
         weak_self = weakref.ref(self)
         
-        # Create a download worker
-        worker = MediaDownloadWorker(url)
+        # Create a download worker, passing the submission data
+        # self.praw_submission holds either the PRAW object or the SimpleNamespace from cache
+        worker = MediaDownloadWorker(url, self.praw_submission)
         
         # Connect signals with safety checks
         # Use lambda functions with try/except to prevent crashes if widget is deleted
@@ -1225,12 +1213,13 @@ class ThumbnailWidget(QWidget):
         self.is_fullscreen_open = False
         self.fullscreen_viewer = None
     
-    def approve_submission(self):
+    def approve_submission(self): # Line 1195
         """Approve the current submission (moderator action)."""
-        if reddit_api.approve_submission(self.praw_submission):
+        # Pass the stored reddit_instance to the API function
+        if reddit_api.approve_submission(self.praw_submission, self.reddit_instance):
             self.update_moderation_status_ui()
-    
-    def remove_submission(self):
+
+    def remove_submission(self): # Line 1201 - Corrected indentation
         """Remove the current submission (moderator action)."""
         # Stop playback and cleanup media *before* blocking API call
         logger.debug(f"Remove clicked for {self.submission_id}. Cleaning up media first.")
@@ -1241,15 +1230,16 @@ class ThumbnailWidget(QWidget):
         logger.debug("Media cleanup complete.")
         
         # Now attempt the removal
-        if reddit_api.remove_submission(self.praw_submission):
+        # Pass the stored reddit_instance to the API function
+        if reddit_api.remove_submission(self.praw_submission, self.reddit_instance):
             self.update_moderation_status_ui()
     
-    def close(self):
+    def close(self): # Line 1214 - Corrected indentation
         """Clean up resources when the widget is closed."""
         self.cleanup_current_media()
         super().close()
     
-    def show_previous_image(self):
+    def show_previous_image(self): # Line 1219 - Corrected indentation
         """Show the previous image in a gallery post."""
         if not self.has_multiple_images or len(self.images) <= 1:
             return
@@ -1264,7 +1254,7 @@ class ThumbnailWidget(QWidget):
         # Load the new image
         self.load_image_async(self.images[self.current_index])
         
-    def show_next_image(self):
+    def show_next_image(self): # Line 1234 - Corrected indentation
         """Show the next image in a gallery post."""
         if not self.has_multiple_images or len(self.images) <= 1:
             return

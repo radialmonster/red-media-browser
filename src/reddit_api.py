@@ -8,29 +8,37 @@ pagination, and moderation actions.
 
 import logging
 from typing import List, Dict, Tuple, Optional, Set, Any
+import os
+import time
 import praw
 import prawcore.exceptions
+from types import SimpleNamespace # Import SimpleNamespace
 from PyQt6.QtCore import QThread, pyqtSignal
+# Import the Submission class for type checking
+from praw.models import Submission
 
 # Import the main app's ModLogFetcher for type hinting if needed, or just use dict
 # from red_media_browser import ModLogFetcher # Avoid circular import if possible
 
+# Import caching utilities
+from utils import (
+    load_submission_index, get_metadata_file_path, read_metadata_file,
+    write_metadata_file, get_cache_dir, update_metadata_cache
+)
+
 # Set up logging
 logger = logging.getLogger(__name__)
 
-# Global dictionary for storing moderation statuses (e.g., "approved" or "removed")
-moderation_statuses = {}
-
-# Global dictionary for caching submission reports
-submission_reports = {}
+# Removed global dictionaries for moderation_statuses and submission_reports
+# These will now be handled by the persistent JSON cache.
 
 def get_moderated_subreddits(reddit_instance) -> List[Dict[str, str]]:
     """
     Get a list of subreddits moderated by the authenticated user.
-    
+
     Args:
         reddit_instance: PRAW Reddit instance
-        
+
     Returns:
         List of dictionaries with subreddit information (name, display_name, subscribers, etc.)
         Sorted alphabetically by display_name
@@ -40,11 +48,11 @@ def get_moderated_subreddits(reddit_instance) -> List[Dict[str, str]]:
         if not user:
             logger.error("Failed to get user information. User may not be authenticated.")
             return []
-            
+
         # Get moderated subreddits
         logger.debug(f"Fetching moderated subreddits for user: {user.name}")
         mod_subreddits = []
-        
+
         # Use a try-except block to handle any API errors
         try:
             for subreddit in reddit_instance.user.moderator_subreddits(limit=None):
@@ -59,7 +67,7 @@ def get_moderated_subreddits(reddit_instance) -> List[Dict[str, str]]:
             logger.error(f"PRAW error while fetching moderated subreddits: {e}")
         except Exception as e:
             logger.error(f"Unexpected error while fetching moderated subreddits: {e}")
-            
+
         # Sort alphabetically by display_name
         mod_subreddits.sort(key=lambda x: x["display_name"].lower())
         logger.debug(f"Found {len(mod_subreddits)} moderated subreddits")
@@ -73,11 +81,11 @@ class ModeratedSubredditsFetcher(QThread):
     Worker thread for asynchronous fetching of moderated subreddits.
     """
     subredditsFetched = pyqtSignal(list)
-    
+
     def __init__(self, reddit_instance):
         super().__init__()
         self.reddit_instance = reddit_instance
-        
+
     def run(self):
         mod_subreddits = get_moderated_subreddits(self.reddit_instance)
         self.subredditsFetched.emit(mod_subreddits)
@@ -104,7 +112,7 @@ class RedditGalleryModel:
         self.is_moderator = False # Specific to subreddit view, determined later
         self.snapshot = []  # Snapshot of submissions (up to 100)
         self.source_name = name
-        self.reddit = reddit_instance
+        self.reddit = reddit_instance # Store the PRAW instance
         self.prefetched_logs = prefetched_mod_logs if prefetched_mod_logs is not None else {}
         self.logs_ready = mod_logs_ready
         self.moderated_subreddit_names = set() # Store names of subs the app user mods
@@ -135,17 +143,23 @@ class RedditGalleryModel:
     def check_user_moderation_status(self) -> bool:
         """
         Check if the current Reddit user is a moderator of the current subreddit.
-        
+
         Returns:
             bool: True if user is a moderator, False otherwise
         """
         if self.is_user_mode:
             return False
-            
+        if not self.subreddit or not self.reddit: # Ensure objects exist
+             return False
+
         try:
             logger.debug("Performing moderator status check")
+            # Consider caching this result per session for the subreddit
             moderators = list(self.subreddit.moderator())
             user = self.reddit.user.me()
+            if not user:
+                 logger.warning("Could not get current user for mod check.")
+                 return False
             logger.debug(f"Current user: {user.name}")
             logger.debug(f"Moderators in subreddit: {[mod.name for mod in moderators]}")
             self.is_moderator = any(mod.name.lower() == user.name.lower() for mod in moderators)
@@ -160,306 +174,221 @@ class RedditGalleryModel:
 
     def fetch_submissions(self, after=None, count=10) -> Tuple[List[Any], Optional[str]]:
         """
-        Fetch a page of submissions from Reddit.
-        
+        DEPRECATED: Use fetch_snapshot instead for cache-aware fetching.
+        Fetch a page of submissions from Reddit (old method without caching).
+
         Args:
             after: Reddit fullname to fetch posts after
             count: Number of posts to fetch
-            
+
         Returns:
             Tuple of (list of submissions, 'after' parameter for next page)
         """
+        logger.warning("fetch_submissions is deprecated, use fetch_snapshot.")
         submissions = []
         new_after = None
         try:
             if self.is_user_mode:
-                # Fetch user submissions
-                already_fetched = sum(len(page) for page in self.snapshot) if self.snapshot else 0
-                user_params = {
-                    'limit': count,
-                    'count': already_fetched
-                }
-                if after:
-                    user_params['after'] = after
-                submissions = list(self.user.submissions.new(limit=count, params=user_params))
+                if not self.user: return [], None
+                user_params = {'limit': count}
+                if after: user_params['after'] = after
+                submissions = list(self.user.submissions.new(**user_params))
             else:
-                # Fetch subreddit submissions
-                if self.is_moderator:
-                    # For moderators, fetch a mix of submissions including modqueue
-                    already_fetched = sum(len(page) for page in self.snapshot) if self.snapshot else 0
-                    params = {
-                        'limit': count,
-                        'raw_json': 1,
-                        'sort': 'new',
-                        'count': already_fetched
-                    }
-                    if after:
-                        params['after'] = after
-                    # Fetch new submissions and modqueue submissions
-                    new_subs = list(self.subreddit.new(limit=count, params=params))
-                    mod_subs = list(self.subreddit.mod.modqueue(limit=count))
-                    # Fetch removed submissions from the mod log (using removelink action)
-                    mod_log_entries = list(self.subreddit.mod.log(action="removelink", limit=count))
-                    removed_fullnames = {entry.target_fullname for entry in mod_log_entries if entry.target_fullname.startswith("t3_")}
-                    removed_subs = list(self.reddit.info(fullnames=list(removed_fullnames)))
-                    
-                    # Mark submissions as removed in our moderation_statuses dictionary
-                    for sub in removed_subs:
-                        moderation_statuses[sub.id] = "removed"
-                    
-                    # Merge submissions by unique id
-                    merged = {s.id: s for s in new_subs + mod_subs + removed_subs}
-                    submissions = list(merged.values())
-                    submissions.sort(key=lambda s: s.created_utc, reverse=True)
-                else:
-                    # For regular users, just fetch new submissions
-                    already_fetched = sum(len(page) for page in self.snapshot) if self.snapshot else 0
-                    params = {
-                        'limit': count,
-                        'raw_json': 1,
-                        'sort': 'new',
-                        'count': already_fetched
-                    }
-                    if after:
-                        params['after'] = after
-                    submissions = list(self.subreddit.new(limit=count, params=params))
-                    # Ensure removed posts are not shown in non-mod view
-                    submissions = [s for s in submissions if moderation_statuses.get(s.id) != "removed"]
-            
-            # Update the 'after' parameter for the next page if we have results
+                if not self.subreddit: return [], None
+                sub_params = {'limit': count}
+                if after: sub_params['after'] = after
+                submissions = list(self.subreddit.new(**sub_params))
+
             if submissions:
                 new_after = submissions[-1].name
         except Exception as e:
-            logger.exception(f"Error fetching submissions: {e}")
+            logger.exception(f"Error in deprecated fetch_submissions: {e}")
         return submissions, new_after
 
     def fetch_snapshot(self, total=100, after=None) -> List[Any]:
         """
-        Fetch a larger batch of submissions to use for pagination.
-        
+        Fetch a larger batch of submissions, utilizing the metadata cache.
+
         Args:
             total: Total number of submissions to fetch
             after: Reddit fullname to fetch posts after
-            
+
         Returns:
-            List of submissions
+            List of submission objects (PRAW instances or SimpleNamespace objects from cache)
         """
+        logger.info(f"Fetching snapshot (total={total}, after={after}) for {'user' if self.is_user_mode else 'subreddit'}: {self.source_name}")
+        snapshot_results = []
+        processed_ids = set() # Keep track of IDs added to results
+
+        # 1. Load the metadata index
+        submission_index = load_submission_index()
+        cache_dir = get_cache_dir()
+
+        # 2. Get potential Submission IDs/Objects from Reddit API
         try:
-            params = {'raw_json': 1, 'sort': 'new'}
+            initial_listing = []
+            params = {'limit': total}
             if after:
                 params['after'] = after
-            
+
+            # --- Fetch initial list from appropriate source ---
             if self.is_user_mode:
                 if not self.user:
                     logger.error("Cannot fetch user submissions, user object is None.")
                     return []
-                # Fetch user submissions
-                user_submissions = list(self.user.submissions.new(limit=total, params=params))
-                logger.debug(f"Fetched {len(user_submissions)} initial posts for user {self.source_name}")
+                initial_listing = list(self.user.submissions.new(**params))
+                logger.debug(f"Fetched {len(initial_listing)} initial items for user {self.source_name}")
 
-                # --- Logic to find and merge removed posts using pre-fetched logs ---
+                # --- Add potential removed posts from logs ---
                 removed_post_fullnames = set()
-                target_username_lower = self.source_name.lower()
-
-                if not self.logs_ready:
-                    logger.warning("Mod logs not yet loaded. Removed posts might be missing from user view.")
-                else:
-                    logger.debug(f"Checking pre-fetched logs for removed posts by {target_username_lower} across {len(self.moderated_subreddit_names)} moderated subs.")
+                if self.logs_ready:
+                    target_username_lower = self.source_name.lower()
+                    logger.debug(f"Checking logs for removed posts by {target_username_lower}...")
                     for sub_name in self.moderated_subreddit_names:
-                        log_entries = self.prefetched_logs.get(sub_name, [])
-                        found_in_sub = 0
-                        for entry in log_entries:
-                            # Check if the author matches the target user
-                            if entry.get('author') == target_username_lower:
-                                fullname = entry.get('fullname')
-                                if fullname:
-                                    removed_post_fullnames.add(fullname)
-                                    found_in_sub += 1
-                        if found_in_sub > 0:
-                             logger.debug(f"Found {found_in_sub} potential removed posts by {target_username_lower} in r/{sub_name} log.")
+                        for entry in self.prefetched_logs.get(sub_name, []):
+                            if entry.get('author') == target_username_lower and entry.get('fullname'):
+                                removed_post_fullnames.add(entry['fullname'])
+                    if removed_post_fullnames:
+                         logger.info(f"Found {len(removed_post_fullnames)} potential removed posts in logs.")
+                         initial_listing.extend(list(removed_post_fullnames))
 
-                if removed_post_fullnames:
-                    logger.info(f"Found {len(removed_post_fullnames)} potential removed posts across all moderated logs for user {target_username_lower}.")
-                    try:
-                        # Fetch the actual submission objects for removed posts
-                        # Filter fullnames that might already be in user_submissions to avoid redundant fetch
-                        existing_fullnames = {sub.fullname for sub in user_submissions}
-                        fullnames_to_fetch = list(removed_post_fullnames - existing_fullnames)
-
-                        removed_submissions = []
-                        if fullnames_to_fetch:
-                             removed_submissions = list(self.reddit.info(fullnames=fullnames_to_fetch))
-                             logger.debug(f"Fetched {len(removed_submissions)} submission objects for removed posts.")
-                        else:
-                             logger.debug("All potential removed posts were already in the initial user fetch.")
-
-
-                        # Mark these as removed in the global status dict
-                        for sub in removed_submissions:
-                            moderation_statuses[sub.id] = "removed"
-                            logger.debug(f"Marked {sub.id} as removed based on mod log.")
-
-                        # Merge removed_submissions with user_submissions
-                        merged_dict = {sub.id: sub for sub in user_submissions}
-                        # Add/overwrite with removed submissions (ensures they are included)
-                        for sub in removed_submissions:
-                             merged_dict[sub.id] = sub
-
-                        snapshot = list(merged_dict.values())
-                        # Sort the final list by creation time
-                        snapshot.sort(key=lambda s: s.created_utc, reverse=True)
-                        logger.debug(f"Merged snapshot size after adding removed posts: {len(snapshot)}")
-
-                    except Exception as e:
-                        logger.exception(f"Error fetching or merging removed posts for user {target_username_lower}: {e}")
-                        # Fallback to just the initially fetched user submissions
-                        snapshot = user_submissions
-                else:
-                    # No removed posts found in logs, use original list
-                    snapshot = user_submissions
-                # --- End of removed posts logic ---
-
-            else:
-                # Fetch subreddit submissions (existing logic)
+            else: # Subreddit Mode
                 if not self.subreddit:
                     logger.error("Cannot fetch subreddit submissions, subreddit object is None.")
                     return []
-                if self.check_user_moderation_status(): # Check mod status here
-                    # For moderators, fetch a mix of submissions including modqueue and reported posts
-                    new_subs = list(self.subreddit.new(limit=total, params=params))
-                    logger.debug(f"Fetched {len(new_subs)} new posts from subreddit")
-                    
-                    # IMPORTANT: Get reported posts directly from the reports feed
-                    # This is a more direct way to get reported posts than checking modqueue
-                    try:
-                        reported_subs = list(self.subreddit.mod.reports(limit=total//2))
-                        logger.debug(f"Fetched {len(reported_subs)} reported posts directly from reports feed")
-                    except Exception as e:
-                        logger.error(f"Error fetching directly from reports feed: {e}")
-                        reported_subs = []
-                    
-                    # Get posts from modqueue as backup
-                    mod_limit = min(total // 2, 50)
-                    mod_subs = list(self.subreddit.mod.modqueue(limit=mod_limit))
-                    logger.debug(f"Fetched {len(mod_subs)} posts from modqueue")
-                    
-                    # Log all reported posts we found - with safer extraction of report counts
-                    reported_count = 0
-                    for sub in reported_subs:
-                        # Check if the submission has reports and is a submission (not a comment)
-                        if hasattr(sub, 'title'):
-                            try:
-                                mod_reports = getattr(sub, 'mod_reports', [])
-                                user_reports = getattr(sub, 'user_reports', [])
-                                
-                                # Safely calculate report count - don't assume structure
-                                mod_report_count = len(mod_reports)
-                                
-                                # User reports might be in different formats, so handle carefully
-                                user_report_count = 0
-                                if user_reports:
-                                    for report_item in user_reports:
-                                        # Check if it's a tuple/list with at least 2 items and second is an int
-                                        if isinstance(report_item, (list, tuple)) and len(report_item) >= 2:
-                                            if isinstance(report_item[1], int):
-                                                user_report_count += report_item[1]
-                                            else:
-                                                # If second item isn't an int, just count each item as 1
-                                                user_report_count += 1
-                                        else:
-                                            # If it's not in expected format, just count each item as 1
-                                            user_report_count += 1
-                                
-                                total_report_count = mod_report_count + user_report_count
-                                
-                                if total_report_count > 0:
-                                    reported_count += 1
-                                    logger.debug(f"Found reported post in reports feed: {sub.id} with {total_report_count} reports")
-                            except Exception as e:
-                                logger.error(f"Error processing reports for submission {sub.id}: {e}")
-                    
-                    logger.debug(f"Found {reported_count} posts with reports")
-                    
-                    # Fetch removed submissions from the mod log, but limit the number
-                    mod_log_limit = min(total // 4, 25)  # Even fewer for removed posts
-                    mod_log_entries = list(self.subreddit.mod.log(action="removelink", limit=mod_log_limit))
-                    removed_fullnames = {entry.target_fullname for entry in mod_log_entries if entry.target_fullname.startswith("t3_")}
-                    removed_subs = list(self.reddit.info(fullnames=list(removed_fullnames))) if removed_fullnames else []
-                    logger.debug(f"Fetched {len(removed_subs)} posts from mod log (removed posts)")
-                    
-                    # Mark submissions as removed in our moderation_statuses dictionary
-                    for sub in removed_subs:
-                        moderation_statuses[sub.id] = "removed"
-                    
-                    # Pre-fetch reports for all submissions from the reports feed
-                    for sub in reported_subs:
-                        # Only fetch reports if this is a submission (not a comment)
-                        if hasattr(sub, 'title'):
-                            try:
-                                reports_count, reports_reasons = get_submission_reports(sub)
-                                if reports_count > 0:
-                                    logger.debug(f"Submission {sub.id} has {reports_count} reports: {reports_reasons}")
-                            except Exception as e:
-                                logger.error(f"Error pre-fetching reports for submission {sub.id}: {e}")
-                    
-                    # Merge submissions while ensuring new posts have higher priority
-                    # But reported posts should have the HIGHEST priority
-                    new_dict = {s.id: s for s in new_subs}
-                    reported_dict = {s.id: s for s in reported_subs if hasattr(s, 'title')}
-                    mod_dict = {s.id: s for s in mod_subs}
-                    removed_dict = {s.id: s for s in removed_subs}
-                    
-                    # Now merge, with reports having highest priority
-                    merged = {}
-                    merged.update(removed_dict)  # Lowest priority
-                    merged.update(mod_dict)      # Medium priority
-                    merged.update(new_dict)      # High priority
-                    merged.update(reported_dict) # Highest priority - these will override any duplicates
-                    
-                    snapshot = list(merged.values())
-                    
-                    # Special sort: First sort reported posts by creation time, then non-removed posts, then removed posts
-                    # Safely identify reported posts
-                    reported = []
-                    for s in snapshot:
+                is_mod = self.check_user_moderation_status()
+
+                if is_mod:
+                    logger.debug("Fetching moderator view sources...")
+                    merged_items = {}
+                    sources_to_fetch = {
+                        'new': lambda p: self.subreddit.new(**p),
+                        'reports': lambda p: self.subreddit.mod.reports(**p),
+                        'modqueue': lambda p: self.subreddit.mod.modqueue(**p),
+                    }
+                    limits = {'new': total, 'reports': total // 2, 'modqueue': total // 2}
+                    logger.debug(f"Fetching limits: {limits}")
+                    for name, fetch_func in sources_to_fetch.items():
                         try:
-                            has_reports = False
-                            if hasattr(s, 'mod_reports') and s.mod_reports:
-                                has_reports = True
-                            if hasattr(s, 'user_reports') and s.user_reports:
-                                has_reports = True
-                            if has_reports:
-                                reported.append(s)
-                        except Exception as e:
-                            logger.error(f"Error checking reports for post {s.id}: {e}")
-                    
-                    non_reported_non_removed = [s for s in snapshot if s not in reported and 
-                                             moderation_statuses.get(s.id) != "removed"]
-                    removed = [s for s in snapshot if moderation_statuses.get(s.id) == "removed"]
-                    
-                    # Sort each group by creation time, newest first
-                    reported.sort(key=lambda s: s.created_utc, reverse=True)
-                    non_reported_non_removed.sort(key=lambda s: s.created_utc, reverse=True)
-                    removed.sort(key=lambda s: s.created_utc, reverse=True)
-                    
-                    # Combine with reported posts first, then regular posts, then removed posts
-                    snapshot = reported + non_reported_non_removed + removed
-                    
-                    # Filter out objects without a title (e.g. comments)
-                    snapshot = [s for s in snapshot if hasattr(s, 'title')]
-                    
-                    logger.debug(f"Total submissions after merging: {len(snapshot)}")
-                    logger.debug(f"Reported posts: {len(reported)}, Regular posts: {len(non_reported_non_removed)}, Removed posts: {len(removed)}")
+                            current_limit = limits.get(name, total)
+                            source_params = {'limit': current_limit}
+                            # Apply 'after' only to the 'new' listing for pagination consistency
+                            if after and name == 'new':
+                                source_params['after'] = after
+                            logger.debug(f"Fetching source '{name}' with params: {source_params}")
+                            count = 0
+                            for item in fetch_func(source_params):
+                                # Ensure we have a PRAW Submission object
+                                if not isinstance(item, Submission):
+                                    logger.warning(f"Skipping non-Submission item from '{name}': {type(item)}")
+                                    continue
+
+                                item_fullname = getattr(item, 'fullname', None)
+                                # Ensure we have a valid fullname (starts with t3_)
+                                if item_fullname and item_fullname.startswith('t3_'):
+                                    if item_fullname not in merged_items:
+                                        merged_items[item_fullname] = item # Use fullname as key
+                                        count += 1
+                                    # else: logger.debug(f"Item {item_fullname} from '{name}' already exists.")
+                                else:
+                                    logger.warning(f"Item from '{name}' missing valid fullname: ID={getattr(item, 'id', 'N/A')}")
+                            logger.debug(f"Added {count} items from source '{name}'. Total merged: {len(merged_items)}")
+                        except Exception as fetch_err:
+                            logger.error(f"Error fetching mod source '{name}': {fetch_err}")
+
+                    # --- Fetch IDs from Mod Log (removelink) ---
+                    mod_log_fullnames = set()
+                    try:
+                        # Fetch a reasonable number, maybe more than 25? Let's try 50.
+                        mod_log_limit = min(total // 2, 50)
+                        logger.debug(f"Fetching up to {mod_log_limit} 'removelink' entries from mod log...")
+                        mod_log_entries = list(self.subreddit.mod.log(action="removelink", limit=mod_log_limit))
+                        for entry in mod_log_entries:
+                             fullname = entry.target_fullname
+                             if fullname and fullname.startswith("t3_"):
+                                  mod_log_fullnames.add(fullname)
+                        logger.debug(f"Found {len(mod_log_fullnames)} unique fullnames in 'removelink' log.")
+                    except Exception as log_err:
+                         logger.error(f"Error fetching removed posts from mod log: {log_err}")
+
+                    # --- Fetch PRAW objects for Mod Log IDs not already present ---
+                    # Use fullname keys for consistency when checking existence
+                    fullnames_to_fetch_from_log = list(mod_log_fullnames - set(merged_items.keys()))
+                    if fullnames_to_fetch_from_log:
+                        logger.debug(f"Fetching {len(fullnames_to_fetch_from_log)} additional items found only in mod log...")
+                        try:
+                            # Fetch in batches if necessary, though reddit.info handles lists well
+                            fetched_log_items = list(self.reddit.info(fullnames=fullnames_to_fetch_from_log))
+                            added_count = 0
+                            for item in fetched_log_items:
+                                # Ensure we got a Submission object back
+                                if not isinstance(item, Submission):
+                                    logger.warning(f"Skipping non-Submission item from mod log info fetch: {type(item)}")
+                                    continue
+
+                                item_fullname = getattr(item, 'fullname', None) # Use fullname as key
+                                if item_fullname and item_fullname.startswith('t3_') and item_fullname not in merged_items:
+                                    merged_items[item_fullname] = item # Add using fullname key
+                                    added_count += 1
+                                # else: logger.debug(f"Item {item_fullname} from mod log fetch already exists or invalid.")
+                            logger.debug(f"Added {added_count} items from mod log fetch. Total merged: {len(merged_items)}")
+                        except Exception as info_err:
+                            logger.error(f"Error fetching items from mod log via reddit.info(): {info_err}")
+
+                    # --- Final combined list ---
+                    initial_listing = list(merged_items.values())
+                    # Sort the combined list by creation time (descending)
+                    initial_listing.sort(key=lambda x: getattr(x, 'created_utc', 0), reverse=True)
+                    logger.debug(f"Total items after merging all sources: {len(initial_listing)}")
+
+                else: # Regular user view
+                    logger.debug("Fetching regular view...")
+                    initial_listing = list(self.subreddit.new(**params))
+
+            # --- 3. Process merged items against cache ---
+            # The initial_listing now contains PRAW objects, sorted by time.
+            # No need to collect IDs and re-fetch with reddit.info() again.
+            logger.debug(f"Processing {len(initial_listing)} merged submissions against cache...")
+            for submission_obj in initial_listing: # Iterate directly through the PRAW objects
+                # Ensure it's a valid object with an ID
+                if not isinstance(submission_obj, Submission) or not hasattr(submission_obj, 'id'):
+                    logger.warning(f"Skipping invalid object during cache processing: {type(submission_obj)}")
+                    continue
+
+                submission_id = submission_obj.id # Use the object's ID attribute
+
+                # Check cache using the ID
+                cached_data = None
+                metadata_path_rel = submission_index.get(submission_id) # Index uses ID
+                if metadata_path_rel:
+                    abs_metadata_path = os.path.abspath(os.path.join(cache_dir, metadata_path_rel.replace('/', os.sep)))
+                    if os.path.exists(abs_metadata_path):
+                        cached_data = read_metadata_file(abs_metadata_path)
+                        if cached_data:
+                            media_cache_path = cached_data.get('cache_path')
+                            if media_cache_path and os.path.exists(media_cache_path):
+                                logger.debug(f"Cache HIT for {submission_id}.")
+                                cached_obj = SimpleNamespace(**cached_data)
+                                snapshot_results.append(cached_obj)
+                                continue
+                            else:
+                                logger.debug(f"Cache MISS for {submission_id}: Media file missing.")
+                        else:
+                            logger.debug(f"Cache MISS for {submission_id}: Metadata invalid.")
+                    else:
+                         logger.debug(f"Cache MISS for {submission_id}: Metadata path not found.")
                 else:
-                    # For regular users, just fetch new submissions
-                    snapshot = list(self.subreddit.new(limit=total, params=params))
-                    # Ensure removed posts are not shown in non-mod view
-                    snapshot = [s for s in snapshot if moderation_statuses.get(s.id) != "removed"]
-            
-            logger.debug(f"Fetched snapshot of {len(snapshot)} submissions.")
-            return snapshot
+                    logger.debug(f"Cache MISS for {submission_id}: Not in index.")
+
+                # Cache miss or invalid cache: Use the fetched PRAW object
+                logger.debug(f"Using fetched PRAW object for {submission_id}.")
+                snapshot_results.append(submission_obj)
+
+            logger.info(f"Snapshot fetch complete. Returning {len(snapshot_results)} items.")
+            return snapshot_results
+
         except Exception as e:
-            logger.exception(f"Error fetching snapshot: {e}")
+            logger.exception(f"Error during snapshot fetch: {e}")
             return []
 
 class SnapshotFetcher(QThread):
@@ -467,148 +396,255 @@ class SnapshotFetcher(QThread):
     Worker thread for asynchronous fetching of Reddit submission snapshots.
     """
     snapshotFetched = pyqtSignal(list)
-    
+
     def __init__(self, model, total=100, after=None):
         super().__init__()
         self.model = model
         self.total = total
         self.after = after
-        
+
     def run(self):
         snapshot = self.model.fetch_snapshot(total=self.total, after=self.after)
         self.snapshotFetched.emit(snapshot)
 
-def approve_submission(submission):
+
+# --- Standalone Moderation/Report Functions ---
+# These need the active PRAW instance passed to them
+
+def approve_submission(submission_data, reddit_instance):
     """
-    Approve a Reddit submission.
-    
+    Approve a Reddit submission and update its cached metadata.
+
     Args:
-        submission: PRAW Submission object to approve
-    
+        submission_data: PRAW Submission object or SimpleNamespace from cache.
+        reddit_instance: Active PRAW instance for API calls.
+
     Returns:
-        bool: True if successful, False otherwise
+        bool: True if successful, False otherwise.
     """
-    try:
-        submission.mod.approve()
-        moderation_statuses[submission.id] = "approved"
-        logger.debug(f"Approved submission: {submission.id}")
-        return True
-    except Exception as e:
-        logger.exception(f"Error approving submission {submission.id}: {e}")
+    submission_id = getattr(submission_data, 'id', None)
+    if not submission_id:
+        logger.error("Cannot approve submission: Missing ID.")
+        return False
+    if not reddit_instance:
+        logger.error(f"Cannot approve submission {submission_id}: Missing PRAW instance.")
         return False
 
-def remove_submission(submission):
-    """
-    Remove a Reddit submission.
-    
-    Args:
-        submission: PRAW Submission object to remove
-    
-    Returns:
-        bool: True if successful, False otherwise
-    """
     try:
-        submission.mod.remove()
-        moderation_statuses[submission.id] = "removed"
-        logger.debug(f"Removed submission: {submission.id}")
+        base_id = submission_id.split('_')[-1]
+        praw_submission = reddit_instance.submission(id=base_id)
+        praw_submission.mod.approve()
+        logger.debug(f"Successfully approved submission via API: {submission_id}")
+
+        metadata_path = get_metadata_file_path(submission_id)
+        if metadata_path:
+            metadata = read_metadata_file(metadata_path)
+            if not metadata:
+                 logger.warning(f"Metadata file not found for {submission_id} on approve, creating.")
+                 metadata = {'id': submission_id}
+
+            if metadata is not None:
+                metadata['approved'] = True
+                metadata['removed'] = False
+                metadata['moderation_status'] = "approved"
+                metadata['last_checked_utc'] = time.time()
+                try:
+                     praw_submission.load()
+                     metadata['score'] = praw_submission.score
+                     metadata['num_comments'] = praw_submission.num_comments
+                except Exception as refresh_e:
+                     logger.warning(f"Could not refresh score/comments for {submission_id} after approve: {refresh_e}")
+
+                if write_metadata_file(metadata_path, metadata):
+                    logger.debug(f"Updated cached metadata for {submission_id} to approved.")
+                else:
+                    logger.error(f"Failed to write updated metadata cache for approved submission {submission_id}.")
+            else:
+                 logger.warning(f"Could not read or create metadata cache for approved submission {submission_id}.")
+        else:
+             logger.warning(f"Could not determine metadata cache path for approved submission {submission_id}.")
+
         return True
+    except Exception as e:
+        logger.exception(f"Error approving submission {submission_id}: {e}")
+        return False
+
+def remove_submission(submission_data, reddit_instance):
+    """
+    Remove a Reddit submission and update its cached metadata.
+
+    Args:
+        submission_data: PRAW Submission object or SimpleNamespace from cache.
+        reddit_instance: Active PRAW instance for API calls.
+
+    Returns:
+        bool: True if successful or pending, False otherwise.
+    """
+    submission_id = getattr(submission_data, 'id', None)
+    if not submission_id:
+        logger.error("Cannot remove submission: Missing ID.")
+        return False
+    if not reddit_instance:
+        logger.error(f"Cannot remove submission {submission_id}: Missing PRAW instance.")
+        return False
+
+    moderation_status_update = "removed"
+    update_cache = False
+    praw_submission = None
+
+    try:
+        base_id = submission_id.split('_')[-1]
+        praw_submission = reddit_instance.submission(id=base_id)
+        praw_submission.mod.remove()
+        logger.debug(f"Successfully removed submission via API: {submission_id}")
+        update_cache = True
+
     except prawcore.exceptions.Forbidden:
-        logger.error(f"Forbidden: You do not have permission to remove submission {submission.id}")
+        logger.error(f"Forbidden: You do not have permission to remove submission {submission_id}")
         return False
     except prawcore.exceptions.RequestException as e:
         if "ConnectTimeout" in str(e) or "ConnectionError" in str(e):
-            logger.error(f"Network connection error while removing submission {submission.id}: {e}")
-            # Still mark as "removal_pending" so the UI can show appropriate state
-            moderation_statuses[submission.id] = "removal_pending"
+            logger.error(f"Network connection error while removing submission {submission_id}: {e}")
+            moderation_status_update = "removal_pending"
+            update_cache = True
         else:
-            logger.error(f"API request error while removing submission {submission.id}: {e}")
-        return False
+            logger.error(f"API request error while removing submission {submission_id}: {e}")
+            return False
     except Exception as e:
-        logger.exception(f"Unexpected error while removing submission {submission.id}: {e}")
+        logger.exception(f"Unexpected error while removing submission {submission_id}: {e}")
         return False
 
-def get_submission_reports(submission):
+    if update_cache:
+        metadata_path = get_metadata_file_path(submission_id)
+        if metadata_path:
+            metadata = read_metadata_file(metadata_path)
+            if not metadata:
+                 logger.warning(f"Metadata file not found for {submission_id} on remove, creating.")
+                 metadata = {'id': submission_id}
+
+            if metadata is not None:
+                metadata['approved'] = False
+                metadata['removed'] = (moderation_status_update == "removed")
+                metadata['moderation_status'] = moderation_status_update
+                metadata['last_checked_utc'] = time.time()
+                try:
+                     if praw_submission:
+                          praw_submission.load()
+                          metadata['score'] = praw_submission.score
+                          metadata['num_comments'] = praw_submission.num_comments
+                except Exception as refresh_e:
+                     logger.warning(f"Could not refresh score/comments for {submission_id} after remove: {refresh_e}")
+
+                if write_metadata_file(metadata_path, metadata):
+                    logger.debug(f"Updated cached metadata for {submission_id} to {moderation_status_update}.")
+                else:
+                    logger.error(f"Failed to write updated metadata cache for removed submission {submission_id}.")
+            else:
+                 logger.warning(f"Could not read or create metadata cache for removed submission {submission_id}.")
+        else:
+             logger.warning(f"Could not determine metadata cache path for removed submission {submission_id}.")
+
+    return moderation_status_update in ["removed", "removal_pending"]
+
+def get_submission_reports(submission_data, reddit_instance):
     """
-    Get reports for a submission.
-    
+    Get reports for a submission, checking cache first.
+
     Args:
-        submission: PRAW Submission object
-    
+        submission_data: PRAW Submission object or SimpleNamespace from cache.
+        reddit_instance: Active PRAW instance for API calls if needed.
+
     Returns:
         Tuple of (report_count, list of report reasons)
     """
+    submission_id = getattr(submission_data, 'id', None)
+    if not submission_id:
+        logger.error("Cannot get reports: Missing submission ID.")
+        return (0, [])
+
+    metadata_path = get_metadata_file_path(submission_id)
+    if metadata_path:
+        metadata = read_metadata_file(metadata_path)
+        if metadata and 'report_count' in metadata and 'report_reasons' in metadata:
+            report_count = metadata.get('report_count', 0)
+            report_reasons = metadata.get('report_reasons', [])
+            logger.debug(f"Using cached reports for {submission_id}: {report_count} reports.")
+            return (report_count, report_reasons)
+
+    logger.debug(f"No valid cache for reports of {submission_id}. Fetching from API.")
+    if not reddit_instance:
+         logger.error(f"Cannot fetch reports for {submission_id}: Missing PRAW instance.")
+         return (0, [])
+
     try:
-        # Check if we already have cached reports for this submission
-        if submission.id in submission_reports:
-            return submission_reports[submission.id]
-        
-        # Get the mod reports and user reports directly from the submission attributes
-        mod_reports = getattr(submission, 'mod_reports', [])
-        user_reports = getattr(submission, 'user_reports', [])
-        
-        # Format the reports as strings
+        base_id = submission_id.split('_')[-1]
+        praw_submission = reddit_instance.submission(id=base_id)
+
+        mod_reports = getattr(praw_submission, 'mod_reports', [])
+        user_reports = getattr(praw_submission, 'user_reports', [])
+
         formatted_reports = []
-        
-        # Add mod reports: [(report_reason, mod_name), ...]
         for reason, moderator in mod_reports:
             formatted_reports.append(f"Moderator {moderator}: {reason}")
-        
-        # Add user reports with safer handling for different formats
+
         user_report_count = 0
-        
         for report_item in user_reports:
             try:
-                if isinstance(report_item, (list, tuple)):
-                    if len(report_item) >= 2:
-                        reason = report_item[0]
-                        if isinstance(report_item[1], int):
-                            user_report_count += report_item[1]
-                            if report_item[1] > 1:
-                                formatted_reports.append(f"Users ({report_item[1]}): {reason}")
-                            else:
-                                formatted_reports.append(f"User: {reason}")
-                        else:
-                            user_report_count += 1
-                            formatted_reports.append(f"User: {reason} ({report_item[1]})")
+                if isinstance(report_item, (list, tuple)) and len(report_item) >= 2:
+                    reason, count = report_item[0], report_item[1]
+                    if isinstance(count, int):
+                        user_report_count += count
+                        formatted_reports.append(f"Users ({count}): {reason}" if count > 1 else f"User: {reason}")
                     else:
-                        # If it doesn't have at least 2 items, count it as 1
                         user_report_count += 1
-                        formatted_reports.append(f"Report: {report_item}")
+                        formatted_reports.append(f"User: {reason} ({count})")
                 else:
-                    # If it's not a tuple/list, count it as 1
                     user_report_count += 1
                     formatted_reports.append(f"Report: {report_item}")
-            except Exception as e:
-                logger.error(f"Error processing report item: {e}")
+            except Exception as item_e:
+                logger.error(f"Error processing report item {report_item}: {item_e}")
                 user_report_count += 1
                 formatted_reports.append("Unprocessable report")
-        
-        # Calculate total report count
+
         total_reports = len(mod_reports) + user_report_count
-        
-        # Cache the results
         result = (total_reports, formatted_reports)
-        submission_reports[submission.id] = result
-        
-        # Minimal logging
+
+        if metadata_path:
+             metadata = read_metadata_file(metadata_path)
+             if not metadata:
+                  metadata = {'id': submission_id}
+
+             if metadata is not None:
+                 metadata['report_count'] = total_reports
+                 metadata['report_reasons'] = formatted_reports
+                 metadata['last_checked_utc'] = time.time()
+                 if write_metadata_file(metadata_path, metadata):
+                      logger.debug(f"Cached fetched reports for {submission_id}.")
+                 else:
+                      logger.error(f"Failed to cache fetched reports for {submission_id}.")
+             else:
+                  logger.error(f"Failed to read/create metadata to cache reports for {submission_id}.")
+        else:
+             logger.error(f"Could not determine metadata path to cache reports for {submission_id}.")
+
         if total_reports > 0:
-            logger.debug(f"Submission {submission.id} has {total_reports} reports")
-            
+            logger.debug(f"Submission {submission_id} has {total_reports} reports")
+
         return result
     except Exception as e:
-        logger.exception(f"Error getting reports for submission {submission.id}: {e}")
+        logger.exception(f"Error getting reports for submission {submission_id}: {e}")
         return (0, [])
 
 def ban_user(subreddit, username, reason, message=None):
     """
     Ban a user from a subreddit.
-    
+
     Args:
         subreddit: PRAW Subreddit object
         username: Username to ban
         reason: Ban reason (for mod notes)
         message: Optional message to send to the user
-        
+
     Returns:
         bool: True if successful, False otherwise
     """

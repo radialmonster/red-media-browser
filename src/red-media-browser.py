@@ -14,6 +14,8 @@ import webbrowser
 from typing import List, Optional, Dict, Any
 
 import praw
+# Import praw.models.Subreddit for type checking
+from praw.models import Subreddit as PrawSubreddit
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QScrollArea, QMessageBox,
@@ -100,15 +102,23 @@ class FilterWorker(QThread):
         filtered_snapshot = []
         try:
             # Perform the filtering
-            filtered_snapshot = [
-                post for post in self.snapshot
-                if hasattr(post, 'subreddit') and
-                post.subreddit.display_name.lower() == self.subreddit_name_lower
-            ]
+            for post in self.snapshot:
+                 # Safely get subreddit name, handling both PRAW objects and cached strings/SimpleNamespace
+                 subreddit_name = "unknown"
+                 subreddit_attr = getattr(post, 'subreddit', None)
+                 if isinstance(subreddit_attr, PrawSubreddit):
+                     subreddit_name = getattr(subreddit_attr, 'display_name', 'unknown')
+                 elif isinstance(subreddit_attr, str):
+                     subreddit_name = subreddit_attr
+                 elif hasattr(subreddit_attr, 'display_name'): # Handle SimpleNamespace case
+                      subreddit_name = subreddit_attr.display_name
+
+                 if subreddit_name.lower() == self.subreddit_name_lower:
+                     filtered_snapshot.append(post)
+
             logger.debug(f"FilterWorker finished. Found {len(filtered_snapshot)} posts.")
         except Exception as e:
             logger.exception(f"Error during background filtering: {e}")
-            # Emit empty list on error? Or handle differently? Emitting empty for now.
             filtered_snapshot = []
         finally:
             self.filteringComplete.emit(filtered_snapshot)
@@ -119,10 +129,10 @@ class RedMediaBrowser(QMainWindow):
     The main application window for Red Media Browser.
     Handles layout, navigation, and Reddit API integration.
     """
-    
+
     def __init__(self):
         super().__init__()
-        
+
         # Initialize class variables
         self.reddit = None
         self.current_model = None
@@ -133,12 +143,12 @@ class RedMediaBrowser(QMainWindow):
         self.thumbnail_widgets = []
         self.is_loading_posts = False
         self.selected_author = None
-        
+
         # For back navigation
         self.previous_subreddit = None
         self.previous_offset = 0
         self.back_button = None
-        
+
         # For moderated subreddits
         self.moderated_subreddits = []
         self.mod_subreddits_fetched = False
@@ -149,124 +159,124 @@ class RedMediaBrowser(QMainWindow):
 
         # Set up the UI
         self.init_ui()
-        
+
         # Initialize Reddit API connection
         self.init_reddit()
-        
+
         # Set up the global thread pool
         QThreadPool.globalInstance().setMaxThreadCount(10)
-        
+
     def init_ui(self):
         """Initialize the user interface components."""
         self.setWindowTitle("Red Media Browser")
         self.setMinimumSize(1024, 768)
-        
+
         # Create central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         # Main layout
         main_layout = QVBoxLayout(central_widget)
-        
+
         # Navigation panel
         nav_layout = QHBoxLayout()
-        
+
         # Moderated subreddits dropdown button (moved to far left)
         self.mod_subreddits_button = QPushButton("My Mod Subreddits")
         self.mod_subreddits_button.setToolTip("View and select from subreddits you moderate")
         self.mod_subreddits_button.clicked.connect(self.show_mod_subreddits_menu)
         nav_layout.addWidget(self.mod_subreddits_button)
-        
+
         # Subreddit/User selector
         self.source_type_combo = QComboBox()
         self.source_type_combo.addItems(["Subreddit", "User"])
         self.source_type_combo.setFixedWidth(100)
         self.source_type_combo.currentIndexChanged.connect(self.on_source_type_changed)
         nav_layout.addWidget(self.source_type_combo)
-        
+
         # Input field for subreddit/user
         self.source_input = QLineEdit()
         self.source_input.setPlaceholderText("Enter subreddit name...")
         self.source_input.returnPressed.connect(self.load_content)
         nav_layout.addWidget(self.source_input)
-        
+
         # Navigation buttons
         self.load_button = QPushButton("Load")
         self.load_button.clicked.connect(self.load_content)
         nav_layout.addWidget(self.load_button)
-        
+
         # Back to subreddit button (initially hidden)
         self.back_button = QPushButton("Back to Subreddit")
         self.back_button.clicked.connect(self.go_back_to_subreddit)
         self.back_button.setVisible(False)  # Initially hidden
         nav_layout.addWidget(self.back_button)
-        
+
         # Filter by subreddit button (initially hidden)
         self.filter_button = QPushButton("Filter by Subreddit")
         self.filter_button.clicked.connect(self.toggle_subreddit_filter)
         self.filter_button.setVisible(False)  # Initially hidden
         self.is_filtered = False  # Track if we're currently filtering
         nav_layout.addWidget(self.filter_button)
-        
+
         self.prev_button = QPushButton("Previous Page")
         self.prev_button.clicked.connect(self.show_previous_page)
         self.prev_button.setEnabled(False)
         nav_layout.addWidget(self.prev_button)
-        
+
         self.next_button = QPushButton("Next Page")
         self.next_button.clicked.connect(self.show_next_page)
         self.next_button.setEnabled(False)
         nav_layout.addWidget(self.next_button)
-        
+
         main_layout.addLayout(nav_layout)
-        
+
         # Status displays
         status_layout = QHBoxLayout()
-        
+
         # Current source label
         self.source_label = QLabel("No content loaded")
         self.source_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         status_layout.addWidget(self.source_label, stretch=1)
-        
+
         # Moderator status
         self.mod_status_label = QLabel("Not a moderator")
         self.mod_status_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         status_layout.addWidget(self.mod_status_label)
-        
+
         main_layout.addLayout(status_layout)
-        
+
         # Loading indicator
         self.loading_bar = QProgressBar()
         self.loading_bar.setTextVisible(False)
         self.loading_bar.setRange(0, 0)  # Indeterminate progress
         self.loading_bar.hide()
         main_layout.addWidget(self.loading_bar)
-        
+
         # Content area in a scroll area
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        
+
         # Content widget to hold thumbnails in a grid layout
         self.content_widget = QWidget()
         self.content_layout = QGridLayout(self.content_widget)
         self.content_layout.setSpacing(10)
         self.content_layout.setContentsMargins(10, 10, 10, 10)
-        
+
         # Configure grid layout to enforce equal cell sizes regardless of content
         for col in range(5):
             self.content_layout.setColumnStretch(col, 1)
             self.content_layout.setColumnMinimumWidth(col, 150)
-        
+
         for row in range(2):
             self.content_layout.setRowStretch(row, 1)
             self.content_layout.setRowMinimumHeight(row, 250)
-            
+
         self.scroll_area.setWidget(self.content_widget)
-        
+
         main_layout.addWidget(self.scroll_area, stretch=1)
-        
+
         # Status bar at bottom
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
@@ -282,7 +292,7 @@ class RedMediaBrowser(QMainWindow):
             # Load config
             config_path = os.path.join(os.path.dirname(__file__), "config.json")
             config = load_config(config_path)
-            
+
             # Set up Reddit instance
             self.reddit = praw.Reddit(
                 client_id=config["client_id"],
@@ -291,16 +301,16 @@ class RedMediaBrowser(QMainWindow):
                 redirect_uri=config["redirect_uri"],
                 user_agent=config["user_agent"]
             )
-            
+
             # Verify credentials work
             try:
                 username = self.reddit.user.me().name
                 logger.info(f"Authenticated as {username}")
                 self.statusBar.showMessage(f"Authenticated as {username}")
-                
+
                 # Fetch moderated subreddits
                 self.fetch_moderated_subreddits()
-                
+
                 # Load default subreddit if specified
                 if "default_subreddit" in config and config["default_subreddit"]:
                     self.source_input.setText(config["default_subreddit"])
@@ -308,20 +318,20 @@ class RedMediaBrowser(QMainWindow):
             except Exception as e:
                 logger.error(f"Authentication failed: {e}")
                 self.statusBar.showMessage("Authentication failed. Please check your credentials.")
-                
+
                 # Try to get a new token if refresh token is invalid
                 if "invalid_grant" in str(e).lower():
                     self.handle_invalid_token(config, config_path)
-        
+
         except Exception as e:
             logger.error(f"Error initializing Reddit API: {e}")
             QMessageBox.critical(self, "Error", f"Failed to initialize Reddit API: {str(e)}")
-    
+
     def fetch_moderated_subreddits(self):
         """Fetch the list of subreddits moderated by the current user."""
         self.mod_subreddits_button.setEnabled(False)
         self.mod_subreddits_button.setText("Loading Mod Subreddits...")
-        
+
         # Create a thread to fetch moderated subreddits
         self.mod_subreddits_fetcher = ModeratedSubredditsFetcher(self.reddit)
         self.mod_subreddits_fetcher.subredditsFetched.connect(self.on_mod_subreddits_fetched)
@@ -336,7 +346,7 @@ class RedMediaBrowser(QMainWindow):
         count = len(mod_subreddits)
         self.mod_subreddits_button.setText(f"My Mod Subreddits ({count})")
         self.mod_subreddits_button.setEnabled(True)
-        
+
         if count == 0:
             self.mod_subreddits_button.setToolTip("You don't moderate any subreddits")
         else:
@@ -372,40 +382,40 @@ class RedMediaBrowser(QMainWindow):
         if not self.mod_subreddits_fetched:
             self.fetch_moderated_subreddits()
             return
-            
+
         if not self.moderated_subreddits:
-            QMessageBox.information(self, "No Moderated Subreddits", 
+            QMessageBox.information(self, "No Moderated Subreddits",
                                    "You don't moderate any subreddits.")
             return
-            
+
         # Create a menu of moderated subreddits
         menu = QMenu(self)
-        
+
         # Add a header/title (as a disabled action)
         title_action = QAction("Select a Subreddit:", self)
         title_action.setEnabled(False)
         menu.addAction(title_action)
         menu.addSeparator()
-        
+
         # Add each moderated subreddit
         for subreddit in self.moderated_subreddits:
             display_name = subreddit["display_name"]
             subscribers = subreddit.get("subscribers", 0)
-            
+
             # Format menu item text with subscriber count if available
             if subscribers:
                 text = f"{display_name} ({subscribers:,} subscribers)"
             else:
                 text = display_name
-                
+
             action = QAction(text, self)
             action.setData(display_name)  # Store the subreddit name as data
             menu.addAction(action)
-        
+
         # Show the menu below the button
         action = menu.exec(self.mod_subreddits_button.mapToGlobal(
             self.mod_subreddits_button.rect().bottomLeft()))
-        
+
         # Handle menu selection
         if action and action.isEnabled():
             subreddit_name = action.data()
@@ -414,7 +424,7 @@ class RedMediaBrowser(QMainWindow):
                 self.source_type_combo.setCurrentIndex(0)  # Switch to Subreddit mode
                 self.source_input.setText(subreddit_name)
                 self.load_content()
-    
+
     def handle_invalid_token(self, config, config_path):
         """Handle invalid refresh token by requesting a new one."""
         msg = QMessageBox()
@@ -423,7 +433,7 @@ class RedMediaBrowser(QMainWindow):
         msg.setInformativeText("Would you like to request a new authentication token?")
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         ret = msg.exec()
-        
+
         if ret == QMessageBox.StandardButton.Yes:
             # Create a temporary Reddit instance without the refresh token
             temp_reddit = praw.Reddit(
@@ -432,12 +442,12 @@ class RedMediaBrowser(QMainWindow):
                 redirect_uri=config["redirect_uri"],
                 user_agent=config["user_agent"]
             )
-            
+
             # Request scopes needed for the application
             requested_scopes = ['identity', 'read', 'mysubreddits', 'history']
             if input("Request moderation scopes as well? (y/n): ").lower() == 'y':
                 requested_scopes.extend(['modcontributors', 'modconfig', 'modflair', 'modlog', 'modposts', 'modwiki'])
-            
+
             # Get a new refresh token
             new_token = get_new_refresh_token(temp_reddit, requested_scopes)
             if new_token:
@@ -446,7 +456,7 @@ class RedMediaBrowser(QMainWindow):
                 self.close()
             else:
                 QMessageBox.critical(self, "Error", "Failed to obtain a new authentication token.")
-    
+
     def on_source_type_changed(self, index):
         """Handle change between subreddit and user mode."""
         if index == 0:  # Subreddit mode
@@ -457,46 +467,42 @@ class RedMediaBrowser(QMainWindow):
             self.source_input.setPlaceholderText("Enter username...")
             # Hide mod subreddits button in user mode
             self.mod_subreddits_button.setVisible(False)
-    
+
     def load_content(self):
         """Load content from the specified subreddit or user."""
         source = self.source_input.text().strip()
         if not source:
             QMessageBox.warning(self, "Warning", "Please enter a subreddit name or username.")
             return
-        
+
         # Show loading indicator
         self.loading_bar.show()
         self.is_loading_posts = True
         self.load_button.setEnabled(False)
         self.prev_button.setEnabled(False)
         self.next_button.setEnabled(False)
-        
+
         # Clear any previous content
         self.clear_content()
-        
+
         # Determine if we're in subreddit or user mode
         is_user_mode = self.source_type_combo.currentIndex() == 1
         source_type = "User" if is_user_mode else "Subreddit"
-        
+
         # Hide the back button ONLY when manually loading new content that's not author navigation
-        # This fixes the issue where the button remains visible when typing a new subreddit
-        # But it preserves the button when coming from author navigation
         if not hasattr(self, 'is_author_navigation') or not self.is_author_navigation:
             self.back_button.setVisible(False)
             self.previous_subreddit = None
             self.previous_offset = 0
-        
-        # Reset the author navigation flag - we don't want to change it here
-        # as we need it to persist through on_snapshot_fetched
+
         was_author_navigation = False
         if hasattr(self, 'is_author_navigation') and self.is_author_navigation:
             was_author_navigation = True
-        self.is_author_navigation = False
-        
+        self.is_author_navigation = False # Reset flag after checking
+
         # Update the status label
         self.source_label.setText(f"Loading {source_type}: {source}")
-        
+
         # Create a new gallery model, passing the pre-fetched logs and status
         self.current_model = RedditGalleryModel(
             source,
@@ -513,582 +519,493 @@ class RedMediaBrowser(QMainWindow):
             self.mod_status_label.setText(mod_status)
         else:
             self.mod_status_label.setText("User mode")
-            
-            # If this is author navigation and we're in user mode, ensure the back button is visible
+
             if was_author_navigation and self.previous_subreddit:
                 logger.debug(f"Ensuring back button remains visible for r/{self.previous_subreddit}")
                 self.back_button.setText(f"Back to r/{self.previous_subreddit}")
                 self.back_button.setVisible(True)
-        
+
         # Start a thread to fetch the snapshot
         self.fetch_snapshot()
-    
+
     def fetch_snapshot(self):
         """Fetch a snapshot of submissions asynchronously."""
         if not self.current_model:
             return
-            
+
         # Create a thread to fetch the snapshot
         self.snapshot_fetcher = SnapshotFetcher(self.current_model)
         self.snapshot_fetcher.snapshotFetched.connect(self.on_snapshot_fetched)
         self.snapshot_fetcher.start()
-    
+
     def on_snapshot_fetched(self, snapshot):
         """Handle the fetched snapshot of submissions."""
         self.current_snapshot = snapshot
         self.snapshot_offset = 0
-        
+
         # Reset pagination controls
         self.prev_button.setEnabled(False)
         self.next_button.setEnabled(len(self.current_snapshot) > self.snapshot_page_size)
-        
+
         # Update status
         self.is_loading_posts = False
         self.load_button.setEnabled(True)
         self.loading_bar.hide()
-        
+
         source_type = "User" if self.current_model.is_user_mode else "Subreddit"
         source = self.source_input.text().strip()
         self.source_label.setText(f"{source_type}: {source} - {len(self.current_snapshot)} posts")
-        
+
         # Show the first page
         self.display_current_page()
-    
+
     def display_current_page(self):
         """Display the current page of submissions in a 5x2 grid."""
         # Clear any existing content
         self.clear_content()
-        
+
         # Get the current page of submissions
         start = self.snapshot_offset
         end = min(start + self.snapshot_page_size, len(self.current_snapshot))
         current_page = self.current_snapshot[start:end]
-        
+
         if not current_page:
             label = QLabel("No posts found")
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.content_layout.addWidget(label, 0, 0, 1, 5)  # span across all columns
             return
-        
+
         # Create thumbnail widgets for each submission and place them in the grid
-        # Grid layout will have 5 columns and up to 2 rows
         for i, submission in enumerate(current_page):
             try:
-                # Calculate row and column positions
-                row = i // 5  # Integer division to get row (0 or 1)
-                col = i % 5   # Modulo to get column (0 to 4)
-                
+                row = i // 5
+                col = i % 5
                 self.add_submission_widget(submission, row, col)
             except Exception as e:
-                logger.exception(f"Error displaying submission {submission.id}: {e}")
-        
+                # Log the error but try to continue displaying other posts
+                submission_id_str = getattr(submission, 'id', 'unknown ID')
+                logger.exception(f"Error creating widget for submission {submission_id_str}: {e}")
+                try:
+                    # Attempt to add an error placeholder
+                    error_widget = QLabel(f"Error loading post:\n{submission_id_str}")
+                    error_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    error_widget.setStyleSheet("background-color: #ffdddd; border: 1px solid #ffaaaa;")
+                    self.content_layout.addWidget(error_widget, row, col)
+                    self.thumbnail_widgets.append(error_widget) # Add placeholder to list for cleanup
+                except Exception as placeholder_e:
+                     logger.error(f"Failed to add error placeholder: {placeholder_e}")
+
+
         # Update status
         self.statusBar.showMessage(f"Showing posts {start+1} to {end} of {len(self.current_snapshot)}")
-    
+
     def add_submission_widget(self, submission, row=None, col=None):
         """Add a thumbnail widget for a submission."""
+        submission_id_str = getattr(submission, 'id', 'unknown ID') # Get ID early for logging
         try:
             # Extract the necessary information from the submission
-            title = submission.title
-            permalink = submission.permalink
-            subreddit_name = submission.subreddit.display_name
-            
-            # Handle gallery posts vs. single image posts
-            has_multiple_images = hasattr(submission, 'is_gallery') and submission.is_gallery
-            
-            # Get the source URL
-            if has_multiple_images and hasattr(submission, 'gallery_data'):
-                # For gallery posts, we'll just show the first image's URL in the info
-                source_url = "Gallery post"
+            title = getattr(submission, 'title', 'No Title')
+            permalink = getattr(submission, 'permalink', '')
+
+            # Safely get subreddit name
+            subreddit_name = "unknown" # Default
+            subreddit_attr = getattr(submission, 'subreddit', None)
+
+            # Check the type of subreddit_attr and extract name accordingly
+            if isinstance(subreddit_attr, PrawSubreddit):
+                # It's a PRAW Subreddit object
+                subreddit_name = getattr(subreddit_attr, 'display_name', 'unknown')
+            elif isinstance(subreddit_attr, str):
+                # It's a string (likely from cache)
+                subreddit_name = subreddit_attr
+            # Check if the attribute itself has 'display_name' (covers SimpleNamespace if subreddit was stored as obj)
+            elif hasattr(subreddit_attr, 'display_name'):
+                 subreddit_name = getattr(subreddit_attr, 'display_name', 'unknown')
+            elif subreddit_attr is None:
+                 logger.debug(f"Subreddit attribute is None for {submission_id_str}")
+                 subreddit_name = "unknown" # Keep default
             else:
-                source_url = submission.url
-            
+                 # Log if it's an unexpected type
+                 logger.warning(f"Unexpected type for subreddit attribute: {type(subreddit_attr)} for submission {submission_id_str}")
+                 subreddit_name = "unknown" # Keep default
+
+            # Handle gallery posts vs. single image posts
+            # Use getattr for safety as cached objects might miss attributes
+            is_gallery = getattr(submission, 'is_gallery', False)
+            gallery_data = getattr(submission, 'gallery_data', None)
+            media_metadata = getattr(submission, 'media_metadata', None)
+            has_multiple_images = is_gallery and (gallery_data or media_metadata)
+
+            # Get the source URL
+            source_url = getattr(submission, 'url', '')
+            if has_multiple_images:
+                source_url = "Gallery post" # Placeholder for display
+
             # Get the image URLs
-            from utils import extract_image_urls
+            from utils import extract_image_urls # Keep import local? Or move to top?
             image_urls = extract_image_urls(submission)
 
-            # Skip submissions without any images
             if not image_urls:
-                logger.warning(f"No images found for submission ID {submission.id}")
-                return
+                logger.warning(f"No images found for submission ID {submission_id_str}")
+                return # Don't add widget if no images
 
             # Determine if the app user can moderate THIS post's subreddit
-            # Use the list stored in the model (fetched during model init)
             can_moderate_this_post = False
             if self.current_model and hasattr(self.current_model, 'moderated_subreddit_names'):
-                 post_subreddit_name = submission.subreddit.display_name.lower()
-                 can_moderate_this_post = post_subreddit_name in self.current_model.moderated_subreddit_names
+                 can_moderate_this_post = subreddit_name.lower() in self.current_model.moderated_subreddit_names
 
             # Create the thumbnail widget
             thumbnail = ThumbnailWidget(
                 images=image_urls,
                 title=title,
                 source_url=source_url,
-                submission=submission,
+                submission=submission, # Pass the object (PRAW or SimpleNamespace)
                 subreddit_name=subreddit_name,
                 has_multiple_images=has_multiple_images,
                 post_url=permalink,
-                is_moderator=can_moderate_this_post # Pass the pre-calculated flag
+                is_moderator=can_moderate_this_post,
+                reddit_instance=self.reddit # Pass the main reddit instance
             )
 
             # Connect signals
             thumbnail.authorClicked.connect(self.on_author_clicked)
-            
+
             # Add to layout and store reference
             if row is not None and col is not None:
                 self.content_layout.addWidget(thumbnail, row, col)
             else:
-                # Fallback for backward compatibility
-                self.content_layout.addWidget(thumbnail)
+                self.content_layout.addWidget(thumbnail) # Fallback
             self.thumbnail_widgets.append(thumbnail)
-            
+
         except Exception as e:
-            logger.exception(f"Error displaying submission {submission.id if hasattr(submission, 'id') else 'unknown'}: {e}")
-            # Don't leave empty spaces in the grid
+            logger.exception(f"Error adding widget for submission {submission_id_str}: {e}")
             if row is not None and col is not None:
-                error_widget = QLabel(f"Error: Failed to load post")
+                error_widget = QLabel(f"Error:\n{submission_id_str}")
                 error_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 error_widget.setStyleSheet("background-color: #ffdddd; border: 1px solid #ffaaaa;")
                 self.content_layout.addWidget(error_widget, row, col)
                 self.thumbnail_widgets.append(error_widget)
-    
+
     def clear_content(self):
         """Clear all content from the display."""
-        # First dispose of VLC video players separately to avoid flashing
-        # This gives them time to clean up properly before removing from layout
         for widget in self.thumbnail_widgets:
-            # Check if widget is a ThumbnailWidget with VLC player
             if hasattr(widget, 'cleanup_current_media'):
                 try:
-                    # Properly cleanup VLC resources first
                     widget.cleanup_current_media()
                 except Exception as e:
-                    logger.debug(f"Error during video cleanup: {e}")
-        
-        # Small delay to allow VLC resources to be fully released
-        QApplication.processEvents()
-        
-        # Now remove widgets from layout and close them
-        for widget in self.thumbnail_widgets:
+                    logger.debug(f"Error during media cleanup in clear_content: {e}")
+            # Remove widget from layout and schedule for deletion
             self.content_layout.removeWidget(widget)
-            widget.setParent(None)  # Detach from parent before closing
-            widget.deleteLater()  # Schedule for deletion instead of immediate close
-        
+            widget.setParent(None)
+            widget.deleteLater()
+
         self.thumbnail_widgets = []
-    
+        # Allow UI to process deletions before potentially adding new widgets
+        QApplication.processEvents()
+
+
     def show_next_page(self):
         """Show the next page of submissions."""
-        if not self.current_snapshot:
-            return
-            
+        current_list = self.current_filtered_snapshot if self.is_filtered else self.current_snapshot
+        if not current_list: return
+
         next_offset = self.snapshot_offset + self.snapshot_page_size
-        if next_offset < len(self.current_snapshot):
+        if next_offset < len(current_list):
             self.snapshot_offset = next_offset
             self.prev_button.setEnabled(True)
-            self.next_button.setEnabled(next_offset + self.snapshot_page_size < len(self.current_snapshot))
-            self.display_current_page()
-    
+            self.next_button.setEnabled(next_offset + self.snapshot_page_size < len(current_list))
+            if self.is_filtered:
+                self.display_filtered_page()
+            else:
+                self.display_current_page()
+
     def show_previous_page(self):
         """Show the previous page of submissions."""
-        if not self.current_snapshot or self.snapshot_offset == 0:
-            return
-            
+        current_list = self.current_filtered_snapshot if self.is_filtered else self.current_snapshot
+        if not current_list or self.snapshot_offset == 0: return
+
         prev_offset = max(0, self.snapshot_offset - self.snapshot_page_size)
         self.snapshot_offset = prev_offset
         self.prev_button.setEnabled(prev_offset > 0)
-        self.next_button.setEnabled(True)
-        self.display_current_page()
-    
+        self.next_button.setEnabled(True) # Always enabled if we moved back
+        if self.is_filtered:
+            self.display_filtered_page()
+        else:
+            self.display_current_page()
+
     def on_author_clicked(self, username):
         """Handle clicking on an author's name."""
-        # Prevent clicks while loading
         if self.is_loading_posts:
             logger.debug("Ignoring author click while content is loading")
             return
-        
-        # Set a flag to track that this is an author navigation (to be used in load_content)
-        self.is_author_navigation = True
-        
-        # Ask if user wants to view the author's posts or take moderation action
+
+        self.is_author_navigation = True # Flag for load_content
+
         msg = QMessageBox()
         msg.setWindowTitle("Author Options")
         msg.setText(f"What would you like to do with u/{username}?")
         view_button = msg.addButton("View Posts", QMessageBox.ButtonRole.ActionRole)
 
-        # Determine if the Ban button should be shown and the relevant subreddit context
         can_ban = False
         ban_subreddit_name = None
-        ban_subreddit_obj = None # Store the PRAW subreddit object if available
+        ban_subreddit_obj = None
 
-        # Case 1: Viewing a subreddit directly as a mod
-        if (self.current_model and not self.current_model.is_user_mode and
-            hasattr(self.current_model, 'is_moderator') and self.current_model.is_moderator):
+        # Determine ban context
+        if self.current_model and not self.current_model.is_user_mode and self.current_model.is_moderator:
             can_ban = True
             ban_subreddit_name = self.current_model.source_name
-            ban_subreddit_obj = self.current_model.subreddit # Use the existing subreddit object
-            logger.debug(f"Ban context: Direct subreddit view r/{ban_subreddit_name}")
-        # Case 2: Viewing a user's posts, filtered by a subreddit the app user mods
-        elif (self.current_model and self.current_model.is_user_mode and
-              self.is_filtered and self.previous_subreddit and
-              hasattr(self.current_model, 'moderated_subreddit_names') and
-              self.previous_subreddit.lower() in self.current_model.moderated_subreddit_names):
-            can_ban = True
-            ban_subreddit_name = self.previous_subreddit
-            # We need to get the subreddit object here
-            try:
-                ban_subreddit_obj = self.reddit.subreddit(ban_subreddit_name)
-                logger.debug(f"Ban context: Filtered user view, target sub r/{ban_subreddit_name}")
-            except Exception as e:
-                logger.error(f"Error getting subreddit object for {ban_subreddit_name} in on_author_clicked: {e}")
-                can_ban = False # Cannot ban if we can't get the subreddit object
+            ban_subreddit_obj = self.current_model.subreddit
+        elif self.current_model and self.current_model.is_user_mode and self.is_filtered and self.previous_subreddit:
+             if self.previous_subreddit.lower() in self.current_model.moderated_subreddit_names:
+                 can_ban = True
+                 ban_subreddit_name = self.previous_subreddit
+                 try:
+                     ban_subreddit_obj = self.reddit.subreddit(ban_subreddit_name)
+                 except Exception as e:
+                     logger.error(f"Error getting subreddit object {ban_subreddit_name}: {e}")
+                     can_ban = False
 
         ban_button = None
-        if can_ban and ban_subreddit_obj: # Ensure we have the subreddit object
+        if can_ban and ban_subreddit_obj:
             ban_button = msg.addButton("Ban User", QMessageBox.ButtonRole.DestructiveRole)
 
         cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        
         msg.exec()
-        
         clicked_button = msg.clickedButton()
-        
+
         if clicked_button == view_button:
-            # Make sure we're not already loading something
             if hasattr(self, 'snapshot_fetcher') and self.snapshot_fetcher.isRunning():
-                logger.debug("Canceling previous snapshot fetch before loading author content")
-                try:
-                    self.snapshot_fetcher.terminate()
-                    self.snapshot_fetcher.wait(500)  # Wait up to 500ms for clean termination
-                except Exception as e:
-                    logger.error(f"Error terminating previous snapshot fetcher: {e}")
-            
-            # Save current subreddit state for back navigation
+                logger.debug("Terminating previous snapshot fetcher...")
+                self.snapshot_fetcher.terminate()
+                self.snapshot_fetcher.wait(500)
+
             if self.current_model and not self.current_model.is_user_mode:
                 self.previous_subreddit = self.current_model.source_name
                 self.previous_offset = self.snapshot_offset
                 logger.debug(f"Saved previous subreddit: {self.previous_subreddit}")
-                
-                # Setup filter button
                 self.filter_button.setText(f"Filter by r/{self.previous_subreddit}")
                 self.filter_button.setStyleSheet("")
                 self.filter_button.setVisible(True)
                 self.is_filtered = False
-            
-            # Switch to user mode and load the user's posts
-            self.source_type_combo.setCurrentIndex(1)  # Switch to User mode
+
+            self.source_type_combo.setCurrentIndex(1)
             self.source_input.setText(username)
-            
-            # Show the back button BEFORE loading content (important order change)
+
             if self.previous_subreddit:
                 self.back_button.setText(f"Back to r/{self.previous_subreddit}")
                 self.back_button.setVisible(True)
-                logger.debug(f"Set back button visible for r/{self.previous_subreddit}")
-            
-            # Use a brief delay to allow the UI to update before loading content
-            QTimer.singleShot(100, lambda: self.load_content())
-                    
-        elif clicked_button == ban_button and ban_subreddit_obj: # Check if ban button was clicked and we have the object
-            # Open ban user dialog, passing the correct subreddit object
-            self.open_ban_dialog(username, ban_subreddit_obj)
 
-        # Reset the flag when we're done (in case load_content wasn't called)
-        # Important: Reset flag *after* potential call to open_ban_dialog
-        if clicked_button != view_button: # This condition might need review if ban dialog is complex
-            self.is_author_navigation = False
-    
+            QTimer.singleShot(50, self.load_content) # Shorter delay
+
+        elif clicked_button == ban_button and ban_subreddit_obj:
+            self.open_ban_dialog(username, ban_subreddit_obj) # Pass object directly
+            self.is_author_navigation = False # Reset flag after action
+
+        else: # Cancelled or other button
+             self.is_author_navigation = False # Reset flag
+
     def go_back_to_subreddit(self):
         """Navigate back to the previously viewed subreddit."""
-        if not self.previous_subreddit:
-            return
-            
-        # Store the target offset we want to restore to
+        if not self.previous_subreddit: return
+
         target_offset = self.previous_offset
         subreddit_name = self.previous_subreddit
-        
-        # Show loading indicator
+
         self.loading_bar.show()
         self.is_loading_posts = True
-        self.load_button.setEnabled(False)
-        self.prev_button.setEnabled(False)
-        self.next_button.setEnabled(False)
-        
-        # Clear any previous content and hide navigation buttons
+        self.load_button.setEnabled(False); self.prev_button.setEnabled(False); self.next_button.setEnabled(False)
         self.clear_content()
-        self.back_button.setVisible(False)
-        self.filter_button.setVisible(False)  # Hide the filter button when going back to subreddit
-        
-        # Reset filtering state
+        self.back_button.setVisible(False); self.filter_button.setVisible(False)
         self.is_filtered = False
-        
-        # Switch to subreddit mode
-        self.source_type_combo.setCurrentIndex(0)  # Switch to Subreddit mode
-        self.source_input.setText(subreddit_name)
-        
-        # Create the model manually, passing logs/status
-        self.current_model = RedditGalleryModel(
-            subreddit_name,
-            is_user_mode=False,
-            reddit_instance=self.reddit,
-            prefetched_mod_logs=self.prefetched_mod_logs,
-            mod_logs_ready=self.mod_logs_ready
-        )
 
-        # Check moderation status
+        self.source_type_combo.setCurrentIndex(0)
+        self.source_input.setText(subreddit_name)
+
+        self.current_model = RedditGalleryModel(
+            subreddit_name, is_user_mode=False, reddit_instance=self.reddit,
+            prefetched_mod_logs=self.prefetched_mod_logs, mod_logs_ready=self.mod_logs_ready
+        )
         is_mod = self.current_model.check_user_moderation_status()
-        mod_status = "Moderator" if is_mod else "Not a moderator"
-        self.mod_status_label.setText(mod_status)
-        
-         # Update status
+        self.mod_status_label.setText("Moderator" if is_mod else "Not a moderator")
         self.source_label.setText(f"Loading Subreddit: {subreddit_name}")
-        
-        # Create a special version of on_snapshot_fetched that will restore the page
+
         def on_snapshot_fetched_with_restore(snapshot):
-            # Call the normal snapshot handler first
             self.current_snapshot = snapshot
-            
-            # Set the offset to the saved offset
-            self.snapshot_offset = target_offset
-            
-            # Update status and buttons
+            self.snapshot_offset = target_offset # Restore offset
             self.is_loading_posts = False
-            self.load_button.setEnabled(True)
-            self.loading_bar.hide()
-            
-            # Enable appropriate navigation buttons
+            self.load_button.setEnabled(True); self.loading_bar.hide()
             self.prev_button.setEnabled(self.snapshot_offset > 0)
             self.next_button.setEnabled(self.snapshot_offset + self.snapshot_page_size < len(snapshot))
-            
             self.source_label.setText(f"Subreddit: {subreddit_name} - {len(snapshot)} posts")
-            
-            # Display the current page (which will use the offset we just set)
-            self.display_current_page()
-            
-            # Disconnect this handler after use to avoid it being called again
-            try:
-                self.snapshot_fetcher.snapshotFetched.disconnect(on_snapshot_fetched_with_restore)
-            except:
-                pass
-        
-        # Connect our specialized handler and start fetching
+            self.display_current_page() # Will use the restored offset
+            try: self.snapshot_fetcher.snapshotFetched.disconnect(on_snapshot_fetched_with_restore)
+            except: pass
+
         self.snapshot_fetcher = SnapshotFetcher(self.current_model)
         self.snapshot_fetcher.snapshotFetched.connect(on_snapshot_fetched_with_restore)
         self.snapshot_fetcher.start()
-    
-    def restore_previous_page(self):
-        """Restore to the previous page offset after going back to subreddit."""
-        if hasattr(self, 'previous_offset') and self.previous_offset > 0:
-            target_offset = self.previous_offset
-            self.snapshot_offset = 0  # Reset first
-            
-            # Move to the target page
-            while self.snapshot_offset < target_offset and self.snapshot_offset + self.snapshot_page_size < len(self.current_snapshot):
-                next_offset = self.snapshot_offset + self.snapshot_page_size
-                self.snapshot_offset = next_offset
-                self.prev_button.setEnabled(True)
-            
-            # Update next button state
-            self.next_button.setEnabled(self.snapshot_offset + self.snapshot_page_size < len(self.current_snapshot))
-            
-            # Display the current page
-            self.display_current_page()
-    
-    def open_ban_dialog(self, username):
+
+    def open_ban_dialog(self, username, subreddit_obj): # Accept subreddit object
         """Open the ban user dialog for moderators."""
-        if not self.current_model or self.current_model.is_user_mode or not self.current_model.is_moderator:
-            return
-            
-        subreddit_name = self.current_model.source_name
+        # No need for the checks here as they are done in on_author_clicked
+        subreddit_name = subreddit_obj.display_name # Get name from object
         dialog = BanUserDialog(username, subreddit_name, self)
         if dialog.exec():
-            # User clicked either "Ban and Share Reason" or "Ban and Set Private Reason"
             reason = dialog.reason
             share = dialog.result_type == "share"
-            
-            # Execute the ban
-            subreddit = self.current_model.subreddit
-            if share:
-                ban_message = reason
-                success = ban_user(subreddit, username, reason, ban_message)
-            else:
-                success = ban_user(subreddit, username, reason)
-                
+            ban_message = reason if share else None
+            success = ban_user(subreddit_obj, username, reason, ban_message) # Pass object
             if success:
-                QMessageBox.information(
-                    self, 
-                    "Success", 
-                    f"User {username} has been banned from r/{subreddit_name}."
-                )
+                QMessageBox.information(self, "Success", f"User {username} banned from r/{subreddit_name}.")
             else:
-                QMessageBox.warning(
-                    self, 
-                    "Error", 
-                    f"Failed to ban {username} from r/{subreddit_name}."
-                )
-    
+                QMessageBox.warning(self, "Error", f"Failed to ban {username} from r/{subreddit_name}.")
+
     def closeEvent(self, event):
         """Handle application shutdown."""
-        # Clean up resources
         QThreadPool.globalInstance().clear()
         if hasattr(self, 'snapshot_fetcher') and self.snapshot_fetcher.isRunning():
             self.snapshot_fetcher.terminate()
             self.snapshot_fetcher.wait()
-        
+        if hasattr(self, 'mod_log_fetcher_thread') and self.mod_log_fetcher_thread.isRunning():
+             self.mod_log_fetcher_thread.terminate()
+             self.mod_log_fetcher_thread.wait()
+        # Check if filter worker exists, is not None, and is running before terminating
+        if hasattr(self, 'filter_worker_thread') and self.filter_worker_thread is not None and self.filter_worker_thread.isRunning():
+             self.filter_worker_thread.terminate()
+             self.filter_worker_thread.wait()
+
         event.accept()
-    
+
     def toggle_subreddit_filter(self):
         """Toggle filtering user posts by the previously viewed subreddit."""
         if not self.previous_subreddit or not self.current_model or not self.current_model.is_user_mode:
-            # Can't filter if not in user mode or no previous subreddit
             self.filter_button.setVisible(False)
             return
-        
-        # Show loading indicator and disable buttons to prevent multiple clicks
-        self.loading_bar.show()
-        self.is_loading_posts = True
-        self.filter_button.setEnabled(False)
-        self.load_button.setEnabled(False)
-        self.prev_button.setEnabled(False)
-        self.next_button.setEnabled(False)
-        
-        # Use QTimer to allow UI to update before processing
-        QTimer.singleShot(100, self._perform_filtering)
+
+        self.loading_bar.show(); self.is_loading_posts = True
+        self.filter_button.setEnabled(False); self.load_button.setEnabled(False)
+        self.prev_button.setEnabled(False); self.next_button.setEnabled(False)
+
+        QTimer.singleShot(50, self._perform_filtering) # Shorter delay
 
     def _perform_filtering(self):
         """Perform the actual filtering operation after UI updates."""
         try:
-            # Toggle the filter state
             self.is_filtered = not self.is_filtered
-            
+            username = self.source_input.text().strip()
+
             if self.is_filtered:
-                # Update the button appearance first
                 self.filter_button.setText(f"Remove Filter")
                 self.filter_button.setStyleSheet("background-color: #ffc107; color: black;")
-                
-                # Show a status message
-                username = self.source_input.text().strip()
                 self.source_label.setText(f"Filtering posts by r/{self.previous_subreddit}...")
-                
-                # Apply the filter - find posts in the specific subreddit
-                logger.debug(f"Filtering {len(self.current_snapshot)} posts for subreddit: {self.previous_subreddit}")
-                
-                # Process in smaller batches if there are many posts
-                filtered_snapshot = []
-                total_posts = len(self.current_snapshot)
-                
-                # Process in batches of 100
-                batch_size = 100
-                for i in range(0, total_posts, batch_size):
-                    batch = self.current_snapshot[i:i+batch_size]
-                    
-                    # Allow UI to update between batches
-                    QApplication.processEvents()
-                    
-                    # Filter this batch
-                    batch_filtered = [
-                        post for post in batch 
-                        if hasattr(post, 'subreddit') and 
-                        post.subreddit.display_name.lower() == self.previous_subreddit.lower()
-                    ]
-                    filtered_snapshot.extend(batch_filtered)
-                
-                # Store the filtered results
-                self.current_filtered_snapshot = filtered_snapshot
-                
-                # Update the source label to show we're filtered
-                username = self.source_input.text().strip()
-                self.source_label.setText(f"User: {username} - Filtered by r/{self.previous_subreddit} - {len(filtered_snapshot)} posts")
-                
-                # Reset to first page
-                self.snapshot_offset = 0
-                
-                # Update navigation buttons
-                self.prev_button.setEnabled(False)
-                self.next_button.setEnabled(len(filtered_snapshot) > self.snapshot_page_size)
-                
-                # Display the filtered content
-                self.display_filtered_page()
-            else:
-                # Remove the filter
+                QApplication.processEvents() # Allow label update
+
+                # Start background filtering
+                self.filter_worker_thread = FilterWorker(self.current_snapshot, self.previous_subreddit.lower())
+                self.filter_worker_thread.filteringComplete.connect(self._on_filtering_complete)
+                self.filter_worker_thread.start()
+
+            else: # Removing filter
                 self.filter_button.setText(f"Filter by r/{self.previous_subreddit}")
                 self.filter_button.setStyleSheet("")
-                
-                # Restore original display
-                username = self.source_input.text().strip()
                 self.source_label.setText(f"User: {username} - {len(self.current_snapshot)} posts")
-                
-                # Reset to first page
                 self.snapshot_offset = 0
-                
-                # Update navigation buttons
                 self.prev_button.setEnabled(False)
                 self.next_button.setEnabled(len(self.current_snapshot) > self.snapshot_page_size)
-                
-                # Display the original content
-                self.display_current_page()
-        
+                self.display_current_page() # Display original unfiltered content
+                # Reset UI state after displaying
+                self.is_loading_posts = False
+                self.loading_bar.hide()
+                self.filter_button.setEnabled(True)
+                self.load_button.setEnabled(True)
+
         except Exception as e:
-            # Handle any errors
-            logger.exception(f"Error during filtering: {e}")
-            QMessageBox.warning(self, "Error", f"An error occurred while filtering: {str(e)}")
-            
-            # Restore button state
-            if self.is_filtered:
-                self.filter_button.setText(f"Remove Filter")
-                self.filter_button.setStyleSheet("background-color: #ffc107; color: black;")
-            else:
-                self.filter_button.setText(f"Filter by r/{self.previous_subreddit}")
-                self.filter_button.setStyleSheet("")
-        
-        finally:
-            # Reset UI state
+            logger.exception(f"Error initiating filtering: {e}")
+            QMessageBox.warning(self, "Error", f"An error occurred during filtering: {str(e)}")
+            # Reset UI state on error
             self.is_loading_posts = False
             self.loading_bar.hide()
             self.filter_button.setEnabled(True)
             self.load_button.setEnabled(True)
-    
+            # Restore button text based on intended state before error
+            if self.is_filtered: # If error happened while trying to filter
+                 self.filter_button.setText(f"Filter by r/{self.previous_subreddit}")
+                 self.filter_button.setStyleSheet("")
+                 self.is_filtered = False # Reset state
+            else: # If error happened while trying to remove filter
+                 self.filter_button.setText(f"Remove Filter")
+                 self.filter_button.setStyleSheet("background-color: #ffc107; color: black;")
+                 self.is_filtered = True # Reset state
+
+    def _on_filtering_complete(self, filtered_snapshot):
+        """Handle completion of the background filtering."""
+        try:
+            self.current_filtered_snapshot = filtered_snapshot
+            username = self.source_input.text().strip()
+            self.source_label.setText(f"User: {username} - Filtered by r/{self.previous_subreddit} - {len(filtered_snapshot)} posts")
+            self.snapshot_offset = 0
+            self.prev_button.setEnabled(False)
+            self.next_button.setEnabled(len(filtered_snapshot) > self.snapshot_page_size)
+            self.display_filtered_page() # Display the filtered content
+        except Exception as e:
+             logger.exception(f"Error processing filtered results: {e}")
+             QMessageBox.warning(self, "Error", f"An error occurred displaying filtered results: {str(e)}")
+             # Attempt to revert UI state
+             self.filter_button.setText(f"Filter by r/{self.previous_subreddit}")
+             self.filter_button.setStyleSheet("")
+             self.is_filtered = False
+             self.display_current_page() # Show original page
+        finally:
+            # Reset UI state regardless of success/failure in processing
+            self.is_loading_posts = False
+            self.loading_bar.hide()
+            self.filter_button.setEnabled(True)
+            self.load_button.setEnabled(True)
+
+
     def display_filtered_page(self):
         """Display the current page of filtered submissions."""
-        # Clear any existing content
         self.clear_content()
-        
         if not hasattr(self, 'current_filtered_snapshot') or not self.current_filtered_snapshot:
             label = QLabel(f"No posts found in r/{self.previous_subreddit}")
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.content_layout.addWidget(label, 0, 0, 1, 5)  # span across all columns
+            self.content_layout.addWidget(label, 0, 0, 1, 5)
+            self.statusBar.showMessage(f"Filtered by r/{self.previous_subreddit}: 0 posts found")
             return
-        
-        # Get the current page of submissions
+
         start = self.snapshot_offset
         end = min(start + self.snapshot_page_size, len(self.current_filtered_snapshot))
         current_page = self.current_filtered_snapshot[start:end]
-        
-        if not current_page:
-            label = QLabel(f"No posts found in r/{self.previous_subreddit}")
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.content_layout.addWidget(label, 0, 0, 1, 5)  # span across all columns
-            return
-        
-        # Create thumbnail widgets for each submission and place them in the grid
-        # Grid layout will have 5 columns and up to 2 rows
+
+        if not current_page: # Should not happen if list is not empty, but check anyway
+             label = QLabel(f"No posts found on this page in r/{self.previous_subreddit}")
+             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+             self.content_layout.addWidget(label, 0, 0, 1, 5)
+             self.statusBar.showMessage(f"Filtered by r/{self.previous_subreddit}: Page {start//self.snapshot_page_size + 1} empty")
+             return
+
         for i, submission in enumerate(current_page):
             try:
-                # Calculate row and column positions
-                row = i // 5  # Integer division to get row (0 or 1)
-                col = i % 5   # Modulo to get column (0 to 4)
-                
+                row = i // 5
+                col = i % 5
                 self.add_submission_widget(submission, row, col)
             except Exception as e:
-                logger.exception(f"Error displaying submission {submission.id}: {e}")
-        
-        # Update status
-        self.statusBar.showMessage(f"Showing posts {start+1} to {end} of {len(self.current_filtered_snapshot)} in r/{self.previous_subreddit}")
+                 submission_id_str = getattr(submission, 'id', 'unknown ID')
+                 logger.exception(f"Error displaying filtered submission {submission_id_str}: {e}")
+                 error_widget = QLabel(f"Error:\n{submission_id_str}")
+                 error_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                 error_widget.setStyleSheet("background-color: #ffdddd; border: 1px solid #ffaaaa;")
+                 self.content_layout.addWidget(error_widget, row, col)
+                 self.thumbnail_widgets.append(error_widget)
+
+        self.statusBar.showMessage(f"Showing posts {start+1} to {end} of {len(self.current_filtered_snapshot)} (Filtered by r/{self.previous_subreddit})")
 
 # Main application entry point
 if __name__ == "__main__":
     # Create and initialize cache directories
     cache_dir = get_cache_dir()
     logger.info(f"Using cache directory: {cache_dir}")
-    
+
     # Start the PyQt application
     app = QApplication(sys.argv)
     app.setApplicationName("Red Media Browser")

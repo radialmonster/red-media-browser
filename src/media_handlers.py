@@ -14,6 +14,7 @@ import requests
 import shutil
 import time
 import json
+import html # For unescaping potential entities in extracted URLs
 from urllib.parse import urlparse, quote
 
 from PyQt6.QtCore import QObject, QRunnable, pyqtSignal, pyqtSlot
@@ -334,6 +335,117 @@ def redgifs_image_handler(url):
 register_handler("i.redgifs.com", redgifs_image_handler)
 register_handler("media.redgifs.com", redgifs_image_handler)
 
+
+# --- Imgur Page Handler ---
+def imgur_page_handler(url):
+    """
+    Process Imgur page URLs (e.g., imgur.com/gallery/xyz, imgur.com/a/xyz, imgur.com/xyz)
+    Attempts to extract the direct image or video URL from the page's meta tags.
+    """
+    logger.info(f"--- Running imgur_page_handler for: {url} ---") # More prominent log
+
+    # Skip if it already looks like a direct media link
+    if any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.mp4', '.webm']):
+        logger.info(f"Imgur handler: URL '{url}' already appears to be a direct media link. Skipping.")
+        return url
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    }
+
+    try:
+        logger.debug(f"Imgur handler: Sending request to {url}")
+        response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        logger.debug(f"Imgur handler: Received response status {response.status_code} for {url}. Final URL: {response.url}")
+        response.raise_for_status() # Raise an exception for bad status codes
+
+        content_type = response.headers.get('Content-Type', '').lower()
+        logger.debug(f"Imgur handler: Content-Type: {content_type}")
+        # If the response *is* the image/video directly, return the final URL
+        if 'image/' in content_type or 'video/' in content_type:
+             logger.info(f"Imgur handler: URL directly resolved to media content ({content_type}): {response.url}")
+             return response.url
+
+        # If we got HTML, parse it for meta tags
+        elif 'text/html' in content_type: # Use elif for clarity
+            logger.debug(f"Imgur handler: Received HTML for {url}. Parsing meta tags...")
+            html_content = response.text
+            extracted_url = None
+
+            # Prioritize video tags if present
+            # <meta property="og:video" content="https://i.imgur.com/xyz.mp4" />
+            # <meta name="twitter:player" content="https://i.imgur.com/xyz.mp4" /> (less common?)
+            logger.debug("Imgur handler: Searching for video meta tags...")
+            video_match_og = re.search(r'<meta\s+property=["\']og:video["\']\s+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+            video_match_twitter = re.search(r'<meta\s+name=["\']twitter:player["\']\s+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+
+            if video_match_og:
+                extracted_url = video_match_og.group(1)
+                logger.info(f"Imgur handler: Extracted video URL from og:video: {extracted_url}")
+            elif video_match_twitter:
+                 extracted_url = video_match_twitter.group(1)
+                 logger.info(f"Imgur handler: Extracted video URL from twitter:player: {extracted_url}")
+            else:
+                 logger.debug("Imgur handler: No video meta tags found.")
+
+
+            # If no video found, look for image tags
+            # <meta property="og:image" content="https://i.imgur.com/xyz.jpg" />
+            # <meta name="twitter:image" content="https://i.imgur.com/xyz.jpg" />
+            if not extracted_url:
+                logger.debug("Imgur handler: Searching for image meta tags...")
+                image_match_og = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+                image_match_twitter = re.search(r'<meta\s+name=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+
+                if image_match_og:
+                    extracted_url = image_match_og.group(1)
+                    # Remove query parameters sometimes added by Imgur (e.g., ?fb)
+                    extracted_url = extracted_url.split('?')[0]
+                    logger.info(f"Imgur handler: Extracted image URL from og:image: {extracted_url}")
+                elif image_match_twitter:
+                    extracted_url = image_match_twitter.group(1)
+                    extracted_url = extracted_url.split('?')[0]
+                    logger.info(f"Imgur handler: Extracted image URL from twitter:image: {extracted_url}")
+                else:
+                    logger.debug("Imgur handler: No image meta tags found.")
+
+
+            if extracted_url:
+                # Unescape potential HTML entities
+                final_url = html.unescape(extracted_url)
+                logger.info(f"Imgur handler: Successfully extracted URL via meta tags: {final_url}")
+                return final_url
+            else:
+                logger.warning(f"Imgur handler: Could not extract media URL from Imgur page meta tags: {url}")
+                # Fallback: Try constructing i.imgur.com URL (simple case)
+                parsed = urlparse(url)
+                path_parts = [p for p in parsed.path.split('/') if p]
+                if len(path_parts) == 1 and '.' not in path_parts[0]: # e.g., /SgQaewF
+                     fallback_url = f"https://i.imgur.com/{path_parts[0]}.jpg" # Guess .jpg
+                     logger.debug(f"Imgur handler: Attempting Imgur fallback construction: {fallback_url}")
+                     return fallback_url
+                else:
+                     logger.warning(f"Imgur handler: Could not apply simple Imgur fallback construction for: {url}")
+
+        else:
+            logger.warning(f"Imgur handler: Received non-HTML/non-media content type ({content_type}) for Imgur URL: {url}")
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Imgur handler: RequestException fetching page {url}: {e}")
+    except Exception as e:
+        logger.exception(f"Imgur handler: Unexpected error processing page {url}: {e}")
+
+    # Return original URL if extraction fails
+    logger.warning(f"Imgur handler: Failed to extract direct URL for {url}. Returning original.")
+    return url
+
+# Register the Imgur page handler (ensure it doesn't conflict with i.imgur.com if needed)
+# Note: This handler should run for 'imgur.com' but might need adjustment if
+# direct i.imgur.com links need different handling (currently they don't have a handler).
+register_handler("imgur.com", imgur_page_handler)
+
+
 def reddit_video_handler(url):
     """
     Process Reddit video URLs (v.redd.it).
@@ -410,86 +522,91 @@ register_handler("v.redd.it", reddit_video_handler)
 def process_media_url(url):
     """
     Determine the media provider and delegate URL processing.
+    Corrected logic: Run handler first, then check cache with processed URL.
     """
     logger.debug(f"Processing media URL: {url}")
-    
-    # For all media types, first check if we already know what the processed URL would be
-    # and if that processed URL is already in the cache
-    
-    # For RedGifs URLs
-    if "redgifs.com" in url and not url.endswith('.mp4'):
-        # Try to predict what the processed URL would be based on RedGifs ID patterns
-        redgifs_id = None
-        
-        # Try to extract ID from the URL pattern
-        if '/watch/' in url:
-            m = re.search(r'/watch/([A-Za-z]+)', url)
-            if m:
-                redgifs_id = m.group(1)
-                # Convert to proper case for media URLs (first letter capitalized for each word)
-                redgifs_id_proper = ''.join(word.capitalize() for word in re.findall(r'[a-z]+', redgifs_id))
-                predicted_url = f"https://media.redgifs.com/{redgifs_id_proper}.mp4"
-                
-                # Check if the predicted URL is in cache
-                cache_path = get_cache_path_for_url(predicted_url)
-                if cache_path and os.path.exists(cache_path):
-                    logger.debug(f"Cache hit for predicted RedGifs URL: {predicted_url}")
-                    return predicted_url
-        
-        # If cache prediction didn't work, proceed with normal processing
-        logger.debug(f"Processing RedGIFs URL: {url}")
-        processed_url = get_redgifs_mp4_url(url)
-        logger.debug(f"Processed URL: {url} -> {processed_url}")
-        return processed_url
+    processed_url = url # Start with the original URL
 
-    # Check if any registered handler can process this URL
-    for domain, handler in provider_handlers.items():
-        if domain in url:
-            # For domain-specific handlers, check cache first with the original URL
+    # --- Step 1: Apply Provider-Specific Handlers ---
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc.lower()
+    best_match_domain = None
+    for handler_domain in provider_handlers.keys():
+        if domain.endswith(handler_domain):
+            if best_match_domain is None or len(handler_domain) > len(best_match_domain):
+                best_match_domain = handler_domain
+
+    if best_match_domain:
+        handler = provider_handlers[best_match_domain]
+        logger.debug(f"Found handler for domain '{best_match_domain}'. Running handler...")
+        try:
+            processed_url = handler(url) # Run handler to get potentially new URL
+            if processed_url != url:
+                logger.debug(f"Handler for {best_match_domain} modified URL to: {processed_url}")
+            else:
+                logger.debug(f"Handler for {best_match_domain} did not modify URL.")
+        except Exception as handler_e:
+            logger.error(f"Error running handler for {best_match_domain} on {url}: {handler_e}")
+            processed_url = url # Revert to original URL on handler error
+    else:
+        logger.debug(f"No specific handler found for domain '{domain}'.")
+
+    # --- Step 2: Apply Generic Transformations (after specific handlers) ---
+    # Handle RedGifs special case (if not already handled by a more specific redgifs handler)
+    # This check might be redundant if redgifs.com handler exists, but keep for safety
+    if "redgifs.com" in processed_url and not processed_url.endswith('.mp4'):
+        # Check if it's already a direct media link (e.g., .jpg from i.redgifs.com handler)
+        if not any(processed_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+             logger.debug(f"Processing non-mp4 RedGIFs URL: {processed_url}")
+             processed_url = get_redgifs_mp4_url(processed_url)
+             logger.debug(f"Processed RedGIFs URL: {url} -> {processed_url}")
+
+    # Handle Reddit links that might contain RedGifs (if no specific handler matched)
+    elif "reddit.com" in domain and best_match_domain is None: # Only if no reddit handler ran
+        logger.debug("Checking Reddit URL for potential embedded RedGifs...")
+        try:
+            # Check cache for the *original* reddit URL first
             cache_path = get_cache_path_for_url(url)
             if cache_path and os.path.exists(cache_path):
-                logger.debug(f"Cache hit for URL before handler processing: {url}")
-                return url
-                
-            # If not in cache, let the handler process it
-            new_url = handler(url)
-            if new_url != url:
-                logger.debug(f"Handler for {domain} modified URL to: {new_url}")
-                return new_url
+                 logger.debug(f"Cache hit for original Reddit URL: {url}")
+                 return url # Return original if HTML/content is cached
 
-    # Process Reddit RedGifs crosspost links
-    if "reddit.com" in url:
-        # Check cache first with the original URL
-        cache_path = get_cache_path_for_url(url)
-        if cache_path and os.path.exists(cache_path):
-            logger.debug(f"Cache hit for Reddit URL: {url}")
-            return url
-            
-        json_url = ensure_json_url(url)
-        logger.debug(f"Converted Reddit URL to JSON endpoint: {json_url}")
-        try:
+            json_url = ensure_json_url(url)
             headers = {"User-Agent": "Mozilla/5.0 (compatible; red-media-browser/1.0)"}
             response = requests.get(json_url, headers=headers, timeout=10)
             response.raise_for_status()
             reddit_json = response.json()
-            extracted = extract_redgifs_url_from_reddit(reddit_json)
-            if extracted:
-                normalized = normalize_redgifs_url(extracted)
-                mp4_url = get_redgifs_mp4_url(normalized)
-                logger.debug(f"Returning MP4 URL after Reddit extraction: {mp4_url}")
-                return mp4_url
+            extracted_redgifs = extract_redgifs_url_from_reddit(reddit_json)
+            if extracted_redgifs:
+                normalized = normalize_redgifs_url(extracted_redgifs)
+                # Process the extracted RedGifs URL (might involve API calls)
+                processed_url = get_redgifs_mp4_url(normalized)
+                logger.debug(f"Processed embedded RedGifs URL: {extracted_redgifs} -> {processed_url}")
             else:
-                logger.error("Failed to extract redgifs URL from Reddit JSON.")
+                logger.debug("No embedded RedGifs URL found in Reddit JSON.")
+                # Keep processed_url as the original reddit URL
         except Exception as e:
-            logger.exception(f"Error processing Reddit redgifs URL: {e}")
-        return url
+            logger.exception(f"Error processing Reddit URL for embedded RedGifs: {e}")
+            # Keep processed_url as the original reddit URL on error
 
-    # Convert gifv to mp4 for Imgur
-    if url.endswith('.gifv'):
-        return url.replace('.gifv', '.mp4')
+    # Convert gifv to mp4 for Imgur (if not handled by imgur handler)
+    elif processed_url.endswith('.gifv'):
+        logger.debug(f"Converting .gifv URL: {processed_url}")
+        processed_url = processed_url.replace('.gifv', '.mp4')
 
-    logger.debug(f"No provider-specific processing required for: {url}")
-    return url
+    # --- Step 3: Check Cache with the FINAL Processed URL ---
+    final_cache_path = get_cache_path_for_url(processed_url)
+    if final_cache_path and os.path.exists(final_cache_path):
+        logger.debug(f"Cache hit for FINAL processed URL '{processed_url}' at path: {final_cache_path}")
+        return processed_url # Return the URL corresponding to the cached file
+
+    # --- Step 4: Return the URL to be downloaded ---
+    if processed_url != url:
+         logger.debug(f"Returning processed URL for download: {processed_url}")
+    else:
+         logger.debug(f"Returning original URL for download (no processing needed or handler failed): {url}")
+    return processed_url # Return the potentially modified URL
+
 
 # Signal class for worker communication
 class WorkerSignals(QObject):
@@ -513,7 +630,7 @@ class MediaDownloadWorker(QRunnable):
         self.processed_url = process_media_url(url) 
         self.signals = WorkerSignals()
         submission_id = getattr(submission_data, 'id', 'UnknownID')
-        logger.debug(f"MediaDownloadWorker initialized for {submission_id}: original={self.original_url}, processed={self.processed_url}")
+        logger.debug(f"MediaDownloadWorker initialized for {submission_id}: original='{self.original_url}', processed='{self.processed_url}'")
         
     @pyqtSlot()
     def run(self):
@@ -545,11 +662,12 @@ class MediaDownloadWorker(QRunnable):
                 return
 
             # Download the file using the processed URL
-            logger.debug(f"Starting download for submission {submission_id} from {self.processed_url}")
+            logger.info(f"Starting download for submission {submission_id} from {self.processed_url}") # Changed to INFO
             file_path = self.download_file(self.processed_url) # This returns the final cache_path
 
             # Update metadata cache after successful download
             if file_path and os.path.exists(file_path):
+                 logger.info(f"Download successful for {submission_id}. File: {file_path}") # Changed to INFO
                  update_metadata_cache(self.submission_data, file_path, self.processed_url)
                  self.signals.finished.emit(file_path, self.submission_data)
             else:

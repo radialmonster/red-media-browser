@@ -16,6 +16,8 @@ import requests
 import json
 import time
 import threading
+import html # Ensure html is imported for unescaping
+from urllib.parse import urlparse # Import urlparse for URL checking
 from praw.models import Redditor, Subreddit # For type checking in filtering
 
 # Basic Logging Configuration
@@ -77,15 +79,101 @@ def ensure_json_url(url):
 
 def extract_image_urls(submission):
     """
-    Given a submission, returns a list of image URLs.
+    Given a submission object (PRAW or SimpleNamespace/dict), returns a list of image URLs.
+    Handles regular posts, gallery posts, and crossposts.
     """
-    if (hasattr(submission, 'is_gallery') and submission.is_gallery and
-        hasattr(submission, 'media_metadata') and submission.media_metadata):
-        return [html.unescape(media['s']['u'])
-                for media in submission.media_metadata.values()
-                if 's' in media and 'u' in media['s']]
-    else:
-        return [submission.url]
+    submission_id_str = getattr(submission, 'id', 'N/A')
+    logger.debug(f"Extracting image URLs for submission ID: {submission_id_str}")
+
+    # --- Check for Crosspost First ---
+    crosspost_parent_list = getattr(submission, 'crosspost_parent_list', None)
+    if crosspost_parent_list and isinstance(crosspost_parent_list, list) and len(crosspost_parent_list) > 0:
+        parent_data = crosspost_parent_list[0] # This is expected to be a dictionary
+        logger.debug(f"Processing {submission_id_str} as crosspost.") # Log keys: {list(parent_data.keys())}") # Keys can be verbose
+
+        # Check parent for gallery
+        parent_is_gallery = parent_data.get('is_gallery', False)
+        parent_media_metadata = parent_data.get('media_metadata', None)
+
+        if parent_is_gallery and parent_media_metadata and isinstance(parent_media_metadata, dict):
+            try:
+                urls = [html.unescape(media['s']['u'])
+                        for media in parent_media_metadata.values()
+                        if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']]
+                if urls:
+                    logger.debug(f"Extracted {len(urls)} gallery URLs from crosspost parent {submission_id_str}.")
+                    return urls
+                else:
+                     logger.warning(f"Crosspost parent gallery detected but no valid URLs found in media_metadata for {submission_id_str}")
+            except Exception as e:
+                 logger.error(f"Error processing crosspost parent gallery metadata for {submission_id_str}: {e}")
+
+        # Check parent for direct URL (if not a gallery or gallery extraction failed)
+        parent_url = parent_data.get('url', None)
+        if parent_url:
+            # Basic check if the URL itself looks like an image
+            parsed_url = urlparse(parent_url)
+            if any(parent_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
+                 logger.debug(f"Using direct image URL from crosspost parent {submission_id_str}: {parent_url}")
+                 return [parent_url]
+            # Consider adding domain checks for imgur, etc. if needed later
+            logger.debug(f"Crosspost parent URL found for {submission_id_str}, but not a direct image link: {parent_url}. Falling back.")
+        else:
+             logger.debug(f"No gallery or direct URL found in crosspost parent for {submission_id_str}")
+
+    # --- If Not Crosspost (or crosspost processing failed/didn't find media) ---
+    logger.debug(f"Processing {submission_id_str} as regular post (or fallback from crosspost)")
+
+    # Check main submission for gallery (using getattr for safety)
+    is_gallery = getattr(submission, 'is_gallery', False)
+    media_metadata = getattr(submission, 'media_metadata', None)
+
+    if is_gallery and media_metadata:
+        try:
+            # Ensure media_metadata is dict-like
+            if not isinstance(media_metadata, dict):
+                 logger.warning(f"media_metadata is not a dict for {submission_id_str}, type: {type(media_metadata)}")
+                 # Attempt to fallback to URL if possible
+                 url = getattr(submission, 'url', None)
+                 if url:
+                      logger.debug(f"Falling back to direct URL for non-dict media_metadata: {url}")
+                      return [url]
+                 else:
+                      logger.error(f"Cannot extract gallery URLs (media_metadata not dict) and no fallback URL for {submission_id_str}")
+                      return []
+
+            urls = [html.unescape(media['s']['u'])
+                    for media in media_metadata.values()
+                    if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']]
+            if urls:
+                logger.debug(f"Extracted {len(urls)} gallery URLs from main submission {submission_id_str}.")
+                return urls
+            else:
+                 logger.warning(f"Main submission gallery detected but no valid URLs found in media_metadata for {submission_id_str}")
+                 # Fall through to check direct URL as fallback
+        except Exception as e:
+             logger.error(f"Error processing main submission gallery metadata for {submission_id_str}: {e}")
+             # Fall through to check direct URL as fallback
+
+    # Fallback to direct URL on main submission
+    url = getattr(submission, 'url', None)
+    if url:
+        # Basic check if the URL itself looks like an image before returning
+        parsed_url = urlparse(url)
+        if any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
+            logger.debug(f"Using direct image URL from main submission {submission_id_str}: {url}")
+            return [url]
+        else:
+            # If the direct URL isn't an image, maybe it's a video or something else?
+            # The ThumbnailWidget might handle this, but extract_image_urls should ideally return image URLs.
+            # For now, let's return it, but log a warning.
+            logger.warning(f"Direct URL from main submission {submission_id_str} is not an image link: {url}. Returning anyway.")
+            return [url]
+
+
+    # If absolutely no URL found
+    logger.error(f"Could not extract any image URL for submission {submission_id_str}")
+    return []
 
 def is_image_file(file_path):
     """Check if the file is an image based on extension."""

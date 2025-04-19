@@ -38,35 +38,39 @@ def register_handler(domain, handler):
 def extract_redgifs_url_from_reddit(json_data):
     """
     Extract a direct RedGIFs URL from Reddit JSON data.
+
+    Args:
+        json_data (list): Reddit post JSON data (as returned by Reddit API).
+
+    Returns:
+        str or None: Direct RedGIFs URL if found, otherwise None.
     """
     try:
         post_listing = json_data[0]
         post_data = post_listing["data"]["children"][0]["data"]
         redgifs_url = post_data.get("url_overridden_by_dest") or post_data.get("url")
-        
+
         # If we already have a redgifs URL, just return it
         if redgifs_url and "redgifs.com" in urlparse(redgifs_url).netloc:
             logger.debug(f"Found RedGIFs URL in post data: {redgifs_url}")
             return redgifs_url
-            
+
         # Try to extract from secure_media or media
         secure_media = post_data.get("secure_media") or post_data.get("media")
-        if (secure_media and "oembed" in secure_media):
+        if secure_media and "oembed" in secure_media:
             oembed_data = secure_media["oembed"]
-            
+
             # Try to extract from thumbnail_url
             thumbnail_url = oembed_data.get("thumbnail_url")
             if thumbnail_url and "redgifs.com" in thumbnail_url:
                 logger.debug(f"Extracted RedGIFs thumbnail URL: {thumbnail_url}")
                 # This is likely a poster image, try to convert to video URL
-                redgifs_id = None
-                # Extract ID from poster image URL like media.redgifs.com/SociableGiftedCoyote-poster.jpg
                 poster_match = re.search(r'([A-Za-z]+)-poster\.(jpg|jpeg|png)', thumbnail_url)
                 if poster_match:
                     redgifs_id = poster_match.group(1)
                     logger.debug(f"Extracted RedGIFs ID from poster: {redgifs_id}")
                     return f"https://www.redgifs.com/watch/{redgifs_id.lower()}"
-            
+
             # Try to extract from the HTML
             oembed_html = oembed_data.get("html", "")
             match = re.search(r'src="([^"]+)"', oembed_html)
@@ -81,7 +85,7 @@ def extract_redgifs_url_from_reddit(json_data):
                         logger.debug(f"Extracted RedGIFs ID from iframe: {redgifs_id}")
                         return f"https://www.redgifs.com/watch/{redgifs_id.lower()}"
                     return candidate
-        
+
         # Check crossposted content
         if not redgifs_url and "crosspost_parent_list" in post_data:
             for cp in post_data["crosspost_parent_list"]:
@@ -89,38 +93,47 @@ def extract_redgifs_url_from_reddit(json_data):
                 if candidate and "redgifs.com" in urlparse(candidate).netloc:
                     redgifs_url = candidate
                     break
-                    
+
                 # Also check embedded media in crossposts
                 cp_media = cp.get("secure_media") or cp.get("media")
                 if cp_media and "oembed" in cp_media and "html" in cp_media["oembed"]:
-                    html = cp_media["oembed"]["html"]
-                    match = re.search(r'src="([^"]+)"', html)
+                    html_content = cp_media["oembed"]["html"]
+                    match = re.search(r'src="([^"]+)"', html_content)
                     if match:
                         candidate = match.group(1)
                         if "redgifs.com" in urlparse(candidate).netloc:
                             redgifs_url = candidate
                             break
-        
+
         if redgifs_url:
             logger.debug(f"Final extracted RedGIFs URL: {redgifs_url}")
         else:
             logger.error("Could not extract a RedGIFs URL from the post.")
         return redgifs_url
-    except Exception as e:
+    except (KeyError, IndexError, TypeError) as e:
         logger.exception(f"Error extracting RedGIFs URL from Reddit JSON: {e}")
         return None
+    except Exception as e:
+        logger.exception(f"Unexpected error extracting RedGIFs URL: {e}")
+        return None
 
-def get_redgifs_mp4_url(url):
+def get_redgifs_mp4_url(url: str) -> str:
     """
     Attempts to extract an mp4 video URL for a RedGIFs post.
+
+    Args:
+        url (str): The RedGIFs URL to process.
+
+    Returns:
+        str: Direct mp4 video URL if found, otherwise returns the original URL.
     """
     url = normalize_redgifs_url(url)
     logger.debug(f"Attempting to fetch mp4 URL from RedGIFs for: {url}")
-    
+
     # Extract the RedGIFs ID from the URL
     redgifs_id = None
     numeric_id = None
-    
+
     # Check for new numeric ID format
     if '/watch/' in url and url.split('/watch/')[-1].isdigit():
         numeric_id = url.split('/watch/')[-1]
@@ -137,18 +150,18 @@ def get_redgifs_mp4_url(url):
         if m:
             redgifs_id = m.group(1)
             logger.debug(f"Extracted fallback RedGIFs ID: {redgifs_id}")
-    
+
     if not redgifs_id and not numeric_id:
         logger.error(f"Could not extract RedGIFs ID from URL: {url}")
         return url
-    
+
     # Headers for API requests
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Referer': 'https://www.redgifs.com/',
         'Accept': 'application/json'
     }
-    
+
     # Try to get an access token first (needed for API v2)
     try:
         token_url = "https://api.redgifs.com/v2/auth/temporary"
@@ -161,25 +174,25 @@ def get_redgifs_mp4_url(url):
                 headers["Authorization"] = f"Bearer {access_token}"
     except Exception as e:
         logger.exception(f"Error getting RedGIFs token: {e}")
-    
+
     # For numeric IDs, use a different API endpoint
     if numeric_id:
         try:
             api_url = f"https://api.redgifs.com/v2/gifs/{numeric_id}"
             logger.debug(f"Trying RedGIFs API v2 with numeric ID: {api_url}")
-            
+
             response = requests.get(api_url, headers=headers, timeout=10)
             logger.debug(f"API v2 numeric ID response status: {response.status_code}")
-            
+
             if response.status_code == 200:
                 data = response.json()
                 gif_data = data.get("gif", {})
-                
+
                 # Try HD URL first, then SD
                 mp4_url = gif_data.get("urls", {}).get("hd")
                 if not mp4_url:
                     mp4_url = gif_data.get("urls", {}).get("sd")
-                
+
                 if mp4_url:
                     logger.debug(f"Extracted mp4 URL from API v2 with numeric ID: {mp4_url}")
                     return mp4_url
@@ -189,32 +202,32 @@ def get_redgifs_mp4_url(url):
                 logger.error(f"API v2 call failed for numeric ID with status: {response.status_code}")
         except Exception as e:
             logger.exception(f"Exception calling API v2 with numeric ID: {e}")
-            
+
         # If API v2 with numeric ID fails, try a direct construction
         direct_url = f"https://thumbs2.redgifs.com/{numeric_id}.mp4"
         logger.debug(f"Trying direct URL with numeric ID: {direct_url}")
         return direct_url
-    
+
     # For text-based IDs, proceed with normal API calls
     else:
         # Try the RedGIFs API v2 first
         api_url = f"https://api.redgifs.com/v2/gifs/{redgifs_id}"
         logger.debug(f"Trying RedGIFs API v2 URL: {api_url}")
-        
+
         try:
             response = requests.get(api_url, headers=headers, timeout=10)
             logger.debug(f"API v2 response status: {response.status_code}")
-            
+
             if response.status_code == 200:
                 data = response.json()
                 gif_data = data.get("gif", {})
-                
+
                 # Try HD URL first
                 mp4_url = gif_data.get("urls", {}).get("hd")
                 if not mp4_url:
                     # Try SD URL next
                     mp4_url = gif_data.get("urls", {}).get("sd")
-                
+
                 if mp4_url:
                     logger.debug(f"Extracted mp4 URL from API v2: {mp4_url}")
                     return mp4_url
@@ -224,11 +237,11 @@ def get_redgifs_mp4_url(url):
                 logger.error(f"API v2 call failed with status: {response.status_code}")
         except Exception as e:
             logger.exception(f"Exception calling API v2: {e}")
-        
+
         # Try the oEmbed API as a fallback
         api_url = "https://api.redgifs.com/v1/oembed?url=" + quote(url, safe='')
         logger.debug(f"Fallback: Fetching RedGIFs oEmbed API URL: {api_url}")
-        
+
         try:
             response = requests.get(api_url, headers=headers, timeout=10)
             logger.debug(f"oEmbed API response status: {response.status_code}")
@@ -247,11 +260,11 @@ def get_redgifs_mp4_url(url):
                 logger.error(f"Failed fetching oEmbed API, status: {response.status_code}")
         except Exception as e:
             logger.exception(f"Exception while calling oEmbed API: {e}")
-        
+
         # If all else fails, try the legacy GFYcats API
         gfycats_url = f"https://api.redgifs.com/v1/gfycats/{redgifs_id}"
         logger.debug(f"Attempting legacy GFYCats API with URL: {gfycats_url}")
-        
+
         try:
             response = requests.get(gfycats_url, headers=headers, timeout=10)
             logger.debug(f"GFYCats API response status: {response.status_code}")
@@ -263,7 +276,7 @@ def get_redgifs_mp4_url(url):
                     mp4_url = gfyItem["urls"].get("hd", "")
                     if not mp4_url:
                         mp4_url = gfyItem["urls"].get("sd", "")
-                
+
                 if mp4_url:
                     logger.debug(f"Extracted mp4 URL from GFYCats API: {mp4_url}")
                     return mp4_url
@@ -273,34 +286,39 @@ def get_redgifs_mp4_url(url):
                 logger.error(f"GFYCats API call failed with status: {response.status_code}")
         except Exception as e:
             logger.exception(f"Exception calling GFYCats API: {e}")
-        
+
         # Final fallback - try a direct URL construction
         direct_url = f"https://thumbs2.redgifs.com/{redgifs_id}.mp4"
         logger.debug(f"All API calls failed, trying direct URL construction: {direct_url}")
         return direct_url
 
-def redgifs_image_handler(url):
+def redgifs_image_handler(url: str) -> str:
     """
     Special handling for i.redgifs.com image URLs.
-    Preserves the file extension for proper media type detection.
+
+    Args:
+        url (str): The RedGIFs image URL.
+
+    Returns:
+        str: The direct image URL, possibly with the correct extension, or the original URL if extraction fails.
     """
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         "Referer": "https://redgifs.com/",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
-    
+
     # Get file extension from original URL (preserve it for type detection)
     ext = os.path.splitext(url.lower())[1]
     is_image_extension = ext in ['.jpg', '.jpeg', '.png', '.webp']
-    
+
     try:
         resp = requests.get(url, stream=True, allow_redirects=True, headers=headers, timeout=10)
         ctype = resp.headers.get('Content-Type', '')
-        
+
         # If content-type confirms it's an image, ensure we preserve that information
         is_image_content = 'image/' in ctype.lower()
-        
+
         if 'text/html' in ctype.lower():
             logger.debug("Redgifs handler: received HTML, attempting extraction.")
             html_content = resp.text
@@ -312,12 +330,14 @@ def redgifs_image_handler(url):
             if m:
                 extracted_url = m.group(1)
                 logger.debug(f"Redgifs handler: extracted image URL: {extracted_url}")
-                
+
                 # Preserve the image extension if we had one originally
-                if is_image_extension and not any(extracted_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                if is_image_extension and not any(
+                    extracted_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']
+                ):
                     logger.debug(f"Preserving original image extension: {ext}")
                     extracted_url = f"{extracted_url}{ext}"
-                
+
                 return extracted_url
             else:
                 logger.error("Redgifs handler: No og:image tag found.")
@@ -327,7 +347,7 @@ def redgifs_image_handler(url):
             return url
     except Exception as e:
         logger.exception(f"Redgifs handler exception: {e}")
-    
+
     # Return original URL as fallback
     return url
 
@@ -337,12 +357,18 @@ register_handler("media.redgifs.com", redgifs_image_handler)
 
 
 # --- Imgur Page Handler ---
-def imgur_page_handler(url):
+def imgur_page_handler(url: str) -> str:
     """
-    Process Imgur page URLs (e.g., imgur.com/gallery/xyz, imgur.com/a/xyz, imgur.com/xyz)
+    Process Imgur page URLs (e.g., imgur.com/gallery/xyz, imgur.com/a/xyz, imgur.com/xyz).
     Attempts to extract the direct image or video URL from the page's meta tags.
+
+    Args:
+        url (str): The Imgur page URL.
+
+    Returns:
+        str: The direct media URL if found, otherwise the original URL.
     """
-    logger.info(f"--- Running imgur_page_handler for: {url} ---") # More prominent log
+    logger.info(f"--- Running imgur_page_handler for: {url} ---")  # More prominent log
 
     # Skip if it already looks like a direct media link
     if any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.mp4', '.webm']):
@@ -358,24 +384,22 @@ def imgur_page_handler(url):
         logger.debug(f"Imgur handler: Sending request to {url}")
         response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
         logger.debug(f"Imgur handler: Received response status {response.status_code} for {url}. Final URL: {response.url}")
-        response.raise_for_status() # Raise an exception for bad status codes
+        response.raise_for_status()  # Raise an exception for bad status codes
 
         content_type = response.headers.get('Content-Type', '').lower()
         logger.debug(f"Imgur handler: Content-Type: {content_type}")
         # If the response *is* the image/video directly, return the final URL
         if 'image/' in content_type or 'video/' in content_type:
-             logger.info(f"Imgur handler: URL directly resolved to media content ({content_type}): {response.url}")
-             return response.url
+            logger.info(f"Imgur handler: URL directly resolved to media content ({content_type}): {response.url}")
+            return response.url
 
         # If we got HTML, parse it for meta tags
-        elif 'text/html' in content_type: # Use elif for clarity
+        elif 'text/html' in content_type:
             logger.debug(f"Imgur handler: Received HTML for {url}. Parsing meta tags...")
             html_content = response.text
             extracted_url = None
 
             # Prioritize video tags if present
-            # <meta property="og:video" content="https://i.imgur.com/xyz.mp4" />
-            # <meta name="twitter:player" content="https://i.imgur.com/xyz.mp4" /> (less common?)
             logger.debug("Imgur handler: Searching for video meta tags...")
             video_match_og = re.search(r'<meta\s+property=["\']og:video["\']\s+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
             video_match_twitter = re.search(r'<meta\s+name=["\']twitter:player["\']\s+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
@@ -384,15 +408,12 @@ def imgur_page_handler(url):
                 extracted_url = video_match_og.group(1)
                 logger.info(f"Imgur handler: Extracted video URL from og:video: {extracted_url}")
             elif video_match_twitter:
-                 extracted_url = video_match_twitter.group(1)
-                 logger.info(f"Imgur handler: Extracted video URL from twitter:player: {extracted_url}")
+                extracted_url = video_match_twitter.group(1)
+                logger.info(f"Imgur handler: Extracted video URL from twitter:player: {extracted_url}")
             else:
-                 logger.debug("Imgur handler: No video meta tags found.")
-
+                logger.debug("Imgur handler: No video meta tags found.")
 
             # If no video found, look for image tags
-            # <meta property="og:image" content="https://i.imgur.com/xyz.jpg" />
-            # <meta name="twitter:image" content="https://i.imgur.com/xyz.jpg" />
             if not extracted_url:
                 logger.debug("Imgur handler: Searching for image meta tags...")
                 image_match_og = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
@@ -400,7 +421,6 @@ def imgur_page_handler(url):
 
                 if image_match_og:
                     extracted_url = image_match_og.group(1)
-                    # Remove query parameters sometimes added by Imgur (e.g., ?fb)
                     extracted_url = extracted_url.split('?')[0]
                     logger.info(f"Imgur handler: Extracted image URL from og:image: {extracted_url}")
                 elif image_match_twitter:
@@ -409,7 +429,6 @@ def imgur_page_handler(url):
                     logger.info(f"Imgur handler: Extracted image URL from twitter:image: {extracted_url}")
                 else:
                     logger.debug("Imgur handler: No image meta tags found.")
-
 
             if extracted_url:
                 # Unescape potential HTML entities
@@ -421,12 +440,12 @@ def imgur_page_handler(url):
                 # Fallback: Try constructing i.imgur.com URL (simple case)
                 parsed = urlparse(url)
                 path_parts = [p for p in parsed.path.split('/') if p]
-                if len(path_parts) == 1 and '.' not in path_parts[0]: # e.g., /SgQaewF
-                     fallback_url = f"https://i.imgur.com/{path_parts[0]}.jpg" # Guess .jpg
-                     logger.debug(f"Imgur handler: Attempting Imgur fallback construction: {fallback_url}")
-                     return fallback_url
+                if len(path_parts) == 1 and '.' not in path_parts[0]:
+                    fallback_url = f"https://i.imgur.com/{path_parts[0]}.jpg"
+                    logger.debug(f"Imgur handler: Attempting Imgur fallback construction: {fallback_url}")
+                    return fallback_url
                 else:
-                     logger.warning(f"Imgur handler: Could not apply simple Imgur fallback construction for: {url}")
+                    logger.warning(f"Imgur handler: Could not apply simple Imgur fallback construction for: {url}")
 
         else:
             logger.warning(f"Imgur handler: Received non-HTML/non-media content type ({content_type}) for Imgur URL: {url}")
@@ -446,17 +465,23 @@ def imgur_page_handler(url):
 register_handler("imgur.com", imgur_page_handler)
 
 
-def reddit_video_handler(url):
+def reddit_video_handler(url: str) -> str:
     """
     Process Reddit video URLs (v.redd.it).
     Extracts the direct MP4 URL from Reddit's video JSON data.
+
+    Args:
+        url (str): The Reddit video URL.
+
+    Returns:
+        str: The direct MP4 URL if found, otherwise the original URL.
     """
     logger.debug(f"Processing Reddit video URL: {url}")
-    
+
     # Check if it's already a direct MP4 URL
     if url.endswith('.mp4'):
         return url
-    
+
     # These are the direct video URLs: structure is v.redd.it/[video_id]
     video_id = None
     parsed_url = urlparse(url)
@@ -464,53 +489,51 @@ def reddit_video_handler(url):
         # Extract the video ID from path
         video_id = parsed_url.path.strip('/')
         logger.debug(f"Extracted Reddit video ID: {video_id}")
-    
+
     if not video_id:
         logger.error(f"Could not extract video ID from Reddit URL: {url}")
         return url
-    
+
     # Try to get the post JSON to extract fallback_url
     try:
-        # First try to get the post data via Reddit API
         headers = {"User-Agent": "Mozilla/5.0 (compatible; red-media-browser/1.0)"}
-        
+
         # We need to get the actual post URL first - v.redd.it is just a redirect
-        # Try fetching with HEAD request to follow redirects to get the actual post
         session = requests.Session()
         try:
             head_response = session.head(url, headers=headers, timeout=10, allow_redirects=True)
             if head_response.url and "reddit.com" in head_response.url:
                 post_url = head_response.url
                 logger.debug(f"Redirected to post URL: {post_url}")
-                
+
                 # Convert to JSON endpoint
                 json_url = ensure_json_url(post_url)
                 logger.debug(f"Fetching JSON data from: {json_url}")
-                
+
                 response = session.get(json_url, headers=headers, timeout=10)
                 response.raise_for_status()
                 json_data = response.json()
-                
+
                 # Extract video URL from the JSON
                 post_data = json_data[0]["data"]["children"][0]["data"]
                 secure_media = post_data.get("secure_media") or post_data.get("media")
-                
+
                 if secure_media and "reddit_video" in secure_media:
                     reddit_video = secure_media["reddit_video"]
                     fallback_url = reddit_video.get("fallback_url")
-                    
+
                     if fallback_url:
                         logger.debug(f"Successfully extracted fallback URL: {fallback_url}")
                         return fallback_url
-            
+
         except Exception as head_e:
             logger.debug(f"Error following redirects: {head_e}")
-        
+
         # Fallback method: try constructing a direct URL if we have the video ID
         fallback_url = f"https://v.redd.it/{video_id}/DASH_1080.mp4?source=fallback"
         logger.debug(f"Using constructed fallback URL: {fallback_url}")
         return fallback_url
-        
+
     except Exception as e:
         logger.exception(f"Error processing Reddit video URL: {e}")
         # If all else fails, just return the original URL

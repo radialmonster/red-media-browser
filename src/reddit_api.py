@@ -17,9 +17,6 @@ from PyQt6.QtCore import QThread, pyqtSignal
 # Import the Submission class for type checking
 from praw.models import Submission
 
-# Import the main app's ModLogFetcher for type hinting if needed, or just use dict
-# from red_media_browser import ModLogFetcher # Avoid circular import if possible
-
 # Import caching utilities
 from utils import (
     load_submission_index, get_metadata_file_path, read_metadata_file,
@@ -28,9 +25,6 @@ from utils import (
 
 # Set up logging
 logger = logging.getLogger(__name__)
-
-# Removed global dictionaries for moderation_statuses and submission_reports
-# These will now be handled by the persistent JSON cache.
 
 def get_moderated_subreddits(reddit_instance) -> List[Dict[str, str]]:
     """
@@ -147,29 +141,26 @@ class RedditGalleryModel:
         Returns:
             bool: True if user is a moderator, False otherwise
         """
-        if self.is_user_mode:
+        if self.is_user_mode or not self.subreddit or not self.reddit:
             return False
-        if not self.subreddit or not self.reddit: # Ensure objects exist
-             return False
 
         try:
             logger.debug("Performing moderator status check")
-            # Consider caching this result per session for the subreddit
             moderators = list(self.subreddit.moderator())
             user = self.reddit.user.me()
             if not user:
-                 logger.warning("Could not get current user for mod check.")
-                 return False
+                logger.warning("Could not get current user for mod check.")
+                return False
             logger.debug(f"Current user: {user.name}")
             logger.debug(f"Moderators in subreddit: {[mod.name for mod in moderators]}")
             self.is_moderator = any(mod.name.lower() == user.name.lower() for mod in moderators)
             logger.debug(f"Moderator status for current user: {self.is_moderator}")
             return self.is_moderator
         except prawcore.exceptions.PrawcoreException as e:
-            logger.error(f"PRAW error while checking moderation status: {e}")
+            logger.exception(f"PRAW error while checking moderation status: {e}")
             return False
         except Exception as e:
-            logger.error(f"Unexpected error while checking moderation status: {e}")
+            logger.exception(f"Unexpected error while checking moderation status: {e}")
             return False
 
     def fetch_submissions(self, after=None, count=10) -> Tuple[List[Any], Optional[str]]:
@@ -411,7 +402,7 @@ class SnapshotFetcher(QThread):
 # --- Standalone Moderation/Report Functions ---
 # These need the active PRAW instance passed to them
 
-def approve_submission(submission_data, reddit_instance):
+def approve_submission(submission_data, reddit_instance) -> bool:
     """
     Approve a Reddit submission and update its cached metadata.
 
@@ -438,38 +429,31 @@ def approve_submission(submission_data, reddit_instance):
 
         metadata_path = get_metadata_file_path(submission_id)
         if metadata_path:
-            metadata = read_metadata_file(metadata_path)
-            if not metadata:
-                 logger.warning(f"Metadata file not found for {submission_id} on approve, creating.")
-                 metadata = {'id': submission_id}
+            metadata = read_metadata_file(metadata_path) or {'id': submission_id}
+            metadata['approved'] = True
+            metadata['removed'] = False
+            metadata['moderation_status'] = "approved"
+            metadata['last_checked_utc'] = time.time()
+            try:
+                praw_submission.load()
+                metadata['score'] = praw_submission.score
+                metadata['num_comments'] = praw_submission.num_comments
+            except Exception as refresh_e:
+                logger.warning(f"Could not refresh score/comments for {submission_id} after approve: {refresh_e}")
 
-            if metadata is not None:
-                metadata['approved'] = True
-                metadata['removed'] = False
-                metadata['moderation_status'] = "approved"
-                metadata['last_checked_utc'] = time.time()
-                try:
-                     praw_submission.load()
-                     metadata['score'] = praw_submission.score
-                     metadata['num_comments'] = praw_submission.num_comments
-                except Exception as refresh_e:
-                     logger.warning(f"Could not refresh score/comments for {submission_id} after approve: {refresh_e}")
-
-                if write_metadata_file(metadata_path, metadata):
-                    logger.debug(f"Updated cached metadata for {submission_id} to approved.")
-                else:
-                    logger.error(f"Failed to write updated metadata cache for approved submission {submission_id}.")
+            if write_metadata_file(metadata_path, metadata):
+                logger.debug(f"Updated cached metadata for {submission_id} to approved.")
             else:
-                 logger.warning(f"Could not read or create metadata cache for approved submission {submission_id}.")
+                logger.error(f"Failed to write updated metadata cache for approved submission {submission_id}.")
         else:
-             logger.warning(f"Could not determine metadata cache path for approved submission {submission_id}.")
+            logger.warning(f"Could not determine metadata cache path for approved submission {submission_id}.")
 
         return True
     except Exception as e:
         logger.exception(f"Error approving submission {submission_id}: {e}")
         return False
 
-def remove_submission(submission_data, reddit_instance):
+def remove_submission(submission_data, reddit_instance) -> bool:
     """
     Remove a Reddit submission and update its cached metadata.
 
@@ -490,7 +474,6 @@ def remove_submission(submission_data, reddit_instance):
 
     moderation_status_update = "removed"
     update_cache = False
-    praw_submission = None
 
     try:
         base_id = submission_id.split('_')[-1]
@@ -517,36 +500,21 @@ def remove_submission(submission_data, reddit_instance):
     if update_cache:
         metadata_path = get_metadata_file_path(submission_id)
         if metadata_path:
-            metadata = read_metadata_file(metadata_path)
-            if not metadata:
-                 logger.warning(f"Metadata file not found for {submission_id} on remove, creating.")
-                 metadata = {'id': submission_id}
-
-            if metadata is not None:
-                metadata['approved'] = False
-                metadata['removed'] = (moderation_status_update == "removed")
-                metadata['moderation_status'] = moderation_status_update
-                metadata['last_checked_utc'] = time.time()
-                try:
-                     if praw_submission:
-                          praw_submission.load()
-                          metadata['score'] = praw_submission.score
-                          metadata['num_comments'] = praw_submission.num_comments
-                except Exception as refresh_e:
-                     logger.warning(f"Could not refresh score/comments for {submission_id} after remove: {refresh_e}")
-
-                if write_metadata_file(metadata_path, metadata):
-                    logger.debug(f"Updated cached metadata for {submission_id} to {moderation_status_update}.")
-                else:
-                    logger.error(f"Failed to write updated metadata cache for removed submission {submission_id}.")
+            metadata = read_metadata_file(metadata_path) or {'id': submission_id}
+            metadata['approved'] = False
+            metadata['removed'] = (moderation_status_update == "removed")
+            metadata['moderation_status'] = moderation_status_update
+            metadata['last_checked_utc'] = time.time()
+            if write_metadata_file(metadata_path, metadata):
+                logger.debug(f"Updated cached metadata for {submission_id} to {moderation_status_update}.")
             else:
-                 logger.warning(f"Could not read or create metadata cache for removed submission {submission_id}.")
+                logger.error(f"Failed to write updated metadata cache for removed submission {submission_id}.")
         else:
-             logger.warning(f"Could not determine metadata cache path for removed submission {submission_id}.")
+            logger.warning(f"Could not determine metadata cache path for removed submission {submission_id}.")
 
     return moderation_status_update in ["removed", "removal_pending"]
 
-def get_submission_reports(submission_data, reddit_instance):
+def get_submission_reports(submission_data, reddit_instance) -> tuple[int, list]:
     """
     Get reports for a submission, checking cache first.
 
@@ -573,8 +541,8 @@ def get_submission_reports(submission_data, reddit_instance):
 
     logger.debug(f"No valid cache for reports of {submission_id}. Fetching from API.")
     if not reddit_instance:
-         logger.error(f"Cannot fetch reports for {submission_id}: Missing PRAW instance.")
-         return (0, [])
+        logger.error(f"Cannot fetch reports for {submission_id}: Missing PRAW instance.")
+        return (0, [])
 
     try:
         base_id = submission_id.split('_')[-1]
@@ -610,22 +578,16 @@ def get_submission_reports(submission_data, reddit_instance):
         result = (total_reports, formatted_reports)
 
         if metadata_path:
-             metadata = read_metadata_file(metadata_path)
-             if not metadata:
-                  metadata = {'id': submission_id}
-
-             if metadata is not None:
-                 metadata['report_count'] = total_reports
-                 metadata['report_reasons'] = formatted_reports
-                 metadata['last_checked_utc'] = time.time()
-                 if write_metadata_file(metadata_path, metadata):
-                      logger.debug(f"Cached fetched reports for {submission_id}.")
-                 else:
-                      logger.error(f"Failed to cache fetched reports for {submission_id}.")
-             else:
-                  logger.error(f"Failed to read/create metadata to cache reports for {submission_id}.")
+            metadata = read_metadata_file(metadata_path) or {'id': submission_id}
+            metadata['report_count'] = total_reports
+            metadata['report_reasons'] = formatted_reports
+            metadata['last_checked_utc'] = time.time()
+            if write_metadata_file(metadata_path, metadata):
+                logger.debug(f"Cached fetched reports for {submission_id}.")
+            else:
+                logger.error(f"Failed to cache fetched reports for {submission_id}.")
         else:
-             logger.error(f"Could not determine metadata path to cache reports for {submission_id}.")
+            logger.error(f"Could not determine metadata path to cache reports for {submission_id}.")
 
         if total_reports > 0:
             logger.debug(f"Submission {submission_id} has {total_reports} reports")
@@ -635,7 +597,7 @@ def get_submission_reports(submission_data, reddit_instance):
         logger.exception(f"Error getting reports for submission {submission_id}: {e}")
         return (0, [])
 
-def ban_user(subreddit, username, reason, message=None):
+def ban_user(subreddit, username: str, reason: str, message: Optional[str] = None) -> bool:
     """
     Ban a user from a subreddit.
 

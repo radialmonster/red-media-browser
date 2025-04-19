@@ -41,12 +41,13 @@ if not logger.hasHandlers():
 
 def create_config_file(config_path):
     """
-    Creates a new configuration file (config.json) with user-provided values.
-    Prompts the user to input their Reddit API credentials and saves them.
+    Create a new configuration file (config.json) with user-provided Reddit API credentials.
+
+    Prompts the user for required values and saves them to the specified path.
     """
     print("config.json not found. Let's create one with your Reddit API credentials.")
     print("Please visit 'https://www.reddit.com/prefs/apps' to create an application if you haven't already.")
-    
+
     client_id = input("Enter Reddit client_id: ").strip()
     client_secret = input("Enter Reddit client_secret: ").strip()
     redirect_uri = input("Enter redirect URI [default: http://localhost:8080]: ").strip() or "http://localhost:8080"
@@ -74,13 +75,16 @@ def create_config_file(config_path):
             print("Then copy the authorization code from your browser back here when prompted.")
             print("If you encounter any issues, please consult Reddit's OAuth2 documentation.")
     except Exception as e:
-        logger.exception("Failed to create config.json: " + str(e))
+        logger.exception("Failed to create config.json", exc_info=e)
         sys.exit(1)
 
 def load_config(config_path):
     """
-    Loads the configuration from config.json.
+    Load the configuration from config.json.
     If the file does not exist, it is created interactively.
+
+    Returns:
+        dict: The loaded configuration dictionary.
     """
     if not os.path.exists(config_path):
         create_config_file(config_path)
@@ -89,7 +93,7 @@ def load_config(config_path):
             config = json.load(config_file)
         return config
     except Exception as e:
-        logger.exception("Error reading configuration file: " + str(e))
+        logger.exception("Error reading configuration file", exc_info=e)
         sys.exit(1)
 
 def get_new_refresh_token(reddit, requested_scopes):
@@ -127,7 +131,7 @@ def get_new_refresh_token(reddit, requested_scopes):
 
 def update_config_with_new_token(config, config_path, new_token):
     """
-    Updates the existing configuration file with the new refresh token.
+    Update the existing configuration file with a new refresh token.
 
     Parameters:
         config (dict): The current configuration dictionary.
@@ -140,7 +144,7 @@ def update_config_with_new_token(config, config_path, new_token):
             json.dump(config, config_file, indent=4)
         logger.info("Updated config.json with new refresh token.")
     except Exception as e:
-        logger.exception("Failed to update config.json: " + str(e))
+        logger.exception("Failed to update config.json", exc_info=e)
 
 if __name__ == "__main__":
     # For quick testing of the configuration manager

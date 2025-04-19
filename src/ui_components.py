@@ -34,22 +34,22 @@ logger = logging.getLogger(__name__)
 
 class ClickableLabel(QLabel):
     """
-    A QLabel that emits a clicked signal when clicked.
-    Used for labels that should act as buttons.
+    QLabel subclass that emits a clicked signal when clicked.
+    Useful for clickable labels acting as buttons.
     """
     clicked = pyqtSignal()
 
     def mousePressEvent(self, event):
-        super().mousePressEvent(event)
         self.clicked.emit()
+        super().mousePressEvent(event)
 
 class FullScreenViewer(QDialog):
     """
     Dialog for displaying media full-screen.
-    Supports both static images and animated content (videos/GIFs).
+    Supports static images, animated content (videos/GIFs).
     """
     closed = pyqtSignal()
-    
+
     def __init__(self, pixmap=None, movie=None, video_path=None, parent=None):
         super().__init__(parent)
         self.pixmap = pixmap
@@ -57,21 +57,21 @@ class FullScreenViewer(QDialog):
         self.video_path = video_path
         self.vlc_instance = None
         self.vlc_player = None
-        
+
         # Set window properties
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setStyleSheet("background-color: black;")
         self.setWindowTitle("Full Screen View")
-        
-        # Create main layout
+
+        # Main layout
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Create content display area
+
+        # Content display area
         self.content_label = QLabel(self)
         self.content_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.content_label)
-        
+
         # Set up the appropriate media
         if self.video_path:
             self.setup_video_player()
@@ -83,7 +83,7 @@ class FullScreenViewer(QDialog):
                 # Use a timer to manually restart the movie when it finishes
                 self.movie_timer = QTimer(self)
                 self.movie_timer.timeout.connect(self.check_movie_restart)
-                self.movie_timer.start(100)  # Check every 100ms
+                self.movie_timer.start(100)
         elif self.pixmap:
             scaled_pixmap = self.pixmap.scaled(
                 self.screen().size(),
@@ -91,82 +91,74 @@ class FullScreenViewer(QDialog):
                 Qt.TransformationMode.SmoothTransformation
             )
             self.content_label.setPixmap(scaled_pixmap)
-    
+
     def setup_video_player(self):
         """Set up the VLC video player for fullscreen playback."""
         if not self.video_path:
             return
-            
+
         abs_video_path = os.path.abspath(self.video_path)
         logger.debug(f"Setting up fullscreen video player for: {abs_video_path}")
-        
-        # Create a VLC instance with enhanced looping arguments (matching the successful test)
+
         instance_args = ['--loop', '--no-video-title-show', '--repeat']
         self.vlc_instance = vlc.Instance(*instance_args)
         self.vlc_player = self.vlc_instance.media_player_new()
-        
-        # Get the ID of our widget to tell VLC where to render
+
+        # Set VLC output window
         if sys.platform.startswith('win'):
             self.vlc_player.set_hwnd(int(self.winId()))
         elif sys.platform.startswith('linux'):
             self.vlc_player.set_xwindow(int(self.winId()))
         elif sys.platform.startswith('darwin'):
             self.vlc_player.set_nsobject(int(self.winId()))
-            
-        # Create media with proper path handling
+
         media = self.vlc_instance.media_new_path(abs_video_path)
-        
-        # Add multiple looping options for redundancy (same as in testredgifs.py)
-        media.add_option('input-repeat=-1')  # Loop indefinitely
+        media.add_option('input-repeat=-1')
         media.add_option(':repeat')
         media.add_option(':loop')
-        media.add_option(':file-caching=3000')  # Increase caching
-        
-        # Set the media and play
+        media.add_option(':file-caching=3000')
+
         self.vlc_player.set_media(media)
         self.vlc_player.play()
         self.vlc_player.audio_set_mute(True)
-        
-        # Add a timer to check playback status and restart if needed
+
         self.playback_check_timer = QTimer(self)
         self.playback_check_timer.timeout.connect(self.check_fullscreen_playback)
-        self.playback_check_timer.start(1000)  # Check every second
+        self.playback_check_timer.start(1000)
 
     def check_fullscreen_playback(self):
-        """Check if fullscreen video playback has ended or errored and restart if needed."""
+        """Restart video if playback ended or errored."""
         if not self.vlc_player:
             return
-            
+
         state = self.vlc_player.get_state()
-        
-        # If video ended or errored, restart it
-        if state == vlc.State.Ended or state == vlc.State.Stopped or state == vlc.State.Error:
+        if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
             logger.debug(f"Fullscreen video state: {state}, restarting playback")
             self.vlc_player.stop()
             self.vlc_player.play()
 
     def check_movie_restart(self):
-        """Check if the animated GIF has finished and restart it if necessary."""
+        """Restart animated GIF if finished."""
         if self.movie and self.movie.state() == QMovie.MovieState.NotRunning:
             self.movie.start()
-    
+
     def keyPressEvent(self, event):
-        """Handle key press events - close on Escape."""
+        """Close on Escape key."""
         if event.key() == Qt.Key.Key_Escape:
             self.close()
         else:
             super().keyPressEvent(event)
-    
+
     def mousePressEvent(self, event):
-        """Handle mouse press events - close on any mouse click."""
+        """Close on any mouse click."""
         self.close()
         super().mousePressEvent(event)
-    
+
     def closeEvent(self, event):
-        """Handle cleanup when the dialog is closed."""
+        """Cleanup when the dialog is closed."""
         if hasattr(self, 'playback_check_timer') and self.playback_check_timer:
             self.playback_check_timer.stop()
-        
+
         if self.vlc_player:
             self.vlc_player.stop()
             self.vlc_player.release()
@@ -183,36 +175,30 @@ class BanUserDialog(QDialog):
     def __init__(self, username, subreddit, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ban User")
-        self.result_type = None  # Will be "share" or "private"
+        self.result_type = None  # "share" or "private"
         self.reason = ""
-        
-        # Main layout
+
         layout = QVBoxLayout(self)
-        
-        # Instruction label
         label = QLabel(f"Enter the reason for banning {username} from r/{subreddit}:", self)
         layout.addWidget(label)
-        
-        # Ban reason input
+
         self.reason_input = QLineEdit(self)
         layout.addWidget(self.reason_input)
-        
-        # Buttons layout
+
         button_layout = QHBoxLayout()
         self.share_button = QPushButton("Ban and Share Reason with User", self)
         self.private_button = QPushButton("Ban and Set Private Reason", self)
         self.cancel_button = QPushButton("Cancel", self)
-        
+
         button_layout.addWidget(self.share_button)
         button_layout.addWidget(self.private_button)
         button_layout.addWidget(self.cancel_button)
         layout.addLayout(button_layout)
-        
-        # Connections
+
         self.share_button.clicked.connect(self.share_clicked)
         self.private_button.clicked.connect(self.private_clicked)
         self.cancel_button.clicked.connect(self.reject)
-        
+
     def share_clicked(self):
         text = self.reason_input.text().strip()
         if not text:
@@ -221,7 +207,7 @@ class BanUserDialog(QDialog):
         self.reason = text
         self.result_type = "share"
         self.accept()
-    
+
     def private_clicked(self):
         text = self.reason_input.text().strip()
         if not text:
@@ -239,22 +225,17 @@ class ReportsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Post Reports")
         self.setMinimumSize(400, 300)
-        
-        # Create layout
+
         layout = QVBoxLayout(self)
-        
-        # Create text browser for displaying reports with scrolling
         self.reports_browser = QTextBrowser()
         self.reports_browser.setOpenExternalLinks(False)
         self.reports_browser.setReadOnly(True)
-        
+
         try:
-            # Format and set the report reasons with proper error handling
             if report_reasons and isinstance(report_reasons, list):
                 html_content = "<h3>Report Reasons:</h3><ul>"
                 for reason in report_reasons:
                     try:
-                        # Check if reason is a valid string
                         if isinstance(reason, str):
                             html_content += f"<li>{html.escape(reason)}</li>"
                         else:
@@ -269,10 +250,8 @@ class ReportsDialog(QDialog):
         except Exception as e:
             logger.error(f"Error creating reports dialog content: {e}")
             self.reports_browser.setHtml(f"<p>Error displaying reports: {html.escape(str(e))}</p>")
-        
+
         layout.addWidget(self.reports_browser)
-        
-        # Add close button
         self.close_button = QPushButton("Close")
         self.close_button.clicked.connect(self.accept)
         layout.addWidget(self.close_button)
@@ -292,11 +271,25 @@ class ThumbnailWidget(QWidget):
     mediaReady = pyqtSignal()
 
     def __init__(self, images, title, source_url, submission,
-                 subreddit_name, has_multiple_images, post_url, is_moderator, reddit_instance): # Added reddit_instance
+                 subreddit_name, has_multiple_images, post_url, is_moderator, reddit_instance):
+        """
+        Initialize ThumbnailWidget for a Reddit post.
+
+        Args:
+            images: List of image/video URLs.
+            title: Post title.
+            source_url: Source URL for the post.
+            submission: PRAW submission or cached object.
+            subreddit_name: Name of the subreddit.
+            has_multiple_images: True if post is a gallery.
+            post_url: Reddit post URL.
+            is_moderator: True if user is a moderator.
+            reddit_instance: Reddit API instance.
+        """
         super().__init__()
 
-        # Store submission data
-        self.reddit_instance = reddit_instance # Store the reddit instance
+        # Submission data
+        self.reddit_instance = reddit_instance
         self.praw_submission = submission
         self.submission_id = submission.id
         self.images = images
@@ -307,7 +300,7 @@ class ThumbnailWidget(QWidget):
         self.subreddit_name = subreddit_name
         self.has_multiple_images = has_multiple_images
         self.is_moderator = is_moderator
-        
+
         # Media display state
         self.pixmap = None
         self.movie = None
@@ -316,81 +309,100 @@ class ThumbnailWidget(QWidget):
         self.is_media_loaded = False
         self.is_fullscreen_open = False
         self.fullscreen_viewer = None
-        self.original_title = title # Store original title
+        self.original_title = title
 
         # Reports data
         self.reports_count = 0
         self.report_reasons = []
-        
-        # Set size policy to ensure equal cell sizes in grid
+
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        
-        # Set up the UI
         self.init_ui()
-        
-        # Start loading the first image
-        if self.images:
+
+        # Check if post is removed/deleted (no images and specific flags)
+        is_removed_or_deleted = False
+        if not self.images:
+            removed_by_cat = getattr(self.praw_submission, 'removed_by_category', None)
+            banned_by = getattr(self.praw_submission, 'banned_by', None)
+            author_name = getattr(self.praw_submission, 'author', None)
+            is_author_deleted = author_name == "[deleted]" or author_name is None
+
+            if removed_by_cat or banned_by or is_author_deleted:
+                is_removed_or_deleted = True
+                status_text = "Post Removed/Deleted"
+                if removed_by_cat:
+                    status_text = f"Post Removed ({removed_by_cat})"
+                elif banned_by:
+                    status_text = f"Post Removed (by {banned_by})"
+                elif is_author_deleted:
+                    status_text = "Post Deleted (Author)"
+
+                logger.debug(f"Submission {self.submission_id} appears removed/deleted. Displaying status.")
+                self.imageLabel.setText(status_text)
+                self.imageLabel.setStyleSheet("background-color: #444; color: #ccc; font-style: italic;")
+                self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.loadingBar.hide()
+                self.is_media_loaded = True
+
+        # Load first image if available and not removed/deleted
+        if self.images and not is_removed_or_deleted:
             self.load_image_async(self.images[self.current_index])
-        
-        # Fetch reports if we're a moderator
-        if self.is_moderator:
+        elif not self.images and not is_removed_or_deleted:
+            logger.warning(f"Submission {self.submission_id} has no images and is not marked as removed/deleted.")
+            self.imageLabel.setText("No Image Available")
+            self.imageLabel.setStyleSheet("background-color: #333; color: #aaa;")
+            self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.loadingBar.hide()
+            self.is_media_loaded = True
+
+        # Fetch reports if moderator and not removed/deleted
+        if self.is_moderator and not is_removed_or_deleted:
             self.fetch_reports()
-    
+
     def init_ui(self):
         """Initialize the UI layout and components."""
         self.layout = QVBoxLayout(self)
         self.layout.setSpacing(5)
-        
-        # Title section - with fixed height for consistency
+
+        # Title section
         self.titleLabel = ClickableLabel()
         self.titleLabel.setText(self.title)
         self.titleLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.titleLabel.setFixedHeight(40)  # Use fixed height instead of min/max
+        self.titleLabel.setFixedHeight(40)
         self.titleLabel.setWordWrap(True)
         self.titleLabel.setStyleSheet("font-weight: bold;")
         self.titleLabel.clicked.connect(self.open_post_url)
-        
-        # Title container with fixed height
+
         title_container = QWidget()
         title_container.setFixedHeight(40)
         title_layout = QVBoxLayout(title_container)
         title_layout.setContentsMargins(0, 0, 0, 0)
         title_layout.addWidget(self.titleLabel)
-        
         self.layout.addWidget(title_container)
 
-        # Subreddit label section (Defined early so it can be added to infoLayout)
+        # Subreddit label
         self.subredditLabel = QLabel(f"r/{self.subreddit_name}")
-        self.subredditLabel.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter) # Center align vertically too
-        self.subredditLabel.setStyleSheet("font-size: 9pt; color: grey;") # Example styling
+        self.subredditLabel.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        self.subredditLabel.setStyleSheet("font-size: 9pt; color: grey;")
         self.subredditLabel.setFixedHeight(20)
-        # self.layout.addWidget(self.subredditLabel) # Removed: Now added to infoLayout below
 
         # Author, Subreddit, and URL info section
         self.infoLayout = QHBoxLayout()
 
-        username = "unknown" # Default
+        username = "unknown"
         try:
             author_data = self.praw_submission.author
             if author_data:
-                # Check if it's a PRAW Redditor object (live data)
                 if hasattr(author_data, 'name'):
                     username = author_data.name
-                # Check if it's a string (cached data)
                 elif isinstance(author_data, str):
                     username = author_data
-                # Add any other potential types if necessary, otherwise stays "unknown"
         except AttributeError:
-            # Catch potential AttributeError if author_data itself doesn't exist on praw_submission
-            # (Shouldn't happen with current caching, but good practice)
             logger.warning(f"Submission {self.submission_id} missing 'author' attribute entirely.")
             username = "unknown"
         except Exception as e:
-            # Catch any other unexpected errors
             logger.error(f"Error accessing author for {self.submission_id}: {e}")
             username = "unknown"
 
-        # Ensure username is not None before setting text
         if username is None:
             username = "unknown"
 
@@ -398,12 +410,11 @@ class ThumbnailWidget(QWidget):
         self.authorLabel.setText(username)
         self.authorLabel.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.authorLabel.setFixedHeight(20)
-        # Use a lambda to capture the *current* value of username when connecting the signal
         self.authorLabel.clicked.connect(lambda u=username: self.authorClicked.emit(u) if u != "unknown" else None)
-        self.infoLayout.addWidget(self.authorLabel) # Add author
-        self.infoLayout.addSpacing(10) # Add space
-        self.infoLayout.addWidget(self.subredditLabel) # Add subreddit (defined above)
-        self.infoLayout.addSpacing(10) # Add space
+        self.infoLayout.addWidget(self.authorLabel)
+        self.infoLayout.addSpacing(10)
+        self.infoLayout.addWidget(self.subredditLabel)
+        self.infoLayout.addSpacing(10)
 
         self.postUrlLabel = QLabel(self.source_url)
         self.postUrlLabel.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -411,27 +422,26 @@ class ThumbnailWidget(QWidget):
         self.infoLayout.addWidget(self.postUrlLabel)
         self.layout.addLayout(self.infoLayout)
 
-        # Image/video display section - give it more space in the layout
+        # Image/video display section
         self.imageLabel = ClickableLabel()
         self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.imageLabel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.imageLabel.setStyleSheet("background-color: #1a1a1a;")
-        # No auto-scaling - we'll handle it manually
         self.imageLabel.setScaledContents(False)
         self.imageLabel.clicked.connect(self.open_fullscreen_view)
-        self.layout.addWidget(self.imageLabel, 1)  # Add stretch factor to give more space
-        
+        self.layout.addWidget(self.imageLabel, 1)
+
         # Loading indicator
         self.loadingBar = QProgressBar(self)
         self.loadingBar.setTextVisible(False)
         self.loadingBar.setMaximum(100)
         self.layout.addWidget(self.loadingBar)
         self.loadingBar.hide()
-        
+
         # Navigation buttons for galleries
         if self.has_multiple_images:
             self.init_arrow_buttons()
-        
+
         # Moderation buttons for moderators
         if self.is_moderator:
             self.create_moderation_buttons()

@@ -10,15 +10,13 @@ import os
 import re
 import logging
 import html
-from urllib.parse import urlparse, unquote, quote, parse_qs, urljoin
 import shutil
-import requests
 import json
 import time
 import threading
-import html # Ensure html is imported for unescaping
-from urllib.parse import urlparse # Import urlparse for URL checking
-from praw.models import Redditor, Subreddit # For type checking in filtering
+
+from urllib.parse import urlparse, unquote, quote, parse_qs, urljoin
+from praw.models import Redditor, Subreddit
 
 # Basic Logging Configuration
 logger = logging.getLogger(__name__)
@@ -27,6 +25,7 @@ logger = logging.getLogger(__name__)
 _submission_index = None
 _index_lock = threading.Lock()
 _index_path = None
+_metadata_lock = threading.Lock()
 
 def ensure_directory(directory):
     """Ensure that the specified directory exists."""
@@ -85,11 +84,11 @@ def extract_image_urls(submission):
     submission_id_str = getattr(submission, 'id', 'N/A')
     logger.debug(f"Extracting image URLs for submission ID: {submission_id_str}")
 
-    # --- Check for Crosspost First ---
+    # Check for crosspost first
     crosspost_parent_list = getattr(submission, 'crosspost_parent_list', None)
     if crosspost_parent_list and isinstance(crosspost_parent_list, list) and len(crosspost_parent_list) > 0:
-        parent_data = crosspost_parent_list[0] # This is expected to be a dictionary
-        logger.debug(f"Processing {submission_id_str} as crosspost.") # Log keys: {list(parent_data.keys())}") # Keys can be verbose
+        parent_data = crosspost_parent_list[0]  # Expected to be a dictionary
+        logger.debug(f"Processing {submission_id_str} as crosspost.")
 
         # Check parent for gallery
         parent_is_gallery = parent_data.get('is_gallery', False)
@@ -97,81 +96,77 @@ def extract_image_urls(submission):
 
         if parent_is_gallery and parent_media_metadata and isinstance(parent_media_metadata, dict):
             try:
-                urls = [html.unescape(media['s']['u'])
-                        for media in parent_media_metadata.values()
-                        if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']]
+                urls = [
+                    html.unescape(media['s']['u'])
+                    for media in parent_media_metadata.values()
+                    if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']
+                ]
                 if urls:
                     logger.debug(f"Extracted {len(urls)} gallery URLs from crosspost parent {submission_id_str}.")
                     return urls
-                else:
-                     logger.warning(f"Crosspost parent gallery detected but no valid URLs found in media_metadata for {submission_id_str}")
+                logger.warning(
+                    f"Crosspost parent gallery detected but no valid URLs found in media_metadata for {submission_id_str}"
+                )
             except Exception as e:
-                 logger.error(f"Error processing crosspost parent gallery metadata for {submission_id_str}: {e}")
+                logger.error(f"Error processing crosspost parent gallery metadata for {submission_id_str}: {e}")
 
         # Check parent for direct URL (if not a gallery or gallery extraction failed)
         parent_url = parent_data.get('url', None)
         if parent_url:
-            # Basic check if the URL itself looks like an image
-            parsed_url = urlparse(parent_url)
             if any(parent_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
-                 logger.debug(f"Using direct image URL from crosspost parent {submission_id_str}: {parent_url}")
-                 return [parent_url]
-            # Consider adding domain checks for imgur, etc. if needed later
-            logger.debug(f"Crosspost parent URL found for {submission_id_str}, but not a direct image link: {parent_url}. Falling back.")
+                logger.debug(f"Using direct image URL from crosspost parent {submission_id_str}: {parent_url}")
+                return [parent_url]
+            logger.debug(
+                f"Crosspost parent URL found for {submission_id_str}, but not a direct image link: {parent_url}. Falling back."
+            )
         else:
-             logger.debug(f"No gallery or direct URL found in crosspost parent for {submission_id_str}")
+            logger.debug(f"No gallery or direct URL found in crosspost parent for {submission_id_str}")
 
-    # --- If Not Crosspost (or crosspost processing failed/didn't find media) ---
+    # If not crosspost (or crosspost processing failed/didn't find media)
     logger.debug(f"Processing {submission_id_str} as regular post (or fallback from crosspost)")
 
-    # Check main submission for gallery (using getattr for safety)
+    # Check main submission for gallery
     is_gallery = getattr(submission, 'is_gallery', False)
     media_metadata = getattr(submission, 'media_metadata', None)
 
     if is_gallery and media_metadata:
         try:
-            # Ensure media_metadata is dict-like
             if not isinstance(media_metadata, dict):
-                 logger.warning(f"media_metadata is not a dict for {submission_id_str}, type: {type(media_metadata)}")
-                 # Attempt to fallback to URL if possible
-                 url = getattr(submission, 'url', None)
-                 if url:
-                      logger.debug(f"Falling back to direct URL for non-dict media_metadata: {url}")
-                      return [url]
-                 else:
-                      logger.error(f"Cannot extract gallery URLs (media_metadata not dict) and no fallback URL for {submission_id_str}")
-                      return []
+                logger.warning(f"media_metadata is not a dict for {submission_id_str}, type: {type(media_metadata)}")
+                url = getattr(submission, 'url', None)
+                if url:
+                    logger.debug(f"Falling back to direct URL for non-dict media_metadata: {url}")
+                    return [url]
+                logger.error(
+                    f"Cannot extract gallery URLs (media_metadata not dict) and no fallback URL for {submission_id_str}"
+                )
+                return []
 
-            urls = [html.unescape(media['s']['u'])
-                    for media in media_metadata.values()
-                    if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']]
+            urls = [
+                html.unescape(media['s']['u'])
+                for media in media_metadata.values()
+                if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']
+            ]
             if urls:
                 logger.debug(f"Extracted {len(urls)} gallery URLs from main submission {submission_id_str}.")
                 return urls
-            else:
-                 logger.warning(f"Main submission gallery detected but no valid URLs found in media_metadata for {submission_id_str}")
-                 # Fall through to check direct URL as fallback
+            logger.warning(
+                f"Main submission gallery detected but no valid URLs found in media_metadata for {submission_id_str}"
+            )
         except Exception as e:
-             logger.error(f"Error processing main submission gallery metadata for {submission_id_str}: {e}")
-             # Fall through to check direct URL as fallback
+            logger.error(f"Error processing main submission gallery metadata for {submission_id_str}: {e}")
 
     # Fallback to direct URL on main submission
     url = getattr(submission, 'url', None)
     if url:
-        # Basic check if the URL itself looks like an image before returning
-        parsed_url = urlparse(url)
         if any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
             logger.debug(f"Using direct image URL from main submission {submission_id_str}: {url}")
             return [url]
-        else:
-            # If the direct URL isn't an image, maybe it's a video or something else?
-            # The ThumbnailWidget might handle this, but extract_image_urls should ideally return image URLs.
-            # For now, let's return it, but log a warning.
-            logger.warning(f"Direct URL from main submission {submission_id_str} is not an image link: {url}. Returning anyway.")
-            return [url]
+        logger.warning(
+            f"Direct URL from main submission {submission_id_str} is not an image link: {url}. Returning anyway."
+        )
+        return [url]
 
-
-    # If absolutely no URL found
     logger.error(f"Could not extract any image URL for submission {submission_id_str}")
     return []
 
@@ -257,48 +252,46 @@ def file_exists_in_cache(url):
     return os.path.exists(cache_path) if cache_path else False
 
 def get_cache_path_for_url(url):
-    """Get the cache file path for a URL."""
+    """
+    Get the cache file path for a URL.
+    Handles special cases for RedGifs and ensures a safe, unique filename.
+    """
     try:
         parsed_url = urlparse(url)
         domain = parsed_url.netloc
         if not domain:
             return None
-            
+
         domain_dir = get_domain_cache_dir(domain)
         path = unquote(parsed_url.path)
         filename = os.path.basename(path)
-        
-        # Special handling for RedGifs domains
-        if "redgifs.com" in domain: # Changed from elif to if
-            original_ext = os.path.splitext(filename)[1].lower()
-            # If it already has a valid media extension, keep it.
-            if original_ext in ['.jpg', '.jpeg', '.png', 'gif', '.webp', '.mp4', '.webm']:
-                pass # Keep filename as is
-            # Handle watch/ifr URLs -> should become .mp4
-            elif "/watch/" in url or "/ifr/" in url:
-                 match = re.search(r'(?:watch|ifr)/([A-Za-z0-9]+)', url) # Allow numeric IDs too
-                 if match:
-                     redgifs_id = match.group(1)
-                     filename = f"{redgifs_id}.mp4" # Force .mp4 for watch/ifr pages
-                 else: # Fallback hash if ID extraction fails
-                     import hashlib
-                     url_hash = hashlib.md5(url.encode()).hexdigest()
-                     filename = f"redgif_watch_hash_{url_hash}.mp4"
-            # Handle URLs like i.redgifs.com/i/xyz (no extension) -> use hash, no assumed extension
-            elif not original_ext and "i.redgifs.com" in domain:
-                 import hashlib
-                 url_hash = hashlib.md5(url.encode()).hexdigest()
-                 logger.warning(f"RedGifs URL has no extension, using hash: {url}")
-                 filename = f"redgif_noext_hash_{url_hash}" # Don't assume extension
-            # Fallback for other unexpected RedGifs URLs - use hash, don't assume extension
-            else:
-                 import hashlib
-                 url_hash = hashlib.md5(url.encode()).hexdigest()
-                 logger.warning(f"Unhandled RedGifs URL format for cache path, using hash: {url}")
-                 # Preserve original extension if it exists, otherwise no extension
-                 filename = f"redgif_fallback_hash_{url_hash}{original_ext}"
 
-        # Handle URLs without a filename (e.g., root path '/') AFTER domain-specific logic
+        # Special handling for RedGifs domains
+        if "redgifs.com" in domain:
+            original_ext = os.path.splitext(filename)[1].lower()
+            if original_ext in ['.jpg', '.jpeg', '.png', 'gif', '.webp', '.mp4', '.webm']:
+                pass  # Keep filename as is
+            elif "/watch/" in url or "/ifr/" in url:
+                match = re.search(r'(?:watch|ifr)/([A-Za-z0-9]+)', url)
+                if match:
+                    redgifs_id = match.group(1)
+                    filename = f"{redgifs_id}.mp4"
+                else:
+                    import hashlib
+                    url_hash = hashlib.md5(url.encode()).hexdigest()
+                    filename = f"redgif_watch_hash_{url_hash}.mp4"
+            elif not original_ext and "i.redgifs.com" in domain:
+                import hashlib
+                url_hash = hashlib.md5(url.encode()).hexdigest()
+                logger.warning(f"RedGifs URL has no extension, using hash: {url}")
+                filename = f"redgif_noext_hash_{url_hash}"
+            else:
+                import hashlib
+                url_hash = hashlib.md5(url.encode()).hexdigest()
+                logger.warning(f"Unhandled RedGifs URL format for cache path, using hash: {url}")
+                filename = f"redgif_fallback_hash_{url_hash}{original_ext}"
+
+        # Handle URLs without a filename (e.g., root path '/')
         if not filename or filename == '/':
             extension = ""
             if url.endswith('.mp4'):
@@ -312,10 +305,9 @@ def get_cache_path_for_url(url):
             elif url.endswith('.webm'):
                 extension = ".webm"
             elif "redgifs.com" in domain:
-                extension = ".mp4"  # Default to .mp4 for RedGifs
-                
+                extension = ".mp4"
             filename = f"downloaded_media{extension}"
-        
+
         filename = clean_filename(filename)
         return os.path.join(domain_dir, filename)
     except Exception as e:
@@ -445,89 +437,72 @@ def write_metadata_file(metadata_path, metadata):
     try:
         # Ensure directory exists (should be handled by get_metadata_file_path, but double check)
         os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
-        
         temp_path = metadata_path + ".tmp"
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2) # Use indent for readability
-        os.replace(temp_path, metadata_path)
-        return True
-    except Exception as e:
-        logger.exception(f"Error writing metadata file {metadata_path}: {e}")
-        # Clean up temp file if it exists
-        if os.path.exists(temp_path):
+        with _metadata_lock:
             try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, indent=2)  # Use indent for readability
+                os.replace(temp_path, metadata_path)
+                return True
+            except Exception as e:
+                logger.exception(f"Error writing metadata file {metadata_path}: {e}")
+                # Clean up temp file if it exists and writing failed
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                return False
+    except Exception as e:
+        logger.exception(f"Error preparing to write metadata file {metadata_path}: {e}")
         return False
 
 def _filter_submission_data(submission):
     """
-    Filters a PRAW Submission object's attributes for caching.
-    Removes internal PRAW objects, comments, and simplifies complex objects.
+    Filter a PRAW Submission object's attributes for caching.
+
+    Removes internal PRAW objects, comments, and simplifies complex objects
+    (e.g., author and subreddit are stored as their names).
+    Only JSON-serializable types are included.
     """
     if not submission:
         return {}
 
-    # Attributes to explicitly exclude
     exclude_keys = {
         'comments', '_reddit', '_mod', '_fetched', '_info_params',
-        'comment_limit', 'comment_sort', # Related to comments
-        # Potentially others depending on PRAW version and usage
+        'comment_limit', 'comment_sort',
     }
 
-    # Attributes to simplify (store identifier instead of object)
     simplify_keys = {
         'author': lambda obj: getattr(obj, 'name', None) if isinstance(obj, Redditor) else str(obj),
         'subreddit': lambda obj: getattr(obj, 'display_name', None) if isinstance(obj, Subreddit) else str(obj),
-        # Add others if needed, e.g., 'approved_by', 'banned_by'
     }
 
     data = {}
-    # Use vars() or __dict__ cautiously, prefer iterating known attributes if possible
-    # PRAW objects might not have a clean __dict__
-    # Let's try iterating dir() and getattr, filtering as we go
     for attr in dir(submission):
         if attr.startswith('_') or attr in exclude_keys:
-            continue # Skip private/internal and excluded keys
+            continue
 
         try:
             value = getattr(submission, attr)
-
-            # Skip methods
             if callable(value):
                 continue
-
-            # Simplify complex objects
             if attr in simplify_keys:
                 data[attr] = simplify_keys[attr](value)
-            # Basic types that are safe for JSON
             elif isinstance(value, (str, int, float, bool, list, dict, type(None))):
-                 # Basic check for list/dict contents (optional, can be slow)
-                 # if isinstance(value, (list, dict)):
-                 #     try:
-                 #         json.dumps(value) # Quick check if serializable
-                 #     except TypeError:
-                 #         logger.warning(f"Skipping non-serializable attribute '{attr}' in submission {submission.id}")
-                 #         continue
-                 data[attr] = value
-            # Log other types we might be missing
-            # else:
-            #     logger.debug(f"Skipping attribute '{attr}' of type {type(value)} for submission {submission.id}")
-
+                data[attr] = value
         except Exception as e:
-            # Handle potential errors accessing attributes (e.g., prawcore exceptions)
-            logger.warning(f"Could not access attribute '{attr}' for submission {submission.id}: {e}")
+            logger.warning(f"Could not access attribute '{attr}' for submission {getattr(submission, 'id', 'N/A')}: {e}")
             continue
 
-    # Ensure essential fields are present even if getattr failed (shouldn't happen often)
+    # Ensure essential fields are present
     essential = ['id', 'name', 'title', 'permalink', 'url']
     for key in essential:
         if key not in data:
             try:
                 data[key] = getattr(submission, key, None)
-            except: # Catch broad exception as fallback
-                 data[key] = None
+            except Exception:
+                data[key] = None
 
     return data
 

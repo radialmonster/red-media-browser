@@ -28,7 +28,7 @@ from PyQt6.QtGui import QAction, QIcon, QPixmapCache
 from red_config import load_config, get_new_refresh_token, update_config_with_new_token
 from reddit_api import RedditGalleryModel, SnapshotFetcher, ban_user, ModeratedSubredditsFetcher
 from ui_components import ThumbnailWidget, BanUserDialog
-from utils import get_cache_dir, ensure_directory
+from utils import get_cache_dir, ensure_directory, extract_image_urls
 from media_handlers import process_media_url
 import reddit_api # Import the module itself for accessing moderation_statuses
 
@@ -601,80 +601,65 @@ class RedMediaBrowser(QMainWindow):
 
     def add_submission_widget(self, submission, row=None, col=None):
         """Add a thumbnail widget for a submission."""
-        submission_id_str = getattr(submission, 'id', 'unknown ID') # Get ID early for logging
+        submission_id_str = getattr(submission, 'id', 'unknown ID')
         try:
-            # Extract the necessary information from the submission
+            # Extract submission info
             title = getattr(submission, 'title', 'No Title')
             permalink = getattr(submission, 'permalink', '')
 
-            # Safely get subreddit name
-            subreddit_name = "unknown" # Default
+            # Get subreddit name robustly
+            subreddit_name = "unknown"
             subreddit_attr = getattr(submission, 'subreddit', None)
-
-            # Check the type of subreddit_attr and extract name accordingly
             if isinstance(subreddit_attr, PrawSubreddit):
-                # It's a PRAW Subreddit object
                 subreddit_name = getattr(subreddit_attr, 'display_name', 'unknown')
             elif isinstance(subreddit_attr, str):
-                # It's a string (likely from cache)
                 subreddit_name = subreddit_attr
-            # Check if the attribute itself has 'display_name' (covers SimpleNamespace if subreddit was stored as obj)
             elif hasattr(subreddit_attr, 'display_name'):
-                 subreddit_name = getattr(subreddit_attr, 'display_name', 'unknown')
-            elif subreddit_attr is None:
-                 logger.debug(f"Subreddit attribute is None for {submission_id_str}")
-                 subreddit_name = "unknown" # Keep default
-            else:
-                 # Log if it's an unexpected type
-                 logger.warning(f"Unexpected type for subreddit attribute: {type(subreddit_attr)} for submission {submission_id_str}")
-                 subreddit_name = "unknown" # Keep default
+                subreddit_name = getattr(subreddit_attr, 'display_name', 'unknown')
+            elif subreddit_attr is not None:
+                logger.warning(f"Unexpected type for subreddit attribute: {type(subreddit_attr)} for submission {submission_id_str}")
 
-            # Handle gallery posts vs. single image posts
-            # Use getattr for safety as cached objects might miss attributes
+            # Gallery vs. single image
             is_gallery = getattr(submission, 'is_gallery', False)
             gallery_data = getattr(submission, 'gallery_data', None)
             media_metadata = getattr(submission, 'media_metadata', None)
             has_multiple_images = is_gallery and (gallery_data or media_metadata)
 
-            # Get the source URL
+            # Source URL
             source_url = getattr(submission, 'url', '')
             if has_multiple_images:
-                source_url = "Gallery post" # Placeholder for display
+                source_url = "Gallery post"
 
-            # Get the image URLs
-            from utils import extract_image_urls # Keep import local? Or move to top?
+            # Get image URLs
             image_urls = extract_image_urls(submission)
-
             if not image_urls:
                 logger.warning(f"No images found for submission ID {submission_id_str}")
-                return # Don't add widget if no images
+                return
 
-            # Determine if the app user can moderate THIS post's subreddit
-            can_moderate_this_post = False
-            if self.current_model and hasattr(self.current_model, 'moderated_subreddit_names'):
-                 can_moderate_this_post = subreddit_name.lower() in self.current_model.moderated_subreddit_names
+            # Moderator check
+            can_moderate_this_post = (
+                self.current_model and
+                hasattr(self.current_model, 'moderated_subreddit_names') and
+                subreddit_name.lower() in self.current_model.moderated_subreddit_names
+            )
 
-            # Create the thumbnail widget
+            # Create and add thumbnail widget
             thumbnail = ThumbnailWidget(
                 images=image_urls,
                 title=title,
                 source_url=source_url,
-                submission=submission, # Pass the object (PRAW or SimpleNamespace)
+                submission=submission,
                 subreddit_name=subreddit_name,
                 has_multiple_images=has_multiple_images,
                 post_url=permalink,
                 is_moderator=can_moderate_this_post,
-                reddit_instance=self.reddit # Pass the main reddit instance
+                reddit_instance=self.reddit
             )
-
-            # Connect signals
             thumbnail.authorClicked.connect(self.on_author_clicked)
-
-            # Add to layout and store reference
             if row is not None and col is not None:
                 self.content_layout.addWidget(thumbnail, row, col)
             else:
-                self.content_layout.addWidget(thumbnail) # Fallback
+                self.content_layout.addWidget(thumbnail)
             self.thumbnail_widgets.append(thumbnail)
 
         except Exception as e:
@@ -687,33 +672,34 @@ class RedMediaBrowser(QMainWindow):
                 self.thumbnail_widgets.append(error_widget)
 
     def clear_content(self):
-        """Clear all content from the display."""
+        """Remove all thumbnail widgets and clean up their resources."""
         for widget in self.thumbnail_widgets:
-            if hasattr(widget, 'cleanup_current_media'):
+            # Clean up media if method exists
+            cleanup = getattr(widget, "cleanup_current_media", None)
+            if callable(cleanup):
                 try:
-                    widget.cleanup_current_media()
+                    cleanup()
                 except Exception as e:
                     logger.debug(f"Error during media cleanup in clear_content: {e}")
             # Remove widget from layout and schedule for deletion
             self.content_layout.removeWidget(widget)
             widget.setParent(None)
             widget.deleteLater()
-
-        self.thumbnail_widgets = []
-        # Allow UI to process deletions before potentially adding new widgets
-        QApplication.processEvents()
+        self.thumbnail_widgets.clear()
+        QApplication.processEvents()  # Allow UI to process deletions
 
 
     def show_next_page(self):
         """Show the next page of submissions."""
         current_list = self.current_filtered_snapshot if self.is_filtered else self.current_snapshot
-        if not current_list: return
+        if not current_list:
+            return
 
         next_offset = self.snapshot_offset + self.snapshot_page_size
         if next_offset < len(current_list):
             self.snapshot_offset = next_offset
-            self.prev_button.setEnabled(True)
-            self.next_button.setEnabled(next_offset + self.snapshot_page_size < len(current_list))
+            self.prev_button.setEnabled(self.snapshot_offset > 0)
+            self.next_button.setEnabled(self.snapshot_offset + self.snapshot_page_size < len(current_list))
             if self.is_filtered:
                 self.display_filtered_page()
             else:
@@ -722,12 +708,12 @@ class RedMediaBrowser(QMainWindow):
     def show_previous_page(self):
         """Show the previous page of submissions."""
         current_list = self.current_filtered_snapshot if self.is_filtered else self.current_snapshot
-        if not current_list or self.snapshot_offset == 0: return
+        if not current_list or self.snapshot_offset == 0:
+            return
 
-        prev_offset = max(0, self.snapshot_offset - self.snapshot_page_size)
-        self.snapshot_offset = prev_offset
-        self.prev_button.setEnabled(prev_offset > 0)
-        self.next_button.setEnabled(True) # Always enabled if we moved back
+        self.snapshot_offset = max(0, self.snapshot_offset - self.snapshot_page_size)
+        self.prev_button.setEnabled(self.snapshot_offset > 0)
+        self.next_button.setEnabled(self.snapshot_offset + self.snapshot_page_size < len(current_list))
         if self.is_filtered:
             self.display_filtered_page()
         else:

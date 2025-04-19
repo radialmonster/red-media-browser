@@ -582,18 +582,14 @@ def process_media_url(url):
         if not any(processed_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
              logger.debug(f"Processing non-mp4 RedGIFs URL: {processed_url}")
              processed_url = get_redgifs_mp4_url(processed_url)
-             logger.debug(f"Processed RedGIFs URL: {url} -> {processed_url}")
+             logger.debug(f"Processed RedGifs URL: {url} -> {processed_url}")
 
     # Handle Reddit links that might contain RedGifs (if no specific handler matched)
     elif "reddit.com" in domain and best_match_domain is None: # Only if no reddit handler ran
         logger.debug("Checking Reddit URL for potential embedded RedGifs...")
         try:
-            # Check cache for the *original* reddit URL first
-            cache_path = get_cache_path_for_url(url)
-            if cache_path and os.path.exists(cache_path):
-                 logger.debug(f"Cache hit for original Reddit URL: {url}")
-                 return url # Return original if HTML/content is cached
-
+            # For RedGIFs, skip cache check for the original /watch/ URL to avoid case mismatch
+            # Only check cache for the processed .mp4 URL after extraction
             json_url = ensure_json_url(url)
             headers = {"User-Agent": "Mozilla/5.0 (compatible; red-media-browser/1.0)"}
             response = requests.get(json_url, headers=headers, timeout=10)
@@ -619,7 +615,7 @@ def process_media_url(url):
 
     # --- Step 3: Check Cache with the FINAL Processed URL ---
     final_cache_path = get_cache_path_for_url(processed_url)
-    if final_cache_path and os.path.exists(final_cache_path):
+    if final_cache_path and file_exists_in_cache(processed_url):
         logger.debug(f"Cache hit for FINAL processed URL '{processed_url}' at path: {final_cache_path}")
         return processed_url # Return the URL corresponding to the cached file
 
@@ -677,7 +673,7 @@ class MediaDownloadWorker(QRunnable):
                  raise ValueError("Could not determine cache path")
 
             # Check if already cached
-            if os.path.exists(cache_path):
+            if file_exists_in_cache(self.processed_url):
                 logger.debug(f"File already cached for submission {submission_id}: {cache_path}")
                 # Update metadata even if file is cached (submission data might be newer)
                 update_metadata_cache(self.submission_data, cache_path, self.processed_url)

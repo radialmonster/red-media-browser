@@ -1,0 +1,563 @@
+PS C:\Users\radia\Documents\projects\red-media-browser> & C:/python310/python.exe c:/Users/radia/Documents/projects/red-media-browser/src/red-media-browser.py
+2025-04-18 22:25:13 - INFO - Using cache directory: c:\Users\radia\Documents\projects\red-media-browser\src\cache
+2025-04-18 22:25:15 - INFO - Preloaded file cache with 8049 media files.
+2025-04-18 22:25:15 - INFO - Starting cache repair/index warming...
+2025-04-18 22:25:15 - DEBUG - Loaded submission index with 9069 entries.
+2025-04-18 22:25:15 - INFO - Building reverse lookup for existing metadata files...
+2025-04-18 22:25:17 - WARNING - Submission ID too short for standard directory structure: cachefile_jpg
+2025-04-18 22:25:17 - WARNING - Submission ID too short for standard directory structure: cachefile_downloaded_media
+2025-04-18 22:25:17 - WARNING - Submission ID too short for standard directory structure: cachefile_downloaded_media
+2025-04-18 22:25:17 - WARNING - Submission ID too short for standard directory structure: cachefile_downloaded_media
+2025-04-18 22:25:17 - WARNING - Submission ID too short for standard directory structure: cachefile_downloaded_media
+2025-04-18 22:25:17 - DEBUG - Saved submission index with 9069 entries.
+2025-04-18 22:25:17 - INFO - Cache repair complete. Added 19 missing metadata/index entries.
+2025-04-18 22:25:17 - DEBUG - Fetching: GET https://oauth.reddit.com/api/v1/me at 1745029517.482987
+2025-04-18 22:25:17 - DEBUG - Data: None
+2025-04-18 22:25:17 - DEBUG - Params: {'raw_json': 1}
+2025-04-18 22:25:17 - DEBUG - Starting new HTTPS connection (1): www.reddit.com:443
+2025-04-18 22:25:17 - DEBUG - https://www.reddit.com:443 "POST /api/v1/access_token HTTP/1.1" 200 883
+2025-04-18 22:25:17 - DEBUG - Starting new HTTPS connection (1): oauth.reddit.com:443
+2025-04-18 22:25:17 - DEBUG - https://oauth.reddit.com:443 "GET /api/v1/me?raw_json=1 HTTP/1.1" 200 1519
+2025-04-18 22:25:17 - DEBUG - Response: 200 (1519 bytes) (rst-281:rem-906.0:used-94 ratelimit) at 1745029517.8975713
+2025-04-18 22:25:17 - INFO - Authenticated as radialmonster
+2025-04-18 22:25:17 - DEBUG - Fetching moderated subreddits for user: radialmonster
+2025-04-18 22:25:17 - DEBUG - Fetching moderated subreddits for user: radialmonster
+2025-04-18 22:25:17 - DEBUG - Fetching: GET https://oauth.reddit.com/subreddits/mine/moderator/ at 1745029517.901024
+2025-04-18 22:25:17 - DEBUG - Fetching: GET https://oauth.reddit.com/subreddits/mine/moderator/ at 1745029517.9020295
+2025-04-18 22:25:17 - DEBUG - Data: None
+2025-04-18 22:25:17 - DEBUG - Data: None
+2025-04-18 22:25:17 - DEBUG - Params: {'limit': 1024, 'raw_json': 1}
+2025-04-18 22:25:17 - DEBUG - Params: {'limit': 1024, 'raw_json': 1}
+2025-04-18 22:25:17 - DEBUG - Starting new HTTPS connection (2): oauth.reddit.com:443
+2025-04-18 22:25:18 - DEBUG - https://oauth.reddit.com:443 "GET /subreddits/mine/moderator/?limit=1024&raw_json=1 HTTP/1.1" 200 7537
+2025-04-18 22:25:18 - DEBUG - Response: 200 (7537 bytes) (rst-281:rem-905.0:used-95 ratelimit) at 1745029518.1557336
+2025-04-18 22:25:18 - DEBUG - Found 10 moderated subreddits
+2025-04-18 22:25:18 - DEBUG - Model initialized with 10 moderated subreddit names.
+2025-04-18 22:25:18 - DEBUG - Performing moderator status check
+2025-04-18 22:25:18 - DEBUG - Fetching: GET https://oauth.reddit.com/r/pics/about/moderators/ at 1745029518.1567395
+2025-04-18 22:25:18 - DEBUG - Data: None
+2025-04-18 22:25:18 - DEBUG - Params: {'raw_json': 1}
+2025-04-18 22:25:18 - DEBUG - https://oauth.reddit.com:443 "GET /subreddits/mine/moderator/?limit=1024&raw_json=1 HTTP/1.1" 200 7537
+2025-04-18 22:25:18 - DEBUG - Response: 200 (7537 bytes) (rst-281:rem-904.0:used-96 ratelimit) at 1745029518.2307425
+2025-04-18 22:25:18 - DEBUG - Found 10 moderated subreddits
+2025-04-18 22:25:18 - DEBUG - https://oauth.reddit.com:443 "GET /r/pics/about/moderators/?raw_json=1 HTTP/1.1" 200 1888
+2025-04-18 22:25:18 - DEBUG - Response: 200 (1888 bytes) (rst-281:rem-903.0:used-97 ratelimit) at 1745029518.4392967
+2025-04-18 22:25:18 - DEBUG - Current user: radialmonster
+2025-04-18 22:25:18 - DEBUG - Moderators in subreddit: ['cwenham', '_BindersFullOfWomen_', 'tragopanic', 'adeadhead', 'RamsesThePigeon', 'n_reineke', 'PicsMod', 'JoyousCacophony', 'PussyWhistle', 'remiel', 'relaxlu', 'noeatnosleep', 'terminal_mole', 'NegativeTwelfth', 'SnowPhoenix9999', 'jamt9000', 'whyhellomichael', 'Lil_SpazJoekp', 'GuitarFreak027', 'Sunkisty', 'daninger4995', 'Emmx2039', 'CorvusCalvaria', 'DerangedOctopus', 'GastricallyStretched', 'TrueAmurrican', 'mayaxs', 'TreKs', 'lessons_learnt', 'pics-moderator', 'MAGIC_EYE_BOT', 'rPicsMods', 'mod-mentions', 'floodassistant', 'comment-nuke', 'hive-protect', 'auto-modmail', 'purge-user', 'evasion-guard', 'modqueue-nuke', 'banhammerapp', 'modmailassistant', 'bot-bouncer', 'AI-Banning-Automaton']
+2025-04-18 22:25:18 - DEBUG - Moderator status for current user: False
+2025-04-18 22:25:18 - INFO - Fetching snapshot (total=100, after=None) for subreddit: pics
+2025-04-18 22:25:18 - INFO - Moderated subreddits found. Starting background mod log fetch.
+2025-04-18 22:25:18 - DEBUG - Performing moderator status check
+2025-04-18 22:25:18 - DEBUG - Fetching: GET https://oauth.reddit.com/r/pics/about/moderators/ at 1745029518.5658846
+2025-04-18 22:25:18 - DEBUG - Data: None
+2025-04-18 22:25:18 - DEBUG - Params: {'raw_json': 1}
+2025-04-18 22:25:18 - INFO - Starting background fetch for mod logs of 10 subreddits...
+2025-04-18 22:25:18 - DEBUG - Fetching mod log for r/Bikini (1/10)
+2025-04-18 22:25:18 - DEBUG - Fetching: GET https://oauth.reddit.com/r/bikini/about/log/ at 1745029518.5668857
+2025-04-18 22:25:18 - DEBUG - Data: None
+2025-04-18 22:25:18 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:18 - DEBUG - https://oauth.reddit.com:443 "GET /r/pics/about/moderators/?raw_json=1 HTTP/1.1" 200 1888
+2025-04-18 22:25:18 - DEBUG - Response: 200 (1888 bytes) (rst-280:rem-902.0:used-98 ratelimit) at 1745029518.9660616
+2025-04-18 22:25:18 - DEBUG - Current user: radialmonster
+2025-04-18 22:25:18 - DEBUG - Moderators in subreddit: ['cwenham', '_BindersFullOfWomen_', 'tragopanic', 'adeadhead', 'RamsesThePigeon', 'n_reineke', 'PicsMod', 'JoyousCacophony', 'PussyWhistle', 'remiel', 'relaxlu', 'noeatnosleep', 'terminal_mole', 'NegativeTwelfth', 'SnowPhoenix9999', 'jamt9000', 'whyhellomichael', 'Lil_SpazJoekp', 'GuitarFreak027', 'Sunkisty', 'daninger4995', 'Emmx2039', 'CorvusCalvaria', 'DerangedOctopus', 'GastricallyStretched', 'TrueAmurrican', 'mayaxs', 'TreKs', 'lessons_learnt', 'pics-moderator', 'MAGIC_EYE_BOT', 'rPicsMods', 'mod-mentions', 'floodassistant', 'comment-nuke', 'hive-protect', 'auto-modmail', 'purge-user', 'evasion-guard', 'modqueue-nuke', 'banhammerapp', 'modmailassistant', 'bot-bouncer', 'AI-Banning-Automaton']
+2025-04-18 22:25:18 - DEBUG - Moderator status for current user: False
+2025-04-18 22:25:18 - DEBUG - Fetching regular view...
+2025-04-18 22:25:18 - DEBUG - Fetching: GET https://oauth.reddit.com/r/pics/new at 1745029518.9670615
+2025-04-18 22:25:18 - DEBUG - Data: None
+2025-04-18 22:25:18 - DEBUG - Params: {'limit': 100, 'raw_json': 1}
+2025-04-18 22:25:19 - DEBUG - https://oauth.reddit.com:443 "GET /r/pics/new?limit=100&raw_json=1 HTTP/1.1" 200 34835
+2025-04-18 22:25:20 - DEBUG - Response: 200 (34835 bytes) (rst-280:rem-900.0:used-100 ratelimit) at 1745029520.0034761
+2025-04-18 22:25:20 - DEBUG - Processing 100 merged submissions against cache...
+2025-04-18 22:25:20 - DEBUG - https://oauth.reddit.com:443 "GET /r/bikini/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 43892
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2lt1x: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2lt1x.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2lp97: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2lp97.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2llmh: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2llmh.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2ldt3: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2ldt3.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2ldkh: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2ldkh.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2l28n: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2l28n.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2l1ki: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2l1ki.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2ku4a: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2ku4a.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2ks5q: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2ks5q.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2krak: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2krak.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2kqv3: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2kqv3.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2koaw: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2koaw.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2kbfo: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2kbfo.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2k9hy: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2k9hy.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2jvr8: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2jvr8.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2juex: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2juex.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2jhqm: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2jhqm.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2jdsf: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2jdsf.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2ioh7: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2ioh7.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2icgu: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2icgu.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2i6vf: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2i6vf.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2hyyn: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2hyyn.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2hm0l: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2hm0l.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2hjet: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2hjet.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2h48c: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2h48c.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2h2m5: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2h2m5.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2guea: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2guea.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2gqbx: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2gqbx.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2gdao: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2gdao.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2gajh: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2gajh.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2fwif: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2fwif.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2fssu: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2fssu.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2fon0: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2fon0.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2f2ni: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2f2ni.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2f0un: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2f0un.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2esl7: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2esl7.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2dwxg: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2dwxg.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2dua1: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2dua1.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2dhyo: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2dhyo.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2dgsj: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2dgsj.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2defq: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2defq.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2ddka: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2ddka.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2d3yk: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2d3yk.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2cve1: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2cve1.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2csod: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2csod.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2c31n: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2c31n.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2bil5: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2bil5.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2b4vp: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2b4vp.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2b138: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2b138.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2awnn: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2awnn.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2atx6: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2atx6.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2aj6y: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2aj6y.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2ae3m: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2ae3m.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2advs: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2advs.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2ac35: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2ac35.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2abcg: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2abcg.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2a4jo: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2a4jo.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2a0ou: Not in index.
+2025-04-18 22:25:20 - DEBUG - Response: 200 (43892 bytes) (rst-280:rem-901.0:used-99 ratelimit) at 1745029520.0384758
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2a0ou.
+2025-04-18 22:25:20 - DEBUG - Fetching: GET https://oauth.reddit.com/r/bikini/about/log/ at 1745029520.0424762
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k29n76: Not in index.
+2025-04-18 22:25:20 - DEBUG - Data: None
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k29n76.
+2025-04-18 22:25:20 - DEBUG - Params: {'after': 'ModAction_9dac0029-e833-11ef-991e-9d74b7feddda',
+ 'limit': 1000,
+ 'mod': None,
+ 'raw_json': 1,
+ 'type': 'removelink'}
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k29mzx: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k29mzx.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k29h0z: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k29h0z.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k281zw: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k281zw.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k275y7: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k275y7.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2737g: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2737g.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k26xbs: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k26xbs.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k26uj9: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k26uj9.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k26lw5: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k26lw5.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k26ia7: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k26ia7.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k26clq: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k26clq.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k26aou: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k26aou.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k260hu: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k260hu.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k260dc: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k260dc.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k25ofn: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k25ofn.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k24wzm: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k24wzm.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k24pc1: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k24pc1.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k24bxe: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k24bxe.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k249x8: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k249x8.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2481k: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2481k.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2466t: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2466t.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k23yab: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k23yab.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k23scu: Media file missing.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k23scu.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k23hax: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k23hax.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k239vs: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k239vs.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2378d: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2378d.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k233hd: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k233hd.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k22opp: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k22opp.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k22jk3: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k22jk3.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k223ld: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k223ld.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2170i: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2170i.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k2127t: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k2127t.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k208hx: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k208hx.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k20077: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k20077.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k1zwdd: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k1zwdd.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k1zj4i: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k1zj4i.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k1z2yj: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k1z2yj.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k1yy9j: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k1yy9j.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k1yqrz: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k1yqrz.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k1y7ke: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k1y7ke.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k1xvy1: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k1xvy1.
+2025-04-18 22:25:20 - DEBUG - Cache MISS for 1k1xvw9: Not in index.
+2025-04-18 22:25:20 - DEBUG - Using fetched PRAW object for 1k1xvw9.
+2025-04-18 22:25:20 - INFO - Snapshot fetch complete. Returning 100 items.
+2025-04-18 22:25:20 - DEBUG - Extracting image URLs for submission ID: 1k2lt1x
+2025-04-18 22:25:20 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2lt1x/ at 1745029520.0574803
+2025-04-18 22:25:20 - DEBUG - Data: None
+2025-04-18 22:25:20 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:20 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2lt1x/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 3539
+2025-04-18 22:25:20 - DEBUG - Response: 200 (3539 bytes) (rst-279:rem-898.0:used-102 ratelimit) at 1745029520.252354
+2025-04-18 22:25:20 - DEBUG - Processing 1k2lt1x as regular post (or fallback from crosspost)
+2025-04-18 22:25:20 - DEBUG - Extracted 4 gallery URLs from main submission 1k2lt1x.
+2025-04-18 22:25:20 - DEBUG - Processing media URL: https://preview.redd.it/9fspb3gx9pve1.jpg?width=1036&format=pjpg&auto=webp&s=7bb536122d40c128f4ebc54fa834e615eaa1390a
+2025-04-18 22:25:20 - DEBUG - No specific handler found for domain 'preview.redd.it'.
+2025-04-18 22:25:20 - DEBUG - Cache hit for FINAL processed URL 'https://preview.redd.it/9fspb3gx9pve1.jpg?width=1036&format=pjpg&auto=webp&s=7bb536122d40c128f4ebc54fa834e615eaa1390a' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\9fspb3gx9pve1.jpg
+2025-04-18 22:25:20 - DEBUG - Processing media URL: https://preview.redd.it/9fspb3gx9pve1.jpg?width=1036&format=pjpg&auto=webp&s=7bb536122d40c128f4ebc54fa834e615eaa1390a
+2025-04-18 22:25:20 - DEBUG - No specific handler found for domain 'preview.redd.it'.
+2025-04-18 22:25:20 - DEBUG - Cache hit for FINAL processed URL 'https://preview.redd.it/9fspb3gx9pve1.jpg?width=1036&format=pjpg&auto=webp&s=7bb536122d40c128f4ebc54fa834e615eaa1390a' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\9fspb3gx9pve1.jpg
+2025-04-18 22:25:20 - DEBUG - MediaDownloadWorker initialized for 1k2lt1x: original='https://preview.redd.it/9fspb3gx9pve1.jpg?width=1036&format=pjpg&auto=webp&s=7bb536122d40c128f4ebc54fa834e615eaa1390a', processed='https://preview.redd.it/9fspb3gx9pve1.jpg?width=1036&format=pjpg&auto=webp&s=7bb536122d40c128f4ebc54fa834e615eaa1390a'
+2025-04-18 22:25:20 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2lp97/ at 1745029520.2573555
+2025-04-18 22:25:20 - DEBUG - Data: None
+2025-04-18 22:25:20 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:20 - DEBUG - File already cached for submission 1k2lt1x: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\9fspb3gx9pve1.jpg
+2025-04-18 22:25:20 - DEBUG - Metadata for submission 1k2lt1x is up to date; no update needed.
+2025-04-18 22:25:20 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2lp97/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 1091
+2025-04-18 22:25:20 - DEBUG - Response: 200 (1091 bytes) (rst-279:rem-897.0:used-103 ratelimit) at 1745029520.4078577
+2025-04-18 22:25:20 - DEBUG - Extracting image URLs for submission ID: 1k2lp97
+2025-04-18 22:25:20 - DEBUG - Processing 1k2lp97 as regular post (or fallback from crosspost)
+2025-04-18 22:25:20 - DEBUG - Using direct image URL from main submission 1k2lp97: https://i.redd.it/xes8mshc9pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - Processing media URL: https://i.redd.it/xes8mshc9pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:20 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/xes8mshc9pve1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\xes8mshc9pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - Processing media URL: https://i.redd.it/xes8mshc9pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:20 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/xes8mshc9pve1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\xes8mshc9pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - MediaDownloadWorker initialized for 1k2lp97: original='https://i.redd.it/xes8mshc9pve1.jpeg', processed='https://i.redd.it/xes8mshc9pve1.jpeg'
+2025-04-18 22:25:20 - DEBUG - Extracting image URLs for submission ID: 1k2llmh
+2025-04-18 22:25:20 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2llmh/ at 1745029520.4116318
+2025-04-18 22:25:20 - DEBUG - Data: None
+2025-04-18 22:25:20 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:20 - DEBUG - File already cached for submission 1k2lp97: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\xes8mshc9pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - Metadata for submission 1k2lp97 is up to date; no update needed.
+2025-04-18 22:25:20 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2llmh/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 3391
+2025-04-18 22:25:20 - DEBUG - Response: 200 (3391 bytes) (rst-278:rem-896.0:used-104 ratelimit) at 1745029520.618625
+2025-04-18 22:25:20 - DEBUG - Processing 1k2llmh as regular post (or fallback from crosspost)
+2025-04-18 22:25:20 - DEBUG - Extracted 6 gallery URLs from main submission 1k2llmh.
+2025-04-18 22:25:20 - DEBUG - Processing media URL: https://preview.redd.it/05t5du1e8pve1.jpg?width=4000&format=pjpg&auto=webp&s=dbc25c46e35dde46506a10997dc8929df17ded92
+2025-04-18 22:25:20 - DEBUG - No specific handler found for domain 'preview.redd.it'.
+2025-04-18 22:25:20 - DEBUG - Cache hit for FINAL processed URL 'https://preview.redd.it/05t5du1e8pve1.jpg?width=4000&format=pjpg&auto=webp&s=dbc25c46e35dde46506a10997dc8929df17ded92' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\05t5du1e8pve1.jpg
+2025-04-18 22:25:20 - DEBUG - Processing media URL: https://preview.redd.it/05t5du1e8pve1.jpg?width=4000&format=pjpg&auto=webp&s=dbc25c46e35dde46506a10997dc8929df17ded92
+2025-04-18 22:25:20 - DEBUG - No specific handler found for domain 'preview.redd.it'.
+2025-04-18 22:25:20 - DEBUG - Cache hit for FINAL processed URL 'https://preview.redd.it/05t5du1e8pve1.jpg?width=4000&format=pjpg&auto=webp&s=dbc25c46e35dde46506a10997dc8929df17ded92' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\05t5du1e8pve1.jpg
+2025-04-18 22:25:20 - DEBUG - MediaDownloadWorker initialized for 1k2llmh: original='https://preview.redd.it/05t5du1e8pve1.jpg?width=4000&format=pjpg&auto=webp&s=dbc25c46e35dde46506a10997dc8929df17ded92', processed='https://preview.redd.it/05t5du1e8pve1.jpg?width=4000&format=pjpg&auto=webp&s=dbc25c46e35dde46506a10997dc8929df17ded92'
+2025-04-18 22:25:20 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2ldt3/ at 1745029520.6236236
+2025-04-18 22:25:20 - DEBUG - Data: None
+2025-04-18 22:25:20 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:20 - DEBUG - File already cached for submission 1k2llmh: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\05t5du1e8pve1.jpg
+2025-04-18 22:25:20 - DEBUG - Metadata for submission 1k2llmh is up to date; no update needed.
+2025-04-18 22:25:20 - DEBUG - https://oauth.reddit.com:443 "GET /r/bikini/about/log/?type=removelink&limit=1000&after=ModAction_9dac0029-e833-11ef-991e-9d74b7feddda&raw_json=1 HTTP/1.1" 200 26892
+2025-04-18 22:25:20 - DEBUG - Response: 200 (26892 bytes) (rst-279:rem-899.0:used-101 ratelimit) at 1745029520.7809908
+2025-04-18 22:25:20 - DEBUG - Fetched 796 log entries for r/Bikini, stored 796 relevant entries.
+2025-04-18 22:25:20 - DEBUG - Fetching mod log for r/CookSux (2/10)
+2025-04-18 22:25:20 - DEBUG - Fetching: GET https://oauth.reddit.com/r/cooksux/about/log/ at 1745029520.7839909
+2025-04-18 22:25:20 - DEBUG - Data: None
+2025-04-18 22:25:20 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:20 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2ldt3/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 3015
+2025-04-18 22:25:20 - DEBUG - Response: 200 (3015 bytes) (rst-278:rem-895.0:used-105 ratelimit) at 1745029520.8710594
+2025-04-18 22:25:20 - DEBUG - Extracting image URLs for submission ID: 1k2ldt3
+2025-04-18 22:25:20 - DEBUG - Processing 1k2ldt3 as regular post (or fallback from crosspost)
+2025-04-18 22:25:20 - DEBUG - Using direct image URL from main submission 1k2ldt3: https://i.redd.it/4bsq572c6pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - Processing media URL: https://i.redd.it/4bsq572c6pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:20 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/4bsq572c6pve1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\4bsq572c6pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - Processing media URL: https://i.redd.it/4bsq572c6pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:20 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/4bsq572c6pve1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\4bsq572c6pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - MediaDownloadWorker initialized for 1k2ldt3: original='https://i.redd.it/4bsq572c6pve1.jpeg', processed='https://i.redd.it/4bsq572c6pve1.jpeg'
+2025-04-18 22:25:20 - DEBUG - Extracting image URLs for submission ID: 1k2ldkh
+2025-04-18 22:25:20 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2ldkh/ at 1745029520.8758683
+2025-04-18 22:25:20 - DEBUG - Data: None
+2025-04-18 22:25:20 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:20 - DEBUG - File already cached for submission 1k2ldt3: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\4bsq572c6pve1.jpeg
+2025-04-18 22:25:20 - DEBUG - Metadata for submission 1k2ldt3 is up to date; no update needed.
+2025-04-18 22:25:20 - DEBUG - https://oauth.reddit.com:443 "GET /r/cooksux/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 461
+2025-04-18 22:25:20 - DEBUG - Response: 200 (461 bytes) (rst-278:rem-894.0:used-106 ratelimit) at 1745029520.9451294
+2025-04-18 22:25:20 - DEBUG - Fetched 2 log entries for r/CookSux, stored 2 relevant entries.
+2025-04-18 22:25:20 - DEBUG - Fetching mod log for r/crappyporn (3/10)
+2025-04-18 22:25:20 - DEBUG - Fetching: GET https://oauth.reddit.com/r/crappyporn/about/log/ at 1745029520.946252
+2025-04-18 22:25:20 - DEBUG - Data: None
+2025-04-18 22:25:20 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:21 - DEBUG - https://oauth.reddit.com:443 "GET /r/crappyporn/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 None
+2025-04-18 22:25:21 - DEBUG - Response: 200 (None bytes) (rst-278:rem-892.0:used-108 ratelimit) at 1745029521.0828602
+2025-04-18 22:25:21 - DEBUG - Fetched 0 log entries for r/crappyporn, stored 0 relevant entries.
+2025-04-18 22:25:21 - DEBUG - Fetching mod log for r/healthcarebills (4/10)
+2025-04-18 22:25:21 - DEBUG - Fetching: GET https://oauth.reddit.com/r/healthcarebills/about/log/ at 1745029521.0828602
+2025-04-18 22:25:21 - DEBUG - Data: None
+2025-04-18 22:25:21 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:21 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2ldkh/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 3083
+2025-04-18 22:25:21 - DEBUG - Response: 200 (3083 bytes) (rst-278:rem-893.0:used-107 ratelimit) at 1745029521.0886397
+2025-04-18 22:25:21 - DEBUG - Processing 1k2ldkh as regular post (or fallback from crosspost)
+2025-04-18 22:25:21 - DEBUG - Extracted 3 gallery URLs from main submission 1k2ldkh.
+2025-04-18 22:25:21 - DEBUG - Processing media URL: https://preview.redd.it/5ng7cck96pve1.jpg?width=3024&format=pjpg&auto=webp&s=be3963ce052c170aa79ef25c22d7f034873678cc
+2025-04-18 22:25:21 - DEBUG - No specific handler found for domain 'preview.redd.it'.
+2025-04-18 22:25:21 - DEBUG - Cache hit for FINAL processed URL 'https://preview.redd.it/5ng7cck96pve1.jpg?width=3024&format=pjpg&auto=webp&s=be3963ce052c170aa79ef25c22d7f034873678cc' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\5ng7cck96pve1.jpg
+2025-04-18 22:25:21 - DEBUG - Processing media URL: https://preview.redd.it/5ng7cck96pve1.jpg?width=3024&format=pjpg&auto=webp&s=be3963ce052c170aa79ef25c22d7f034873678cc
+2025-04-18 22:25:21 - DEBUG - No specific handler found for domain 'preview.redd.it'.
+2025-04-18 22:25:21 - DEBUG - Cache hit for FINAL processed URL 'https://preview.redd.it/5ng7cck96pve1.jpg?width=3024&format=pjpg&auto=webp&s=be3963ce052c170aa79ef25c22d7f034873678cc' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\5ng7cck96pve1.jpg
+2025-04-18 22:25:21 - DEBUG - MediaDownloadWorker initialized for 1k2ldkh: original='https://preview.redd.it/5ng7cck96pve1.jpg?width=3024&format=pjpg&auto=webp&s=be3963ce052c170aa79ef25c22d7f034873678cc', processed='https://preview.redd.it/5ng7cck96pve1.jpg?width=3024&format=pjpg&auto=webp&s=be3963ce052c170aa79ef25c22d7f034873678cc'
+2025-04-18 22:25:21 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2l28n/ at 1745029521.09364
+2025-04-18 22:25:21 - DEBUG - Data: None
+2025-04-18 22:25:21 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:21 - DEBUG - File already cached for submission 1k2ldkh: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\5ng7cck96pve1.jpg
+2025-04-18 22:25:21 - DEBUG - Metadata for submission 1k2ldkh is up to date; no update needed.
+2025-04-18 22:25:21 - DEBUG - https://oauth.reddit.com:443 "GET /r/healthcarebills/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 None
+2025-04-18 22:25:21 - DEBUG - Response: 200 (None bytes) (rst-278:rem-891.0:used-109 ratelimit) at 1745029521.235261
+2025-04-18 22:25:21 - DEBUG - Fetched 1 log entries for r/healthcarebills, stored 1 relevant entries.
+2025-04-18 22:25:21 - DEBUG - Fetching mod log for r/menwithbigcocks (5/10)
+2025-04-18 22:25:21 - DEBUG - Fetching: GET https://oauth.reddit.com/r/menwithbigcocks/about/log/ at 1745029521.235261
+2025-04-18 22:25:21 - DEBUG - Data: None
+2025-04-18 22:25:21 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:21 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2l28n/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 1779
+2025-04-18 22:25:21 - DEBUG - Response: 200 (1779 bytes) (rst-278:rem-890.0:used-110 ratelimit) at 1745029521.2928646
+2025-04-18 22:25:21 - DEBUG - Extracting image URLs for submission ID: 1k2l28n
+2025-04-18 22:25:21 - DEBUG - Processing 1k2l28n as regular post (or fallback from crosspost)
+2025-04-18 22:25:21 - WARNING - Direct URL from main submission 1k2l28n is not an image link: https://i.imgur.com/50VmayO.jpg?1. Returning anyway.
+2025-04-18 22:25:21 - DEBUG - Processing media URL: https://i.imgur.com/50VmayO.jpg?1
+2025-04-18 22:25:21 - DEBUG - Found handler for domain 'imgur.com'. Running handler...
+2025-04-18 22:25:21 - INFO - --- Running imgur_page_handler for: https://i.imgur.com/50VmayO.jpg?1 ---
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Sending request to https://i.imgur.com/50VmayO.jpg?1
+2025-04-18 22:25:21 - DEBUG - Starting new HTTPS connection (1): i.imgur.com:443
+2025-04-18 22:25:21 - DEBUG - https://i.imgur.com:443 "GET /50VmayO.jpg?1 HTTP/1.1" 302 0
+2025-04-18 22:25:21 - DEBUG - Starting new HTTPS connection (1): imgur.com:443
+2025-04-18 22:25:21 - DEBUG - https://oauth.reddit.com:443 "GET /r/menwithbigcocks/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 5793
+2025-04-18 22:25:21 - DEBUG - Response: 200 (5793 bytes) (rst-278:rem-889.0:used-111 ratelimit) at 1745029521.505994
+2025-04-18 22:25:21 - DEBUG - Fetched 90 log entries for r/menwithbigcocks, stored 90 relevant entries.
+2025-04-18 22:25:21 - DEBUG - Fetching mod log for r/MicroBikini (6/10)
+2025-04-18 22:25:21 - DEBUG - Fetching: GET https://oauth.reddit.com/r/microbikini/about/log/ at 1745029521.5069945
+2025-04-18 22:25:21 - DEBUG - Data: None
+2025-04-18 22:25:21 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:21 - DEBUG - https://imgur.com:443 "GET /50VmayO HTTP/1.1" 200 None
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Received response status 200 for https://i.imgur.com/50VmayO.jpg?1. Final URL: https://imgur.com/50VmayO
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Content-Type: text/html
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Received HTML for https://i.imgur.com/50VmayO.jpg?1. Parsing meta tags...
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Searching for video meta tags...
+2025-04-18 22:25:21 - DEBUG - Imgur handler: No video meta tags found.
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Searching for image meta tags...
+2025-04-18 22:25:21 - DEBUG - Imgur handler: No image meta tags found.
+2025-04-18 22:25:21 - WARNING - Imgur handler: Could not extract media URL from Imgur page meta tags: https://i.imgur.com/50VmayO.jpg?1
+2025-04-18 22:25:21 - WARNING - Imgur handler: Could not apply simple Imgur fallback construction for: https://i.imgur.com/50VmayO.jpg?1
+2025-04-18 22:25:21 - WARNING - Imgur handler: Failed to extract direct URL for https://i.imgur.com/50VmayO.jpg?1. Returning original.
+2025-04-18 22:25:21 - DEBUG - Handler for imgur.com did not modify URL.
+2025-04-18 22:25:21 - DEBUG - Cache hit for FINAL processed URL 'https://i.imgur.com/50VmayO.jpg?1' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.imgur.com\50VmayO.jpg
+2025-04-18 22:25:21 - DEBUG - Processing media URL: https://i.imgur.com/50VmayO.jpg?1
+2025-04-18 22:25:21 - DEBUG - Found handler for domain 'imgur.com'. Running handler...
+2025-04-18 22:25:21 - INFO - --- Running imgur_page_handler for: https://i.imgur.com/50VmayO.jpg?1 ---
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Sending request to https://i.imgur.com/50VmayO.jpg?1
+2025-04-18 22:25:21 - DEBUG - Starting new HTTPS connection (1): i.imgur.com:443
+2025-04-18 22:25:21 - DEBUG - https://oauth.reddit.com:443 "GET /r/microbikini/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 3160
+2025-04-18 22:25:21 - DEBUG - Response: 200 (3160 bytes) (rst-277:rem-888.0:used-112 ratelimit) at 1745029521.733071
+2025-04-18 22:25:21 - DEBUG - Fetched 33 log entries for r/MicroBikini, stored 33 relevant entries.
+2025-04-18 22:25:21 - DEBUG - Fetching mod log for r/u_radialmonster (7/10)
+2025-04-18 22:25:21 - DEBUG - Fetching: GET https://oauth.reddit.com/r/u_radialmonster/about/log/ at 1745029521.7340696
+2025-04-18 22:25:21 - DEBUG - Data: None
+2025-04-18 22:25:21 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:21 - DEBUG - https://i.imgur.com:443 "GET /50VmayO.jpg?1 HTTP/1.1" 302 0
+2025-04-18 22:25:21 - DEBUG - Starting new HTTPS connection (1): imgur.com:443
+2025-04-18 22:25:21 - DEBUG - https://oauth.reddit.com:443 "GET /r/u_radialmonster/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 None
+2025-04-18 22:25:21 - DEBUG - Response: 200 (None bytes) (rst-277:rem-887.0:used-113 ratelimit) at 1745029521.8643453
+2025-04-18 22:25:21 - DEBUG - Fetched 0 log entries for r/u_radialmonster, stored 0 relevant entries.
+2025-04-18 22:25:21 - DEBUG - Fetching mod log for r/VideoCameras (8/10)
+2025-04-18 22:25:21 - DEBUG - Fetching: GET https://oauth.reddit.com/r/videocameras/about/log/ at 1745029521.8673394
+2025-04-18 22:25:21 - DEBUG - Data: None
+2025-04-18 22:25:21 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:21 - DEBUG - https://imgur.com:443 "GET /50VmayO HTTP/1.1" 200 None
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Received response status 200 for https://i.imgur.com/50VmayO.jpg?1. Final URL: https://imgur.com/50VmayO
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Content-Type: text/html
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Received HTML for https://i.imgur.com/50VmayO.jpg?1. Parsing meta tags...
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Searching for video meta tags...
+2025-04-18 22:25:21 - DEBUG - Imgur handler: No video meta tags found.
+2025-04-18 22:25:21 - DEBUG - Imgur handler: Searching for image meta tags...
+2025-04-18 22:25:21 - DEBUG - Imgur handler: No image meta tags found.
+2025-04-18 22:25:21 - WARNING - Imgur handler: Could not extract media URL from Imgur page meta tags: https://i.imgur.com/50VmayO.jpg?1
+2025-04-18 22:25:21 - WARNING - Imgur handler: Could not apply simple Imgur fallback construction for: https://i.imgur.com/50VmayO.jpg?1
+2025-04-18 22:25:21 - WARNING - Imgur handler: Failed to extract direct URL for https://i.imgur.com/50VmayO.jpg?1. Returning original.
+2025-04-18 22:25:21 - DEBUG - Handler for imgur.com did not modify URL.
+2025-04-18 22:25:21 - DEBUG - Cache hit for FINAL processed URL 'https://i.imgur.com/50VmayO.jpg?1' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.imgur.com\50VmayO.jpg
+2025-04-18 22:25:21 - DEBUG - MediaDownloadWorker initialized for 1k2l28n: original='https://i.imgur.com/50VmayO.jpg?1', processed='https://i.imgur.com/50VmayO.jpg?1'
+2025-04-18 22:25:21 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2l1ki/ at 1745029521.9005466
+2025-04-18 22:25:21 - DEBUG - Data: None
+2025-04-18 22:25:21 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:21 - DEBUG - File already cached for submission 1k2l28n: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.imgur.com\50VmayO.jpg
+2025-04-18 22:25:21 - DEBUG - Metadata for submission 1k2l28n is up to date; no update needed.
+2025-04-18 22:25:22 - DEBUG - https://oauth.reddit.com:443 "GET /r/videocameras/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 None
+2025-04-18 22:25:22 - DEBUG - Response: 200 (None bytes) (rst-277:rem-886.0:used-114 ratelimit) at 1745029522.013786
+2025-04-18 22:25:22 - DEBUG - Fetched 0 log entries for r/VideoCameras, stored 0 relevant entries.
+2025-04-18 22:25:22 - DEBUG - Fetching mod log for r/voterfraud (9/10)
+2025-04-18 22:25:22 - DEBUG - Fetching: GET https://oauth.reddit.com/r/voterfraud/about/log/ at 1745029522.0147588
+2025-04-18 22:25:22 - DEBUG - Data: None
+2025-04-18 22:25:22 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:22 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2l1ki/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 2016
+2025-04-18 22:25:22 - DEBUG - Response: 200 (2016 bytes) (rst-277:rem-885.0:used-115 ratelimit) at 1745029522.0729885
+2025-04-18 22:25:22 - DEBUG - Extracting image URLs for submission ID: 1k2l1ki
+2025-04-18 22:25:22 - DEBUG - Processing 1k2l1ki as regular post (or fallback from crosspost)
+2025-04-18 22:25:22 - DEBUG - Using direct image URL from main submission 1k2l1ki: https://i.redd.it/comb34wz2pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - Processing media URL: https://i.redd.it/comb34wz2pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:22 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/comb34wz2pve1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\comb34wz2pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - Processing media URL: https://i.redd.it/comb34wz2pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:22 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/comb34wz2pve1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\comb34wz2pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - MediaDownloadWorker initialized for 1k2l1ki: original='https://i.redd.it/comb34wz2pve1.jpeg', processed='https://i.redd.it/comb34wz2pve1.jpeg'
+2025-04-18 22:25:22 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2ku4a/ at 1745029522.0770025
+2025-04-18 22:25:22 - DEBUG - Data: None
+2025-04-18 22:25:22 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:22 - DEBUG - File already cached for submission 1k2l1ki: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\comb34wz2pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - Metadata for submission 1k2l1ki is up to date; no update needed.
+2025-04-18 22:25:22 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2ku4a/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 1073
+2025-04-18 22:25:22 - DEBUG - Response: 200 (1073 bytes) (rst-277:rem-883.0:used-117 ratelimit) at 1745029522.2197256
+2025-04-18 22:25:22 - DEBUG - Extracting image URLs for submission ID: 1k2ku4a
+2025-04-18 22:25:22 - DEBUG - Processing 1k2ku4a as regular post (or fallback from crosspost)
+2025-04-18 22:25:22 - DEBUG - Using direct image URL from main submission 1k2ku4a: https://i.redd.it/vr7mr0bz0pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - Processing media URL: https://i.redd.it/vr7mr0bz0pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:22 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/vr7mr0bz0pve1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\vr7mr0bz0pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - Processing media URL: https://i.redd.it/vr7mr0bz0pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:22 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/vr7mr0bz0pve1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\vr7mr0bz0pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - MediaDownloadWorker initialized for 1k2ku4a: original='https://i.redd.it/vr7mr0bz0pve1.jpeg', processed='https://i.redd.it/vr7mr0bz0pve1.jpeg'
+2025-04-18 22:25:22 - DEBUG - Extracting image URLs for submission ID: 1k2ks5q
+2025-04-18 22:25:22 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2ks5q/ at 1745029522.2246947
+2025-04-18 22:25:22 - DEBUG - Data: None
+2025-04-18 22:25:22 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:22 - DEBUG - File already cached for submission 1k2ku4a: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\vr7mr0bz0pve1.jpeg
+2025-04-18 22:25:22 - DEBUG - Metadata for submission 1k2ku4a is up to date; no update needed.
+2025-04-18 22:25:22 - DEBUG - https://oauth.reddit.com:443 "GET /r/voterfraud/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 7673
+2025-04-18 22:25:22 - DEBUG - Response: 200 (7673 bytes) (rst-277:rem-884.0:used-116 ratelimit) at 1745029522.2935746
+2025-04-18 22:25:22 - DEBUG - Fetched 67 log entries for r/voterfraud, stored 67 relevant entries.
+2025-04-18 22:25:22 - DEBUG - Fetching mod log for r/WeAreMods (10/10)
+2025-04-18 22:25:22 - DEBUG - Fetching: GET https://oauth.reddit.com/r/wearemods/about/log/ at 1745029522.2945743
+2025-04-18 22:25:22 - DEBUG - Data: None
+2025-04-18 22:25:22 - DEBUG - Params: {'limit': 1000, 'mod': None, 'raw_json': 1, 'type': 'removelink'}
+2025-04-18 22:25:22 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2ks5q/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 3313
+2025-04-18 22:25:22 - DEBUG - Response: 200 (3313 bytes) (rst-277:rem-882.0:used-118 ratelimit) at 1745029522.4220068
+2025-04-18 22:25:22 - DEBUG - Processing 1k2ks5q as regular post (or fallback from crosspost)
+2025-04-18 22:25:22 - DEBUG - Extracted 4 gallery URLs from main submission 1k2ks5q.
+2025-04-18 22:25:22 - DEBUG - Processing media URL: https://preview.redd.it/l6jekuua0pve1.jpg?width=1600&format=pjpg&auto=webp&s=7585749e8219a524e322d66205360037a25e6a99
+2025-04-18 22:25:22 - DEBUG - No specific handler found for domain 'preview.redd.it'.
+2025-04-18 22:25:22 - DEBUG - Cache hit for FINAL processed URL 'https://preview.redd.it/l6jekuua0pve1.jpg?width=1600&format=pjpg&auto=webp&s=7585749e8219a524e322d66205360037a25e6a99' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\l6jekuua0pve1.jpg
+2025-04-18 22:25:22 - DEBUG - Processing media URL: https://preview.redd.it/l6jekuua0pve1.jpg?width=1600&format=pjpg&auto=webp&s=7585749e8219a524e322d66205360037a25e6a99
+2025-04-18 22:25:22 - DEBUG - No specific handler found for domain 'preview.redd.it'.
+2025-04-18 22:25:22 - DEBUG - Cache hit for FINAL processed URL 'https://preview.redd.it/l6jekuua0pve1.jpg?width=1600&format=pjpg&auto=webp&s=7585749e8219a524e322d66205360037a25e6a99' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\l6jekuua0pve1.jpg
+2025-04-18 22:25:22 - DEBUG - MediaDownloadWorker initialized for 1k2ks5q: original='https://preview.redd.it/l6jekuua0pve1.jpg?width=1600&format=pjpg&auto=webp&s=7585749e8219a524e322d66205360037a25e6a99', processed='https://preview.redd.it/l6jekuua0pve1.jpg?width=1600&format=pjpg&auto=webp&s=7585749e8219a524e322d66205360037a25e6a99'
+2025-04-18 22:25:22 - DEBUG - Fetching: GET https://oauth.reddit.com/comments/1k2krak/ at 1745029522.4260056
+2025-04-18 22:25:22 - DEBUG - Data: None
+2025-04-18 22:25:22 - DEBUG - Params: {'limit': 2048, 'raw_json': 1, 'sort': 'confidence'}
+2025-04-18 22:25:22 - DEBUG - File already cached for submission 1k2ks5q: c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\l6jekuua0pve1.jpg
+2025-04-18 22:25:22 - DEBUG - Metadata for submission 1k2ks5q is up to date; no update needed.
+2025-04-18 22:25:22 - DEBUG - https://oauth.reddit.com:443 "GET /comments/1k2krak/?limit=2048&sort=confidence&raw_json=1 HTTP/1.1" 200 1075
+2025-04-18 22:25:22 - DEBUG - Response: 200 (1075 bytes) (rst-276:rem-880.0:used-120 ratelimit) at 1745029522.5849142
+2025-04-18 22:25:22 - DEBUG - Extracting image URLs for submission ID: 1k2krak
+2025-04-18 22:25:22 - DEBUG - Processing 1k2krak as regular post (or fallback from crosspost)
+2025-04-18 22:25:22 - DEBUG - Using direct image URL from main submission 1k2krak: https://i.redd.it/uoho8ciszove1.jpeg
+2025-04-18 22:25:22 - DEBUG - Processing media URL: https://i.redd.it/uoho8ciszove1.jpeg
+2025-04-18 22:25:22 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:22 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/uoho8ciszove1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\uoho8ciszove1.jpeg
+2025-04-18 22:25:22 - DEBUG - Processing media URL: https://i.redd.it/uoho8ciszove1.jpeg
+2025-04-18 22:25:22 - DEBUG - No specific handler found for domain 'i.redd.it'.
+2025-04-18 22:25:22 - DEBUG - Cache hit for FINAL processed URL 'https://i.redd.it/uoho8ciszove1.jpeg' at path: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\uoho8ciszove1.jpeg
+2025-04-18 22:25:22 - DEBUG - MediaDownloadWorker initialized for 1k2krak: original='https://i.redd.it/uoho8ciszove1.jpeg', processed='https://i.redd.it/uoho8ciszove1.jpeg'
+2025-04-18 22:25:22 - DEBUG - File already cached for submission 1k2krak: c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\uoho8ciszove1.jpeg
+2025-04-18 22:25:22 - DEBUG - Metadata for submission 1k2krak is up to date; no update needed.
+2025-04-18 22:25:22 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\9fspb3gx9pve1.jpg: image
+2025-04-18 22:25:22 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\xes8mshc9pve1.jpeg: image
+2025-04-18 22:25:22 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\05t5du1e8pve1.jpg: image
+2025-04-18 22:25:22 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\4bsq572c6pve1.jpeg: image
+2025-04-18 22:25:22 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\5ng7cck96pve1.jpg: image
+2025-04-18 22:25:23 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.imgur.com\50VmayO.jpg: image
+2025-04-18 22:25:23 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\comb34wz2pve1.jpeg: image
+2025-04-18 22:25:23 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\vr7mr0bz0pve1.jpeg: image
+2025-04-18 22:25:23 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\preview.redd.it\l6jekuua0pve1.jpg: image
+2025-04-18 22:25:23 - DEBUG - Media type for c:\Users\radia\Documents\projects\red-media-browser\src\cache\i.redd.it\uoho8ciszove1.jpeg: image
+2025-04-18 22:25:23 - DEBUG - https://oauth.reddit.com:443 "GET /r/wearemods/about/log/?type=removelink&limit=1000&raw_json=1 HTTP/1.1" 200 None
+2025-04-18 22:25:23 - DEBUG - Response: 200 (None bytes) (rst-277:rem-881.0:used-119 ratelimit) at 1745029523.266793
+2025-04-18 22:25:23 - DEBUG - Fetched 0 log entries for r/WeAreMods, stored 0 relevant entries.
+2025-04-18 22:25:23 - INFO - Finished fetching mod logs for 10 subreddits.
+2025-04-18 22:25:23 - INFO - Background mod log fetching complete.
+PS C:\Users\radia\Documents\projects\red-media-browser> 

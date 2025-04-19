@@ -1,0 +1,106 @@
+Red Media Browser Cache Overview
+================================
+
+This document describes the main cache mechanisms in the Red Media Browser, the functions that implement them, and the rationale for each. The goal is to help future developers understand how and why caching is used in the program.
+
+-------------------------------------------------------------------------------
+
+1. Media File Disk Cache
+------------------------
+
+**What:**  
+- All downloaded media files (images, videos, etc.) are stored on disk in the `src/cache/` directory, organized by domain and filename.
+- The cache path for each media file is deterministically derived from its URL, ensuring consistent cache hits and avoiding duplicates.
+
+**How:**  
+- The function `get_cache_path_for_url(url)` (in `utils.py`) maps a media URL to a unique file path in the cache.
+- The function `file_exists_in_cache(url)` checks if a media file is already cached, using a preloaded in-memory set for fast lookup.
+- The function `preload_file_cache()` scans the cache directory at startup and builds an in-memory set of all cached file paths for efficient existence checks.
+
+**Why:**  
+- Caching media files avoids redundant downloads, speeds up UI operations, and allows offline access to previously viewed content.
+- The in-memory set enables fast checks for cache hits without repeated disk access.
+
+-------------------------------------------------------------------------------
+
+2. Metadata Cache (Per-Post JSON)
+---------------------------------
+
+**What:**  
+- For each Reddit post, a metadata JSON file is stored in `src/cache/metadata/`, containing post details, cache paths, moderation status, report counts, and more.
+- A global index file (`submission_index.json`) maps post IDs to their metadata file paths for fast lookup.
+
+**How:**  
+- The function `update_metadata_cache(submission, media_cache_path, final_media_url)` writes or updates the metadata file for a post after downloading media or updating moderation status.
+- The function `get_metadata_file_path(submission_id)` generates the structured path for a post's metadata file.
+- The functions `load_submission_index()` and `save_submission_index()` manage the in-memory and on-disk index of all cached posts.
+
+**Why:**  
+- The metadata cache allows the app to quickly display post details, moderation status, and report info without repeated API calls.
+- It enables efficient UI updates and supports offline browsing of cached posts.
+
+-------------------------------------------------------------------------------
+
+3. In-Memory Caches
+-------------------
+
+**What:**  
+- The set of cached media file paths (`_file_cache_set`) and the metadata index (`_submission_index`) are kept in memory for fast access.
+- These are loaded at startup and updated as the cache changes.
+
+**How:**  
+- `preload_file_cache()` and `load_submission_index()` are called at startup to populate these in-memory structures.
+- All cache checks and lookups use these in-memory sets for speed.
+
+**Why:**  
+- In-memory caches drastically reduce disk I/O and make cache checks nearly instantaneous, improving app responsiveness.
+
+-------------------------------------------------------------------------------
+
+4. Mod Reports and Moderation Data
+----------------------------------
+
+**What:**  
+- For moderator users, the app fetches mod reports and modqueue data for all subreddits the user moderates.
+- Report counts and reasons are cached in the metadata files for each post.
+
+**How:**  
+- During snapshot fetches, the app batches mod report data and writes it to the metadata cache.
+- The function `get_submission_reports()` checks the cache first before making API calls.
+
+**Why:**  
+- Caching mod report data allows moderators to quickly review and act on reports without waiting for live API responses.
+- This is why all subs are fetched on program load for moderator users: to prefetch and cache moderation/report info for fast UI access.
+
+-------------------------------------------------------------------------------
+
+5. Cache Repair and Clearing
+----------------------------
+
+**What:**  
+- The app includes utilities to repair the cache (ensure every media file has metadata) and to clear the cache (delete all cached files and metadata).
+
+**How:**  
+- `repair_cache_index()` scans the cache and creates missing metadata/index entries.
+- `clear_metadata_cache()` and `clear_full_cache()` delete cached metadata and/or media files.
+
+**Why:**  
+- These utilities help maintain cache integrity and allow users to reset the cache if needed.
+
+-------------------------------------------------------------------------------
+
+Summary Table
+-------------
+
+| Cache Type         | Storage      | Main Functions                | Purpose/Why                                      |
+|--------------------|--------------|-------------------------------|--------------------------------------------------|
+| Media file cache   | Disk         | get_cache_path_for_url, file_exists_in_cache, preload_file_cache | Avoids redundant downloads, enables offline use  |
+| Metadata cache     | Disk         | update_metadata_cache, get_metadata_file_path, load/save_submission_index | Fast post info, moderation, offline browsing     |
+| In-memory sets     | RAM          | _file_cache_set, _submission_index | Fast cache checks, low latency UI                |
+| Mod report cache   | Disk/Memory  | get_submission_reports, update_metadata_cache | Fast moderator workflows, prefetches on load     |
+| Repair/Clear tools | Disk         | repair_cache_index, clear_metadata_cache, clear_full_cache | Maintains cache health, allows reset             |
+
+-------------------------------------------------------------------------------
+
+**If you add new cache mechanisms, document them here.**  
+For more details, see the relevant functions in `src/utils.py`, `src/reddit_api.py`, and `src/media_handlers.py`.

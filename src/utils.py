@@ -21,6 +21,101 @@ from praw.models import Redditor, Subreddit
 # Basic Logging Configuration
 logger = logging.getLogger(__name__)
 
+# --- File Cache Preload Globals ---
+_file_cache_set = None
+_file_cache_lock = threading.Lock()
+
+def preload_file_cache():
+    """
+    Recursively scan the media cache directory and build a set of all cached file paths (relative to cache dir).
+    Should be called once at program startup.
+    """
+    global _file_cache_set
+    cache_dir = get_cache_dir()
+    file_set = set()
+    for root, dirs, files in os.walk(cache_dir):
+        for fname in files:
+            # Exclude metadata and index files
+            if fname.endswith('.json') or fname == 'submission_index.json':
+                continue
+            # Store relative path from cache_dir for fast lookup
+            rel_path = os.path.relpath(os.path.join(root, fname), cache_dir)
+            file_set.add(rel_path.replace(os.sep, '/'))  # Use posix separators
+    with _file_cache_lock:
+        _file_cache_set = file_set
+    logger.info(f"Preloaded file cache with {len(_file_cache_set)} media files.")
+
+def repair_cache_index():
+    """
+    Scan all cached media files and ensure there is a metadata file and index entry for each.
+    If missing, create a minimal metadata file and update the index.
+    """
+    logger.info("Starting cache repair/index warming...")
+    cache_dir = get_cache_dir()
+    metadata_dir = get_metadata_dir()
+    index = load_submission_index()
+    repaired = 0
+
+    # Use the preloaded file cache set
+    global _file_cache_set
+    if _file_cache_set is None:
+        logger.warning("File cache not preloaded. Preloading now for repair.")
+        preload_file_cache()
+
+    # Build a reverse lookup: cache_path -> submission_id
+    logger.info("Building reverse lookup for existing metadata files...")
+    cache_path_to_id = {}
+    for sub_id, meta_rel in index.items():
+        meta_path = os.path.join(cache_dir, meta_rel.replace('/', os.sep))
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                    cpath = meta.get('cache_path')
+                    if cpath:
+                        cache_path_to_id[cpath] = sub_id
+            except Exception:
+                continue
+
+    for rel_path in _file_cache_set:
+        abs_path = os.path.join(cache_dir, rel_path)
+        if abs_path in cache_path_to_id:
+            continue  # Already indexed
+
+        # Not found, create a new metadata file and index entry
+        fname = os.path.basename(rel_path)
+        base_id = os.path.splitext(fname)[0]
+        submission_id = f"cachefile_{base_id}"
+        meta_path = get_metadata_file_path(submission_id)
+        minimal_metadata = {
+            "id": submission_id,
+            "cache_path": abs_path,
+            "media_url": None,
+            "title": f"Recovered cached file {fname}",
+            "last_checked_utc": time.time(),
+        }
+        if write_metadata_file(meta_path, minimal_metadata):
+            rel_meta_path = os.path.relpath(meta_path, cache_dir).replace(os.sep, '/')
+            index[submission_id] = rel_meta_path
+            repaired += 1
+
+    if repaired > 0:
+        save_submission_index()
+        logger.info(f"Cache repair complete. Added {repaired} missing metadata/index entries.")
+    else:
+        logger.info("Cache repair complete. No missing entries found.")
+
+def file_in_cache_preloaded(rel_path):
+    """
+    Check if a file (relative to cache dir, posix style) is in the preloaded file cache set.
+    """
+    global _file_cache_set
+    if _file_cache_set is None:
+        logger.warning("File cache set not preloaded. Call preload_file_cache() first.")
+        return False
+    with _file_cache_lock:
+        return rel_path in _file_cache_set
+
 # --- Metadata Cache Globals ---
 _submission_index = None
 _index_lock = threading.Lock()
@@ -247,14 +342,35 @@ def get_media_type(file_path):
     return "unknown"
 
 def file_exists_in_cache(url):
-    """Check if a file exists in the cache based on its URL."""
+    """Check if a file exists in the cache based on its URL, using preloaded file cache if available."""
     cache_path = get_cache_path_for_url(url)
-    return os.path.exists(cache_path) if cache_path else False
+    if not cache_path:
+        logger.debug(f"file_exists_in_cache: No cache path for URL: {url}")
+        return False
+    cache_dir = get_cache_dir()
+    rel_path = os.path.relpath(cache_path, cache_dir).replace(os.sep, '/')
+    # Prefer preloaded set if available
+    global _file_cache_set
+    if _file_cache_set is not None:
+        in_cache = file_in_cache_preloaded(rel_path)
+        if in_cache:
+            logger.debug(f"file_exists_in_cache: Cache HIT for {rel_path}")
+        else:
+            logger.debug(f"file_exists_in_cache: Cache MISS for {rel_path}")
+        return in_cache
+    # Fallback to disk check
+    exists = os.path.exists(cache_path)
+    if exists:
+        logger.debug(f"file_exists_in_cache: Disk HIT for {cache_path}")
+    else:
+        logger.debug(f"file_exists_in_cache: Disk MISS for {cache_path}")
+    return exists
 
 def get_cache_path_for_url(url):
     """
     Get the cache file path for a URL.
     Handles special cases for RedGifs and ensures a safe, unique filename.
+    Strips query parameters for image/video URLs to ensure consistent cache hits.
     """
     try:
         parsed_url = urlparse(url)
@@ -262,9 +378,17 @@ def get_cache_path_for_url(url):
         if not domain:
             return None
 
-        domain_dir = get_domain_cache_dir(domain)
+        # Strip query parameters for image/video URLs
         path = unquote(parsed_url.path)
         filename = os.path.basename(path)
+        # If the URL has a query string and looks like an image/video, ignore the query for cache path
+        if parsed_url.query and any(filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.webm']):
+            url_no_query = url.split('?', 1)[0]
+            parsed_url = urlparse(url_no_query)
+            path = unquote(parsed_url.path)
+            filename = os.path.basename(path)
+
+        domain_dir = get_domain_cache_dir(domain)
 
         # Special handling for RedGifs domains
         if "redgifs.com" in domain:
@@ -510,7 +634,8 @@ def _filter_submission_data(submission):
 def update_metadata_cache(submission, media_cache_path, final_media_url):
     """
     Updates the metadata cache for a given submission.
-    Writes the filtered submission data to its JSON file and updates the index.
+    Writes the filtered submission data to its JSON file and updates the index,
+    but only if the metadata is missing or has changed.
     """
     if not submission or not hasattr(submission, 'id'):
         logger.error("Invalid submission object provided to update_metadata_cache.")
@@ -536,42 +661,42 @@ def update_metadata_cache(submission, media_cache_path, final_media_url):
         if getattr(submission, 'approved', False):
             initial_mod_status = "approved"
         elif getattr(submission, 'removed', False) or getattr(submission, 'banned_by', None) is not None:
-            # Check 'removed' or if 'banned_by' is set (indicating removal)
             initial_mod_status = "removed"
-        # Add more checks if needed, e.g., spam status
-        # elif getattr(submission, 'spam', False):
-        #     initial_mod_status = "spam" # Or maybe just "removed"?
     except Exception as e:
         logger.warning(f"Could not determine initial mod status for {submission_id}: {e}")
 
-    # Only add moderation_status if it's determined (approved/removed)
-    # Otherwise, leave it out or set to None, indicating neutral/unknown initial state
     if initial_mod_status:
          metadata['moderation_status'] = initial_mod_status
     elif 'moderation_status' in metadata:
-         # Ensure we don't carry over an old status if the new check is neutral
          del metadata['moderation_status']
 
+    # Check if metadata file exists and is unchanged
+    needs_update = True
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+            # Only update if something important has changed
+            compare_keys = ['cache_path', 'media_url', 'id']
+            if all(existing.get(k) == metadata.get(k) for k in compare_keys):
+                needs_update = False
+        except Exception:
+            needs_update = True
 
-    # Write the individual metadata file
-    if not write_metadata_file(metadata_path, metadata):
-        logger.error(f"Failed to write metadata file for submission {submission_id}.")
-        return False # Stop if writing the main data fails
+    if needs_update:
+        if not write_metadata_file(metadata_path, metadata):
+            logger.error(f"Failed to write metadata file for submission {submission_id}.")
+            return False
 
-    # Update the index
-    index = load_submission_index() # Load current index (might be cached)
-    # Store relative path from cache_dir for portability
-    relative_metadata_path = os.path.relpath(metadata_path, get_cache_dir())
-    
-    # Use posix path separators for consistency across OS
-    relative_metadata_path = relative_metadata_path.replace(os.sep, '/') 
-    
-    index[submission_id] = relative_metadata_path
-    # No need to set _submission_index globally here, save_submission_index reads it
-
-    # Save the updated index
-    save_submission_index()
-    logger.debug(f"Updated metadata cache and index for submission {submission_id}")
+        # Update the index
+        index = load_submission_index() # Load current index (might be cached)
+        relative_metadata_path = os.path.relpath(metadata_path, get_cache_dir())
+        relative_metadata_path = relative_metadata_path.replace(os.sep, '/')
+        index[submission_id] = relative_metadata_path
+        save_submission_index()
+        logger.debug(f"Updated metadata cache and index for submission {submission_id}")
+    else:
+        logger.debug(f"Metadata for submission {submission_id} is up to date; no update needed.")
     return True
 
 def clear_metadata_cache():

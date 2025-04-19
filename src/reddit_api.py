@@ -20,7 +20,7 @@ from praw.models import Submission
 # Import caching utilities
 from utils import (
     load_submission_index, get_metadata_file_path, read_metadata_file,
-    write_metadata_file, get_cache_dir, update_metadata_cache
+    write_metadata_file, get_cache_dir, update_metadata_cache, file_exists_in_cache
 )
 
 # Set up logging
@@ -340,6 +340,47 @@ class RedditGalleryModel:
             # The initial_listing now contains PRAW objects, sorted by time.
             # No need to collect IDs and re-fetch with reddit.info() again.
             logger.debug(f"Processing {len(initial_listing)} merged submissions against cache...")
+
+            # --- Efficiency Improvement: Batch cache report data for moderator ---
+            if self.is_moderator:
+                for submission_obj in initial_listing:
+                    if not isinstance(submission_obj, Submission) or not hasattr(submission_obj, 'id'):
+                        continue
+                    submission_id = submission_obj.id
+                    metadata_path = get_metadata_file_path(submission_id)
+                    if metadata_path:
+                        try:
+                            mod_reports = getattr(submission_obj, 'mod_reports', [])
+                            user_reports = getattr(submission_obj, 'user_reports', [])
+                            formatted_reports = []
+                            for reason, moderator in mod_reports:
+                                formatted_reports.append(f"Moderator {moderator}: {reason}")
+                            user_report_count = 0
+                            for report_item in user_reports:
+                                try:
+                                    if isinstance(report_item, (list, tuple)) and len(report_item) >= 2:
+                                        reason, count = report_item[0], report_item[1]
+                                        if isinstance(count, int):
+                                            user_report_count += count
+                                            formatted_reports.append(f"Users ({count}): {reason}" if count > 1 else f"User: {reason}")
+                                        else:
+                                            user_report_count += 1
+                                            formatted_reports.append(f"User: {reason} ({count})")
+                                    else:
+                                        user_report_count += 1
+                                        formatted_reports.append(f"Report: {report_item}")
+                                except Exception as item_e:
+                                    user_report_count += 1
+                                    formatted_reports.append("Unprocessable report")
+                            total_reports = len(mod_reports) + user_report_count
+                            metadata = read_metadata_file(metadata_path) or {'id': submission_id}
+                            metadata['report_count'] = total_reports
+                            metadata['report_reasons'] = formatted_reports
+                            metadata['last_checked_utc'] = time.time()
+                            write_metadata_file(metadata_path, metadata)
+                        except Exception as e:
+                            logger.error(f"Error batch-caching reports for {submission_id}: {e}")
+
             for submission_obj in initial_listing: # Iterate directly through the PRAW objects
                 # Ensure it's a valid object with an ID
                 if not isinstance(submission_obj, Submission) or not hasattr(submission_obj, 'id'):
@@ -357,7 +398,8 @@ class RedditGalleryModel:
                         cached_data = read_metadata_file(abs_metadata_path)
                         if cached_data:
                             media_cache_path = cached_data.get('cache_path')
-                            if media_cache_path and os.path.exists(media_cache_path):
+                            # Use file_exists_in_cache for media file check
+                            if media_cache_path and file_exists_in_cache(media_cache_path):
                                 logger.debug(f"Cache HIT for {submission_id}.")
                                 cached_obj = SimpleNamespace(**cached_data)
                                 snapshot_results.append(cached_obj)

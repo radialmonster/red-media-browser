@@ -992,6 +992,11 @@ if __name__ == "__main__":
     cache_dir = get_cache_dir()
     logger.info(f"Using cache directory: {cache_dir}")
 
+    # Preload file cache for fast existence checks
+    from utils import preload_file_cache, repair_cache_index
+    preload_file_cache()
+    repair_cache_index()
+
     # Start the PyQt application
     app = QApplication(sys.argv)
     app.setApplicationName("Red Media Browser")

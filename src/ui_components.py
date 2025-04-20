@@ -43,6 +43,9 @@ class ClickableLabel(QLabel):
         self.clicked.emit()
         super().mousePressEvent(event)
 
+# (ClickableVLCWidget removed; use standard QWidget for VLC video area)
+
+
 class FullScreenViewer(QDialog):
     """
     Dialog for displaying media full-screen.
@@ -100,7 +103,7 @@ class FullScreenViewer(QDialog):
         abs_video_path = os.path.abspath(self.video_path)
         logger.debug(f"Setting up fullscreen video player for: {abs_video_path}")
 
-        instance_args = ['--loop', '--no-video-title-show', '--repeat']
+        instance_args = ['--no-video-title-show', '--quiet']
         self.vlc_instance = vlc.Instance(*instance_args)
         self.vlc_player = self.vlc_instance.media_player_new()
 
@@ -119,7 +122,10 @@ class FullScreenViewer(QDialog):
         media.add_option(':file-caching=3000')
 
         self.vlc_player.set_media(media)
-        self.vlc_player.play()
+
+        # Delay play to allow window to show and avoid blocking UI
+        QTimer.singleShot(100, self.vlc_player.play)
+
         self.vlc_player.audio_set_mute(True)
 
         self.playback_check_timer = QTimer(self)
@@ -255,6 +261,8 @@ class ReportsDialog(QDialog):
         self.close_button = QPushButton("Close")
         self.close_button.clicked.connect(self.accept)
         layout.addWidget(self.close_button)
+
+from PyQt6.QtCore import QEvent
 
 class ThumbnailWidget(QWidget):
     """
@@ -1023,10 +1031,16 @@ class ThumbnailWidget(QWidget):
             self.vlc_widget = QWidget(self)
             self.vlc_widget.setStyleSheet("background-color: black;")
             self.layout.insertWidget(2, self.vlc_widget)
-            
+
             # Ensure the widget has the same size policy as the image label
             self.vlc_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            
+
+            # Set mousePressEvent directly to open_fullscreen_view (like GIFs)
+            def vlc_mouse_press_event(event):
+                self.open_fullscreen_view()
+                event.accept()
+            self.vlc_widget.mousePressEvent = vlc_mouse_press_event
+
             # Set the window for rendering
             if sys.platform.startswith('win'):
                 self.vlc_player.set_hwnd(int(self.vlc_widget.winId()))
@@ -1168,6 +1182,7 @@ class ThumbnailWidget(QWidget):
         except Exception as e:
             logger.exception(f"Error during cleanup_current_media: {e}")
     
+
     def open_post_url(self):
         """Open the Reddit post URL in the default web browser."""
         full_url = "https://www.reddit.com" + self.post_url if self.post_url.startswith("/") else self.post_url
@@ -1189,6 +1204,9 @@ class ThumbnailWidget(QWidget):
             # For videos, pass the video path
             logger.debug("Opening fullscreen video player")
             viewer = FullScreenViewer(video_path=self.current_video_path)
+            # Start playing video in fullscreen
+            if viewer.vlc_player:
+                viewer.vlc_player.play()
         elif hasattr(self, 'gifDisplay') and self.gifDisplay is not None and self.gifDisplay.movie is not None:
             # For GIFs in our custom display, create a new QMovie for fullscreen
             logger.debug("Opening fullscreen GIF viewer from AnimatedGifDisplay")
@@ -1196,6 +1214,7 @@ class ThumbnailWidget(QWidget):
                 fullscreen_movie = QMovie(self.gif_file_path)
                 fullscreen_movie.setCacheMode(QMovie.CacheMode.CacheAll)
                 viewer = FullScreenViewer(movie=fullscreen_movie)
+                fullscreen_movie.start()
             else:
                 logger.error("Cannot open fullscreen GIF - no file path")
                 self.is_fullscreen_open = False
@@ -1204,6 +1223,7 @@ class ThumbnailWidget(QWidget):
             # For GIFs using standard player, pass the movie
             logger.debug("Opening fullscreen GIF viewer")
             viewer = FullScreenViewer(movie=self.movie)
+            self.movie.start()
         elif self.pixmap and not self.pixmap.isNull():
             # For static images, pass the pixmap
             logger.debug("Opening fullscreen image viewer")
@@ -1223,22 +1243,33 @@ class ThumbnailWidget(QWidget):
         self.is_fullscreen_open = False
         self.fullscreen_viewer = None
     
+    def stop_all_media(self):
+        """
+        Stop all playing media (videos, GIFs, fullscreen) and clean up resources.
+        This should be called before any user action that could conflict with media playback.
+        """
+        logger.debug(f"Stopping all media for submission {self.submission_id}")
+        # Stop embedded/inline media
+        self.cleanup_current_media()
+        # Stop fullscreen viewer if open
+        if getattr(self, 'is_fullscreen_open', False) and getattr(self, 'fullscreen_viewer', None):
+            try:
+                logger.debug("Closing fullscreen viewer as part of media stop.")
+                self.fullscreen_viewer.close()
+            except Exception as e:
+                logger.error(f"Error closing fullscreen viewer: {e}")
+
     def approve_submission(self): # Line 1195
         """Approve the current submission (moderator action)."""
+        self.stop_all_media()
         # Pass the stored reddit_instance to the API function
         if reddit_api.approve_submission(self.praw_submission, self.reddit_instance):
             self.update_moderation_status_ui()
 
     def remove_submission(self): # Line 1201 - Corrected indentation
         """Remove the current submission (moderator action)."""
-        # Stop playback and cleanup media *before* blocking API call
-        logger.debug(f"Remove clicked for {self.submission_id}. Cleaning up media first.")
-        if hasattr(self, 'playback_monitor') and self.playback_monitor:
-            self.playback_monitor.stop()
-            logger.debug("Stopped playback monitor.")
-        self.cleanup_current_media()
-        logger.debug("Media cleanup complete.")
-        
+        self.stop_all_media()
+        logger.debug(f"Remove clicked for {self.submission_id}. Media stopped and cleaned up.")
         # Now attempt the removal
         # Pass the stored reddit_instance to the API function
         if reddit_api.remove_submission(self.praw_submission, self.reddit_instance):
@@ -1246,11 +1277,12 @@ class ThumbnailWidget(QWidget):
     
     def close(self): # Line 1214 - Corrected indentation
         """Clean up resources when the widget is closed."""
-        self.cleanup_current_media()
+        self.stop_all_media()
         super().close()
     
     def show_previous_image(self): # Line 1219 - Corrected indentation
         """Show the previous image in a gallery post."""
+        self.stop_all_media()
         if not self.has_multiple_images or len(self.images) <= 1:
             return
             
@@ -1266,6 +1298,7 @@ class ThumbnailWidget(QWidget):
         
     def show_next_image(self): # Line 1234 - Corrected indentation
         """Show the next image in a gallery post."""
+        self.stop_all_media()
         if not self.has_multiple_images or len(self.images) <= 1:
             return
             

@@ -27,7 +27,9 @@ from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie, QIcon
 # Import caching utilities needed for moderation status
 from utils import get_media_type, get_metadata_file_path, read_metadata_file
 from media_handlers import process_media_url, MediaDownloadWorker
+# Import specific API functions and workers
 import reddit_api
+from reddit_api import ApproveWorker, RemoveWorker, get_submission_reports
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -46,10 +48,162 @@ class ClickableLabel(QLabel):
 # (ClickableVLCWidget removed; use standard QWidget for VLC video area)
 
 
+class SimpleVideoFullscreenViewer(QWidget):
+    """
+    A simplified fullscreen video viewer with a visible close button.
+    This class is specifically for video playback only.
+    """
+    closed = pyqtSignal()
+
+    def __init__(self, video_path, parent=None):
+        super().__init__(parent)
+        self.video_path = video_path
+        self.vlc_instance = None
+        self.vlc_player = None
+        self.is_closing = False
+
+        # Set window properties for fullscreen
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet("background-color: black;")
+        self.setWindowTitle("Video Fullscreen")
+
+        # Create a large, visible close button
+        self.close_button = QPushButton("×", self)
+        self.close_button.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255, 0, 0, 0.7);
+                color: white;
+                font-size: 24pt;
+                font-weight: bold;
+                border-radius: 20px;
+                min-width: 40px;
+                min-height: 40px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 0, 0, 0.9);
+            }
+        """)
+        self.close_button.clicked.connect(self.safe_close)
+        
+        # Position the close button in the top-right corner
+        self.close_button.move(20, 20)
+        self.close_button.raise_()  # Ensure it's on top
+
+        # Set up the video player
+        self.setup_video_player()
+
+    def setup_video_player(self):
+        """Set up a simple VLC video player for fullscreen playback."""
+        if not self.video_path:
+            self.safe_close()
+            return
+
+        try:
+            abs_video_path = os.path.abspath(self.video_path)
+            logger.debug(f"Setting up simple fullscreen video player for: {abs_video_path}")
+
+            # Create VLC instance with minimal arguments
+            instance_args = ['--no-video-title-show', '--quiet', '--loop']
+            self.vlc_instance = vlc.Instance(*instance_args)
+            self.vlc_player = self.vlc_instance.media_player_new()
+
+            # Set the window for rendering
+            if sys.platform.startswith('win'):
+                self.vlc_player.set_hwnd(int(self.winId()))
+            elif sys.platform.startswith('linux'):
+                self.vlc_player.set_xwindow(int(self.winId()))
+            elif sys.platform.startswith('darwin'):
+                self.vlc_player.set_nsobject(int(self.winId()))
+                
+            # Set fullscreen mode directly
+            self.vlc_player.set_fullscreen(True)
+
+            # Create and set media
+            media = self.vlc_instance.media_new_path(abs_video_path)
+            media.add_option('input-repeat=-1')  # Loop indefinitely
+            media.add_option(':repeat')
+            media.add_option(':loop')
+            self.vlc_player.set_media(media)
+
+            # Mute audio
+            self.vlc_player.audio_set_mute(True)
+
+            # Start playback immediately
+            play_result = self.vlc_player.play()
+            logger.debug(f"Started fullscreen video playback: {play_result}")
+            
+            # Set up a timer to check playback status
+            self.playback_timer = QTimer(self)
+            self.playback_timer.timeout.connect(self.check_playback)
+            self.playback_timer.start(500)  # Check more frequently
+            
+        except Exception as e:
+            logger.exception(f"Error setting up simple fullscreen video: {e}")
+            self.safe_close()
+
+    def check_playback(self):
+        """Check if playback has ended and restart if needed."""
+        if not self.vlc_player or self.is_closing:
+            return
+
+        try:
+            state = self.vlc_player.get_state()
+            if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
+                logger.debug(f"Simple fullscreen video state: {state}, restarting...")
+                self.vlc_player.stop()
+                self.vlc_player.play()
+        except Exception as e:
+            logger.error(f"Error checking playback: {e}")
+
+    def safe_close(self):
+        """Safely close the viewer, stopping playback first."""
+        if self.is_closing:
+            return
+            
+        self.is_closing = True
+        logger.debug("Safe close initiated for simple fullscreen video")
+        
+        # Stop the playback timer
+        if hasattr(self, 'playback_timer') and self.playback_timer:
+            self.playback_timer.stop()
+        
+        # Stop and release VLC resources
+        try:
+            if hasattr(self, 'vlc_player') and self.vlc_player:
+                self.vlc_player.stop()
+                self.vlc_player.release()
+                self.vlc_player = None
+                
+            if hasattr(self, 'vlc_instance') and self.vlc_instance:
+                self.vlc_instance.release()
+                self.vlc_instance = None
+        except Exception as e:
+            logger.error(f"Error releasing VLC resources: {e}")
+        
+        # Emit closed signal and close the widget
+        self.closed.emit()
+        self.close()
+        
+    def keyPressEvent(self, event):
+        """Handle key press events."""
+        if event.key() == Qt.Key.Key_Escape:
+            self.safe_close()
+        else:
+            super().keyPressEvent(event)
+            
+    def mousePressEvent(self, event):
+        """Handle mouse press events."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Only close if not clicking the close button (to avoid double close)
+            if not self.close_button.geometry().contains(event.pos()):
+                self.safe_close()
+        super().mousePressEvent(event)
+
 class FullScreenViewer(QDialog):
     """
     Dialog for displaying media full-screen.
-    Supports static images, animated content (videos/GIFs).
+    Supports static images and animated content (GIFs).
+    Videos are handled by SimpleVideoFullscreenViewer.
     """
     closed = pyqtSignal()
 
@@ -58,10 +212,16 @@ class FullScreenViewer(QDialog):
         self.pixmap = pixmap
         self.movie = movie
         self.video_path = video_path
-        self.vlc_instance = None
-        self.vlc_player = None
-
-        # Set window properties
+        
+        # For videos, use the simplified viewer instead
+        if self.video_path:
+            self.video_viewer = SimpleVideoFullscreenViewer(self.video_path, parent)
+            self.video_viewer.closed.connect(self.on_video_viewer_closed)
+            self.video_viewer.showFullScreen()
+            # Don't continue with this dialog for videos
+            return
+            
+        # Set window properties for images/GIFs
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setStyleSheet("background-color: black;")
         self.setWindowTitle("Full Screen View")
@@ -75,10 +235,8 @@ class FullScreenViewer(QDialog):
         self.content_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.content_label)
 
-        # Set up the appropriate media
-        if self.video_path:
-            self.setup_video_player()
-        elif self.movie:
+        # Set up the appropriate media (non-video)
+        if self.movie:
             self.content_label.setMovie(self.movie)
             self.movie.start()
             # Set movie to loop continuously
@@ -95,54 +253,10 @@ class FullScreenViewer(QDialog):
             )
             self.content_label.setPixmap(scaled_pixmap)
 
-    def setup_video_player(self):
-        """Set up the VLC video player for fullscreen playback."""
-        if not self.video_path:
-            return
-
-        abs_video_path = os.path.abspath(self.video_path)
-        logger.debug(f"Setting up fullscreen video player for: {abs_video_path}")
-
-        instance_args = ['--no-video-title-show', '--quiet']
-        self.vlc_instance = vlc.Instance(*instance_args)
-        self.vlc_player = self.vlc_instance.media_player_new()
-
-        # Set VLC output window
-        if sys.platform.startswith('win'):
-            self.vlc_player.set_hwnd(int(self.winId()))
-        elif sys.platform.startswith('linux'):
-            self.vlc_player.set_xwindow(int(self.winId()))
-        elif sys.platform.startswith('darwin'):
-            self.vlc_player.set_nsobject(int(self.winId()))
-
-        media = self.vlc_instance.media_new_path(abs_video_path)
-        media.add_option('input-repeat=-1')
-        media.add_option(':repeat')
-        media.add_option(':loop')
-        media.add_option(':file-caching=3000')
-
-        self.vlc_player.set_media(media)
-
-        # Delay play to allow window to show and avoid blocking UI
-        QTimer.singleShot(100, self.vlc_player.play)
-
-        self.vlc_player.audio_set_mute(True)
-
-        self.playback_check_timer = QTimer(self)
-        self.playback_check_timer.timeout.connect(self.check_fullscreen_playback)
-        self.playback_check_timer.start(1000)
-
-    def check_fullscreen_playback(self):
-        """Restart video if playback ended or errored."""
-        if not self.vlc_player:
-            return
-
-        state = self.vlc_player.get_state()
-        if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
-            logger.debug(f"Fullscreen video state: {state}, restarting playback")
-            self.vlc_player.stop()
-            self.vlc_player.play()
-
+    def on_video_viewer_closed(self):
+        """Handle the video viewer being closed."""
+        self.closed.emit()
+        
     def check_movie_restart(self):
         """Restart animated GIF if finished."""
         if self.movie and self.movie.state() == QMovie.MovieState.NotRunning:
@@ -157,19 +271,12 @@ class FullScreenViewer(QDialog):
 
     def mousePressEvent(self, event):
         """Close on any mouse click."""
-        self.close()
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.close()
         super().mousePressEvent(event)
 
     def closeEvent(self, event):
         """Cleanup when the dialog is closed."""
-        if hasattr(self, 'playback_check_timer') and self.playback_check_timer:
-            self.playback_check_timer.stop()
-
-        if self.vlc_player:
-            self.vlc_player.stop()
-            self.vlc_player.release()
-        if self.vlc_instance:
-            self.vlc_instance.release()
         self.closed.emit()
         super().closeEvent(event)
 
@@ -279,7 +386,7 @@ class ThumbnailWidget(QWidget):
     mediaReady = pyqtSignal()
 
     def __init__(self, images, title, source_url, submission,
-                 subreddit_name, has_multiple_images, post_url, is_moderator, reddit_instance):
+                 subreddit_name, has_multiple_images, post_url, is_moderator, reddit_instance, vlc_path=None):
         """
         Initialize ThumbnailWidget for a Reddit post.
 
@@ -318,6 +425,7 @@ class ThumbnailWidget(QWidget):
         self.is_fullscreen_open = False
         self.fullscreen_viewer = None
         self.original_title = title
+        self.mod_worker = None # To hold reference to active moderation worker
 
         # Reports data
         self.reports_count = 0
@@ -364,6 +472,7 @@ class ThumbnailWidget(QWidget):
 
         # Fetch reports if moderator and not removed/deleted
         if self.is_moderator and not is_removed_or_deleted:
+            # Use the imported function directly
             self.fetch_reports()
 
     def init_ui(self):
@@ -382,8 +491,12 @@ class ThumbnailWidget(QWidget):
 
         title_container = QWidget()
         title_container.setFixedHeight(40)
-        title_layout = QVBoxLayout(title_container)
+        title_layout = QHBoxLayout(title_container)
         title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(8)
+        self.titleLabel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        # Restore title to full width
+        # (Removed setMaximumWidth and playTitleLabel)
         title_layout.addWidget(self.titleLabel)
         self.layout.addWidget(title_container)
 
@@ -424,7 +537,8 @@ class ThumbnailWidget(QWidget):
         self.infoLayout.addWidget(self.subredditLabel)
         self.infoLayout.addSpacing(10)
 
-        self.postUrlLabel = QLabel(self.source_url)
+        # Make the filename clickable for .mp4 files
+        self.postUrlLabel = ClickableLabel(self.source_url)
         self.postUrlLabel.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.postUrlLabel.setFixedHeight(20)
         self.infoLayout.addWidget(self.postUrlLabel)
@@ -600,10 +714,13 @@ class ThumbnailWidget(QWidget):
     
     def fetch_reports(self):
         """Fetch reports for the current submission using the dedicated API function."""
+        # Ensure we have the necessary data and instance
+        if not self.praw_submission or not self.reddit_instance:
+            logger.warning(f"Cannot fetch reports for {self.submission_id}: Missing submission data or Reddit instance.")
+            return
         try:
-            # Directly call the API function which handles caching and fetching
-            # Pass the stored reddit_instance
-            report_count, report_reasons = reddit_api.get_submission_reports(self.praw_submission, self.reddit_instance)
+            # Use the imported function directly
+            report_count, report_reasons = get_submission_reports(self.praw_submission, self.reddit_instance)
             self.reports_count = report_count
             self.report_reasons = report_reasons
 
@@ -769,6 +886,20 @@ class ThumbnailWidget(QWidget):
             filename = os.path.basename(file_path)
             display_path = f"{domain}/{filename}"
             self.postUrlLabel.setText(display_path)
+
+            # Make the filename clickable for .mp4 files
+            if hasattr(self, 'postUrlLabel'):
+                try:
+                    self.postUrlLabel.clicked.disconnect()
+                except Exception:
+                    pass
+                if media_type == "video":
+                    self.postUrlLabel.setStyleSheet("color: #4CAF50; text-decoration: underline; cursor: pointer;")
+                    self.postUrlLabel.setToolTip("Open video fullscreen")
+                    self.postUrlLabel.clicked.connect(self.open_fullscreen_view)
+                else:
+                    self.postUrlLabel.setStyleSheet("")
+                    self.postUrlLabel.setToolTip("")
             
             if media_type == "video":
                 # For RedGifs videos, make sure file is fully downloaded before playing
@@ -851,8 +982,10 @@ class ThumbnailWidget(QWidget):
                     self.update_pixmap()
                 else:
                     self.imageLabel.setText("Image not available")
+                    if hasattr(self, 'playTitleLabel'): self.playTitleLabel.hide() # Hide play label
             else:
                 self.imageLabel.setText("Media not available")
+                if hasattr(self, 'playTitleLabel'): self.playTitleLabel.hide() # Hide play label
             
             # Signal that media is ready
             self.is_media_loaded = True
@@ -1005,6 +1138,8 @@ class ThumbnailWidget(QWidget):
         self.current_video_path = abs_video_path
         logger.debug(f"VLC: Playing video from file: {abs_video_path}")
         
+        # Show the play label for fullscreen even when video is playing inline
+        # Remove playTitleLabel logic from play_video
         # Don't try to play non-existent or empty files
         if not os.path.exists(abs_video_path) or os.path.getsize(abs_video_path) == 0:
             logger.error(f"VLC: Video file does not exist or is empty: {abs_video_path}")
@@ -1035,11 +1170,7 @@ class ThumbnailWidget(QWidget):
             # Ensure the widget has the same size policy as the image label
             self.vlc_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-            # Set mousePressEvent directly to open_fullscreen_view (like GIFs)
-            def vlc_mouse_press_event(event):
-                self.open_fullscreen_view()
-                event.accept()
-            self.vlc_widget.mousePressEvent = vlc_mouse_press_event
+            # --- Removed overlay play button code ---
 
             # Set the window for rendering
             if sys.platform.startswith('win'):
@@ -1137,28 +1268,54 @@ class ThumbnailWidget(QWidget):
             return
             
         try:
-            # Stop the playback monitor if active
+            # Stop the playback monitor immediately if active
             if hasattr(self, 'playback_monitor') and self.playback_monitor:
                 self.playback_monitor.stop()
-            
-            # Stop any playing video
+                # Optional: Delete the timer attribute immediately after stopping
+                # delattr(self, 'playback_monitor')
+
+            # Stop and release any playing video immediately
             if hasattr(self, 'vlc_player') and self.vlc_player:
+                logger.debug(f"Cleanup: Stopping VLC player for {self.submission_id}")
                 try:
-                    self.vlc_player.stop()
+                    # Stop playback forcefully
+                    if self.vlc_player.is_playing():
+                        self.vlc_player.stop()
+
+                    # Release player and instance
                     self.vlc_player.release()
-                    self.vlc_instance.release()
-                    
+                    if hasattr(self, 'vlc_instance') and self.vlc_instance:
+                         self.vlc_instance.release()
+
+                    # Immediately remove the VLC widget if it exists
                     if hasattr(self, 'vlc_widget'):
-                        self.vlc_widget.setParent(None)  # Properly detach from parent
-                        self.vlc_widget.deleteLater()
-                        
-                    delattr(self, 'vlc_player')
-                    delattr(self, 'vlc_instance')
-                    if hasattr(self, 'vlc_widget'):
+                        self.vlc_widget.setParent(None)
+                        self.vlc_widget.deleteLater() # Still use deleteLater for the widget itself
+                        # Delete attributes immediately after release/detach
                         delattr(self, 'vlc_widget')
+
+                    # Delete attributes immediately after release
+                    self.vlc_player = None
+                    if hasattr(self, 'vlc_instance'):
+                         self.vlc_instance = None
+                         delattr(self, 'vlc_instance') # Keep delattr for instance too
+                    delattr(self, 'vlc_player') # Keep delattr for player
+                    logger.debug(f"Cleanup: VLC resources released and attributes cleared for {self.submission_id}")
                 except Exception as e:
-                    logger.exception(f"Error during VLC cleanup: {e}")
-            
+                    logger.exception(f"Error during VLC cleanup for {self.submission_id}: {e}")
+                    # Ensure attributes are cleared even if release fails
+                    self.vlc_player = None
+                    if hasattr(self, 'vlc_instance'):
+                         self.vlc_instance = None
+                         try: delattr(self, 'vlc_instance')
+                         except AttributeError: pass
+                    try: delattr(self, 'vlc_player')
+                    except AttributeError: pass
+                    if hasattr(self, 'vlc_widget'):
+                         try: delattr(self, 'vlc_widget')
+                         except AttributeError: pass
+
+
             # Clean up the AnimatedGifDisplay
             if hasattr(self, 'gifDisplay') and self.gifDisplay is not None:
                 try:
@@ -1176,6 +1333,7 @@ class ThumbnailWidget(QWidget):
             if hasattr(self, 'imageLabel'):
                 self.imageLabel.clear()
                 self.imageLabel.show()  # Make sure it's visible
+            # Remove playTitleLabel logic from cleanup_current_media
         except RuntimeError as e:
             # Widget was deleted during cleanup
             logger.debug(f"Widget was deleted during cleanup_current_media: {e}")
@@ -1200,13 +1358,18 @@ class ThumbnailWidget(QWidget):
         self.is_fullscreen_open = True
         
         # Determine what type of media we have
-        if hasattr(self, 'vlc_player') and self.vlc_player:
-            # For videos, pass the video path
-            logger.debug("Opening fullscreen video player")
-            viewer = FullScreenViewer(video_path=self.current_video_path)
-            # Start playing video in fullscreen
-            if viewer.vlc_player:
-                viewer.vlc_player.play()
+        if hasattr(self, 'vlc_player') and self.vlc_player or (hasattr(self, 'current_video_path') and self.current_video_path and self.current_video_path.lower().endswith('.mp4')):
+            # For videos, use the system VLC player
+            if hasattr(self, 'current_video_path') and self.current_video_path:
+                logger.debug(f"Opening system VLC player for: {self.current_video_path}")
+                self.launch_system_vlc(self.current_video_path)
+                # No need for a viewer reference since we're using the system VLC
+                QTimer.singleShot(500, self.on_fullscreen_closed)
+                return
+            else:
+                logger.error("No video path available")
+                self.is_fullscreen_open = False
+                return
         elif hasattr(self, 'gifDisplay') and self.gifDisplay is not None and self.gifDisplay.movie is not None:
             # For GIFs in our custom display, create a new QMovie for fullscreen
             logger.debug("Opening fullscreen GIF viewer from AnimatedGifDisplay")
@@ -1233,10 +1396,74 @@ class ThumbnailWidget(QWidget):
             self.is_fullscreen_open = False
             return
         
-        # Keep a reference and show
-        self.fullscreen_viewer = viewer
-        viewer.closed.connect(self.on_fullscreen_closed)
-        viewer.showFullScreen()
+        # For non-video media, keep a reference and show
+        if 'viewer' in locals():
+            self.fullscreen_viewer = viewer
+            viewer.closed.connect(self.on_fullscreen_closed)
+            viewer.showFullScreen()
+    
+    def launch_system_vlc(self, video_path):
+        """Launch the system VLC player with the video file."""
+        import subprocess
+        import shlex
+        
+        abs_path = os.path.abspath(video_path)
+        logger.debug(f"Launching system VLC with file: {abs_path}")
+        
+        try:
+            # Use the VLC path passed to the constructor if available
+            vlc_cmd = None
+            if hasattr(self, 'vlc_path') and self.vlc_path and os.path.exists(self.vlc_path):
+                vlc_cmd = f'"{self.vlc_path}"'
+                logger.debug(f"Using VLC path from instance: {self.vlc_path}")
+            
+            # If no valid path in instance, use default logic
+            if not vlc_cmd:
+                logger.debug("No valid VLC path in instance, using default paths")
+                if sys.platform.startswith('win'):
+                    # Try common Windows VLC installation paths
+                    potential_paths = [
+                        r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+                        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"
+                    ]
+                    for path in potential_paths:
+                        if os.path.exists(path):
+                            vlc_cmd = f'"{path}"'
+                            break
+                    
+                    # If not found in common locations, try using just 'vlc'
+                    if not vlc_cmd:
+                        vlc_cmd = "vlc"
+                elif sys.platform.startswith('darwin'):  # macOS
+                    vlc_cmd = "/Applications/VLC.app/Contents/MacOS/VLC"
+                    if not os.path.exists(vlc_cmd):
+                        vlc_cmd = "vlc"  # Try using just 'vlc' if not in standard location
+                else:  # Linux and others
+                    vlc_cmd = "vlc"
+            
+            # Build the command with arguments
+            # --fullscreen: Start in fullscreen mode
+            # --play-and-exit: Close VLC when playback ends
+            # --no-video-title-show: Don't show the title
+            # --loop: Loop the video
+            # --volume=0: Start with volume at 0 (muted)
+            cmd = f'{vlc_cmd} "{abs_path}" --fullscreen --play-and-exit --no-video-title-show --loop --volume=0'
+            
+            logger.debug(f"VLC command: {cmd}")
+            
+            # Launch VLC in a separate process
+            if sys.platform.startswith('win'):
+                # On Windows, use shell=True to handle paths with spaces
+                subprocess.Popen(cmd, shell=True)
+            else:
+                # On Unix-like systems, split the command into arguments
+                args = shlex.split(cmd)
+                subprocess.Popen(args)
+                
+            logger.debug("VLC process started")
+        except Exception as e:
+            logger.exception(f"Error launching system VLC: {e}")
+            self.is_fullscreen_open = False
     
     def on_fullscreen_closed(self):
         """Handle the fullscreen viewer being closed."""
@@ -1259,23 +1486,72 @@ class ThumbnailWidget(QWidget):
             except Exception as e:
                 logger.error(f"Error closing fullscreen viewer: {e}")
 
-    def approve_submission(self): # Line 1195
-        """Approve the current submission (moderator action)."""
-        self.stop_all_media()
-        # Pass the stored reddit_instance to the API function
-        if reddit_api.approve_submission(self.praw_submission, self.reddit_instance):
-            self.update_moderation_status_ui()
+    def approve_submission(self):
+        """Approve the current submission using a background worker."""
+        if self.mod_worker and self.mod_worker.isRunning():
+            logger.warning(f"Moderation worker already running for {self.submission_id}. Ignoring request.")
+            return
 
-    def remove_submission(self): # Line 1201 - Corrected indentation
-        """Remove the current submission (moderator action)."""
         self.stop_all_media()
-        logger.debug(f"Remove clicked for {self.submission_id}. Media stopped and cleaned up.")
-        # Now attempt the removal
-        # Pass the stored reddit_instance to the API function
-        if reddit_api.remove_submission(self.praw_submission, self.reddit_instance):
-            self.update_moderation_status_ui()
-    
-    def close(self): # Line 1214 - Corrected indentation
+        logger.debug(f"Starting ApproveWorker for {self.submission_id}")
+
+        # Disable buttons temporarily
+        self.approve_button.setEnabled(False)
+        self.remove_button.setEnabled(False)
+        self.approve_button.setText("Approving...")
+
+        # Create and start worker
+        self.mod_worker = ApproveWorker(self.submission_id, self.reddit_instance)
+        self.mod_worker.signals.success.connect(self.on_mod_action_success)
+        self.mod_worker.signals.error.connect(self.on_mod_action_error)
+        self.mod_worker.signals.finished.connect(self.on_mod_worker_finished)
+        self.mod_worker.start()
+
+    def remove_submission(self):
+        """Remove the current submission using a background worker."""
+        if self.mod_worker and self.mod_worker.isRunning():
+            logger.warning(f"Moderation worker already running for {self.submission_id}. Ignoring request.")
+            return
+
+        self.stop_all_media()
+        logger.debug(f"Starting RemoveWorker for {self.submission_id}")
+
+        # Disable buttons temporarily
+        self.approve_button.setEnabled(False)
+        self.remove_button.setEnabled(False)
+        self.remove_button.setText("Removing...")
+
+        # Create and start worker
+        self.mod_worker = RemoveWorker(self.submission_id, self.reddit_instance)
+        self.mod_worker.signals.success.connect(self.on_mod_action_success)
+        self.mod_worker.signals.error.connect(self.on_mod_action_error)
+        self.mod_worker.signals.finished.connect(self.on_mod_worker_finished)
+        self.mod_worker.start()
+
+    def on_mod_action_success(self, submission_id):
+        """Handle successful moderation action from worker."""
+        if submission_id == self.submission_id:
+            logger.info(f"Moderation action successful for {self.submission_id}")
+            self.update_moderation_status_ui() # Update UI based on new cache status
+        else:
+            logger.warning(f"Received success signal for wrong submission ID: {submission_id} (expected {self.submission_id})")
+
+    def on_mod_action_error(self, error_message):
+        """Handle error signal from moderation worker."""
+        logger.error(f"Moderation action failed for {self.submission_id}: {error_message}")
+        QMessageBox.warning(self, "Moderation Error", f"Failed to perform action:\n{error_message}")
+        # Re-enable buttons and revert text based on current cache status
+        self.update_moderation_status_ui()
+
+    def on_mod_worker_finished(self):
+        """Handle worker finished signal."""
+        logger.debug(f"Moderation worker finished for {self.submission_id}")
+        # Re-enable buttons (status should already be updated by success/error handlers)
+        self.approve_button.setEnabled(True)
+        self.remove_button.setEnabled(True)
+        self.mod_worker = None # Clear worker reference
+
+    def close(self):
         """Clean up resources when the widget is closed."""
         self.stop_all_media()
         super().close()

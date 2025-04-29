@@ -55,6 +55,11 @@ def create_config_file(config_path):
     refresh_token = input("Enter Reddit refresh_token (or leave blank if you don't have one yet): ").strip()
     user_agent = input("Enter user_agent [default: red-image-browser/1.0]: ").strip() or "red-image-browser/1.0"
     default_subreddit = input("Enter default subreddit [default: pics]: ").strip() or "pics"
+    
+    print("\nOptional: Enter the full path to your VLC executable if it's not in a standard location.")
+    print("Leave blank to use default paths (C:\\Program Files\\VideoLAN\\VLC\\vlc.exe on Windows,")
+    print("/Applications/VLC.app/Contents/MacOS/VLC on macOS, or 'vlc' command on Linux).")
+    vlc_path = input("VLC path [optional]: ").strip()
 
     config_data = {
         "client_id": client_id,
@@ -62,7 +67,8 @@ def create_config_file(config_path):
         "redirect_uri": redirect_uri,
         "refresh_token": refresh_token,
         "user_agent": user_agent,
-        "default_subreddit": default_subreddit
+        "default_subreddit": default_subreddit,
+        "vlc_path": vlc_path
     }
 
     try:

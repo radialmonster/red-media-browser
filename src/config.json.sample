@@ -4,5 +4,11 @@
     "redirect_uri": "http://localhost:8080",
     "refresh_token": "xxxxxxxxxxxxxxxxxxxxxxxxxxx",
     "user_agent": "red-image-browser/1.0",
-    "default_subreddit": "pics"
+    "default_subreddit": "pics",
+    "vlc_path": "",
+    "_comment_vlc_examples": "Example VLC paths (replace the empty vlc_path above with one of these):",
+    "_example_windows_64bit": "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe",
+    "_example_windows_32bit": "C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe",
+    "_example_macos": "/Applications/VLC.app/Contents/MacOS/VLC",
+    "_example_linux": "/usr/bin/vlc"
 }

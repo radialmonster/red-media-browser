@@ -26,7 +26,8 @@ from PyQt6.QtCore import Qt, QSize, QThreadPool, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QIcon, QPixmapCache
 
 from red_config import load_config, get_new_refresh_token, update_config_with_new_token
-from reddit_api import RedditGalleryModel, SnapshotFetcher, ban_user, ModeratedSubredditsFetcher
+# Import specific workers and functions
+from reddit_api import RedditGalleryModel, SnapshotFetcher, ModeratedSubredditsFetcher, BanWorker, ban_user as sync_ban_user
 from ui_components import ThumbnailWidget, BanUserDialog
 from utils import get_cache_dir, ensure_directory, extract_image_urls
 from media_handlers import process_media_url
@@ -156,6 +157,8 @@ class RedMediaBrowser(QMainWindow):
         self.mod_logs_ready = False
         self.mod_log_fetcher_thread = None # To keep a reference
         self.filter_worker_thread = None # To keep reference to filter worker
+        self.ban_worker = None # To keep reference to ban worker
+        self.active_workers = [] # Keep track of active workers
 
         # Set up the UI
         self.init_ui()
@@ -301,6 +304,14 @@ class RedMediaBrowser(QMainWindow):
                 redirect_uri=config["redirect_uri"],
                 user_agent=config["user_agent"]
             )
+            
+            # Store VLC path from config (if available)
+            self.vlc_path = config.get("vlc_path", "")
+            if self.vlc_path and os.path.exists(self.vlc_path):
+                logger.info(f"Using custom VLC path from config: {self.vlc_path}")
+            else:
+                self.vlc_path = ""
+                logger.info("Using default VLC paths")
 
             # Verify credentials work
             try:
@@ -525,6 +536,9 @@ class RedMediaBrowser(QMainWindow):
                 self.back_button.setText(f"Back to r/{self.previous_subreddit}")
                 self.back_button.setVisible(True)
 
+        # Cleanup is handled by clear_content() called within display_current_page()
+        # self.stop_all_thumbnail_media() # Removed redundant call
+
         # Start a thread to fetch the snapshot
         self.fetch_snapshot()
 
@@ -653,7 +667,8 @@ class RedMediaBrowser(QMainWindow):
                 has_multiple_images=has_multiple_images,
                 post_url=permalink,
                 is_moderator=can_moderate_this_post,
-                reddit_instance=self.reddit
+                reddit_instance=self.reddit,
+                vlc_path=self.vlc_path  # Pass the VLC path from config
             )
             thumbnail.authorClicked.connect(self.on_author_clicked)
             if row is not None and col is not None:
@@ -685,12 +700,28 @@ class RedMediaBrowser(QMainWindow):
             self.content_layout.removeWidget(widget)
             widget.setParent(None)
             widget.deleteLater()
+            # Process events after each widget deletion to force cleanup
+            QApplication.processEvents()
         self.thumbnail_widgets.clear()
-        QApplication.processEvents()  # Allow UI to process deletions
+        # Final processEvents after loop might still be beneficial
+        QApplication.processEvents()
 
+    def stop_all_thumbnail_media(self):
+        """Iterate through all visible thumbnails and stop their media."""
+        logger.debug(f"Stopping media for {len(self.thumbnail_widgets)} thumbnail widgets.")
+        for widget in self.thumbnail_widgets:
+            if isinstance(widget, ThumbnailWidget): # Ensure it's the correct widget type
+                try:
+                    widget.stop_all_media()
+                except Exception as e:
+                    logger.error(f"Error stopping media in widget {getattr(widget, 'submission_id', 'N/A')}: {e}")
+            # This function is kept in case it's needed elsewhere, but not called before pagination/load
 
     def show_next_page(self):
         """Show the next page of submissions."""
+        # Cleanup is handled by clear_content() called within display_current_page/display_filtered_page
+        # self.stop_all_thumbnail_media() # Removed redundant call
+
         current_list = self.current_filtered_snapshot if self.is_filtered else self.current_snapshot
         if not current_list:
             return
@@ -707,6 +738,9 @@ class RedMediaBrowser(QMainWindow):
 
     def show_previous_page(self):
         """Show the previous page of submissions."""
+        # Cleanup is handled by clear_content() called within display_current_page/display_filtered_page
+        # self.stop_all_thumbnail_media() # Removed redundant call
+
         current_list = self.current_filtered_snapshot if self.is_filtered else self.current_snapshot
         if not current_list or self.snapshot_offset == 0:
             return
@@ -724,6 +758,10 @@ class RedMediaBrowser(QMainWindow):
         if self.is_loading_posts:
             logger.debug("Ignoring author click while content is loading")
             return
+
+        # Stop currently playing media before showing options or navigating?
+        # Let's rely on clear_content before the *next* action (view posts or ban) instead.
+        # self.stop_all_thumbnail_media() # Removed redundant call
 
         self.is_author_navigation = True # Flag for load_content
 
@@ -794,6 +832,9 @@ class RedMediaBrowser(QMainWindow):
         """Navigate back to the previously viewed subreddit."""
         if not self.previous_subreddit: return
 
+        # Cleanup is handled by clear_content() called within display_current_page()
+        # self.stop_all_thumbnail_media() # Removed redundant call
+
         target_offset = self.previous_offset
         subreddit_name = self.previous_subreddit
 
@@ -837,14 +878,24 @@ class RedMediaBrowser(QMainWindow):
         subreddit_name = subreddit_obj.display_name # Get name from object
         dialog = BanUserDialog(username, subreddit_name, self)
         if dialog.exec():
+            # Stop media again just before initiating the ban action?
+            # Let's rely on the ThumbnailWidget's stop_all_media called internally by the ban worker trigger if needed.
+            # The main clear_content will handle cleanup if navigation happens later.
+            # self.stop_all_thumbnail_media() # Removed redundant call
+
             reason = dialog.reason
             share = dialog.result_type == "share"
             ban_message = reason if share else None
-            success = ban_user(subreddit_obj, username, reason, ban_message) # Pass object
-            if success:
-                QMessageBox.information(self, "Success", f"User {username} banned from r/{subreddit_name}.")
-            else:
-                QMessageBox.warning(self, "Error", f"Failed to ban {username} from r/{subreddit_name}.")
+
+            # Use BanWorker instead of direct call
+            logger.info(f"Starting BanWorker for user {username} in r/{subreddit_name}")
+            # Ensure reddit instance is passed if needed by worker (it wasn't in previous version, adding defensively)
+            self.ban_worker = BanWorker(subreddit_obj, username, reason, ban_message, self.reddit)
+            self.ban_worker.signals.success.connect(self.on_ban_success)
+            self.ban_worker.signals.error.connect(self.on_ban_error)
+            self.ban_worker.signals.finished.connect(self.on_worker_finished) # Generic finished handler
+            self.active_workers.append(self.ban_worker) # Track worker
+            self.ban_worker.start()
 
     def closeEvent(self, event):
         """Handle application shutdown."""
@@ -859,6 +910,15 @@ class RedMediaBrowser(QMainWindow):
         if hasattr(self, 'filter_worker_thread') and self.filter_worker_thread is not None and self.filter_worker_thread.isRunning():
              self.filter_worker_thread.terminate()
              self.filter_worker_thread.wait()
+        if hasattr(self, 'ban_worker') and self.ban_worker is not None and self.ban_worker.isRunning():
+             self.ban_worker.terminate()
+             self.ban_worker.wait()
+        # Terminate any other active workers cleanly
+        for worker in self.active_workers:
+             if worker is not None and worker.isRunning():
+                  logger.debug(f"Terminating active worker: {type(worker).__name__}")
+                  worker.terminate()
+                  worker.wait()
 
         event.accept()
 
@@ -985,6 +1045,28 @@ class RedMediaBrowser(QMainWindow):
                  self.thumbnail_widgets.append(error_widget)
 
         self.statusBar.showMessage(f"Showing posts {start+1} to {end} of {len(self.current_filtered_snapshot)} (Filtered by r/{self.previous_subreddit})")
+
+    # --- Generic Worker Finished Handler ---
+    def on_worker_finished(self):
+        """Remove finished worker from tracking list."""
+        sender = self.sender()
+        if sender in self.active_workers:
+            logger.debug(f"Worker finished and removed from tracking: {type(sender).__name__}")
+            self.active_workers.remove(sender)
+        # Specific worker references are cleared in their success/error handlers
+
+    # --- Ban Worker Handlers ---
+    def on_ban_success(self, success_message):
+        """Handle successful ban signal from worker."""
+        logger.info(f"Ban successful: {success_message}")
+        QMessageBox.information(self, "Success", success_message)
+        self.ban_worker = None # Clear specific worker reference
+
+    def on_ban_error(self, error_message):
+        """Handle error signal from ban worker."""
+        logger.error(f"Ban failed: {error_message}")
+        QMessageBox.warning(self, "Ban Error", f"Failed to ban user:\n{error_message}")
+        self.ban_worker = None # Clear specific worker reference
 
 # Main application entry point
 if __name__ == "__main__":

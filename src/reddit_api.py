@@ -13,9 +13,9 @@ import time
 import praw
 import prawcore.exceptions
 from types import SimpleNamespace # Import SimpleNamespace
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, QObject # Import QObject for worker signals
 # Import the Submission class for type checking
-from praw.models import Submission
+from praw.models import Submission, Subreddit
 
 # Import caching utilities
 from utils import (
@@ -227,8 +227,16 @@ class RedditGalleryModel:
                 if not self.user:
                     logger.error("Cannot fetch user submissions, user object is None.")
                     return []
-                initial_listing = list(self.user.submissions.new(**params))
-                logger.debug(f"Fetched {len(initial_listing)} initial items for user {self.source_name}")
+                try:
+                    initial_listing = list(self.user.submissions.new(**params))
+                    logger.debug(f"Fetched {len(initial_listing)} initial items for user {self.source_name}")
+                except prawcore.exceptions.NotFound:
+                    logger.warning(f"User '{self.source_name}' not found or inaccessible (404). Returning empty list.")
+                    return [] # Return empty list if user not found
+                except Exception as user_fetch_err:
+                    # Catch other potential errors during user fetch
+                    logger.error(f"Error fetching submissions for user {self.source_name}: {user_fetch_err}")
+                    return [] # Return empty list on other errors too
 
                 # --- Add potential removed posts from logs ---
                 removed_post_fullnames = set()
@@ -440,9 +448,176 @@ class SnapshotFetcher(QThread):
         snapshot = self.model.fetch_snapshot(total=self.total, after=self.after)
         self.snapshotFetched.emit(snapshot)
 
+# --- Worker Signals ---
+class WorkerSignals(QObject):
+    """
+    Defines the signals available from a running worker thread.
+    Supported signals are:
+    finished: No data
+    error: tuple (exctype, value, traceback.format_exc())
+    result: object data returned from processing, anything
+    progress: int indicating % progress
+    """
+    finished = pyqtSignal()
+    error = pyqtSignal(str) # Simplified error signal with just a message
+    success = pyqtSignal(str) # Signal for successful completion, with optional message
+
+# --- Background Workers for Moderation ---
+
+class ApproveWorker(QThread):
+    """Worker thread to approve a submission."""
+    signals = WorkerSignals()
+
+    def __init__(self, submission_id: str, reddit_instance):
+        super().__init__()
+        self.submission_id = submission_id
+        self.reddit_instance = reddit_instance
+
+    def run(self):
+        try:
+            if not self.submission_id:
+                raise ValueError("Missing submission ID.")
+            if not self.reddit_instance:
+                raise ValueError("Missing PRAW instance.")
+
+            base_id = self.submission_id.split('_')[-1]
+            praw_submission = self.reddit_instance.submission(id=base_id)
+            praw_submission.mod.approve()
+            logger.debug(f"Successfully approved submission via API: {self.submission_id}")
+
+            # Update cache after successful API call
+            metadata_path = get_metadata_file_path(self.submission_id)
+            if metadata_path:
+                metadata = read_metadata_file(metadata_path) or {'id': self.submission_id}
+                metadata['approved'] = True
+                metadata['removed'] = False
+                metadata['moderation_status'] = "approved"
+                metadata['last_checked_utc'] = time.time()
+                try:
+                    praw_submission.load() # Refresh data
+                    metadata['score'] = praw_submission.score
+                    metadata['num_comments'] = praw_submission.num_comments
+                except Exception as refresh_e:
+                    logger.warning(f"Could not refresh score/comments for {self.submission_id} after approve: {refresh_e}")
+
+                if write_metadata_file(metadata_path, metadata):
+                    logger.debug(f"Updated cached metadata for {self.submission_id} to approved.")
+                else:
+                    logger.error(f"Failed to write updated metadata cache for approved submission {self.submission_id}.")
+            else:
+                logger.warning(f"Could not determine metadata cache path for approved submission {self.submission_id}.")
+
+            self.signals.success.emit(self.submission_id) # Emit success with ID
+
+        except Exception as e:
+            logger.exception(f"Error approving submission {self.submission_id} in worker: {e}")
+            self.signals.error.emit(f"Error approving {self.submission_id}: {str(e)}")
+        finally:
+            self.signals.finished.emit()
+
+class RemoveWorker(QThread):
+    """Worker thread to remove a submission."""
+    signals = WorkerSignals()
+
+    def __init__(self, submission_id: str, reddit_instance):
+        super().__init__()
+        self.submission_id = submission_id
+        self.reddit_instance = reddit_instance
+
+    def run(self):
+        moderation_status_update = "removed"
+        update_cache = False
+        error_message = None
+
+        try:
+            if not self.submission_id:
+                raise ValueError("Missing submission ID.")
+            if not self.reddit_instance:
+                raise ValueError("Missing PRAW instance.")
+
+            base_id = self.submission_id.split('_')[-1]
+            praw_submission = self.reddit_instance.submission(id=base_id)
+            praw_submission.mod.remove()
+            logger.debug(f"Successfully removed submission via API: {self.submission_id}")
+            update_cache = True
+
+        except prawcore.exceptions.Forbidden as e:
+            logger.error(f"Forbidden: You do not have permission to remove submission {self.submission_id}")
+            error_message = f"Permission denied to remove {self.submission_id}."
+        except prawcore.exceptions.RequestException as e:
+            if "ConnectTimeout" in str(e) or "ConnectionError" in str(e):
+                logger.error(f"Network connection error while removing submission {self.submission_id}: {e}")
+                moderation_status_update = "removal_pending" # Mark as pending on network error
+                update_cache = True
+                # Don't treat network error as a failure for the signal, let UI handle pending state
+            else:
+                logger.error(f"API request error while removing submission {self.submission_id}: {e}")
+                error_message = f"API error removing {self.submission_id}: {str(e)}"
+        except Exception as e:
+            logger.exception(f"Unexpected error while removing submission {self.submission_id} in worker: {e}")
+            error_message = f"Error removing {self.submission_id}: {str(e)}"
+
+        # Update cache if needed (successful removal or network error)
+        if update_cache:
+            metadata_path = get_metadata_file_path(self.submission_id)
+            if metadata_path:
+                metadata = read_metadata_file(metadata_path) or {'id': self.submission_id}
+                metadata['approved'] = False
+                metadata['removed'] = (moderation_status_update == "removed")
+                metadata['moderation_status'] = moderation_status_update
+                metadata['last_checked_utc'] = time.time()
+                if write_metadata_file(metadata_path, metadata):
+                    logger.debug(f"Updated cached metadata for {self.submission_id} to {moderation_status_update}.")
+                else:
+                    logger.error(f"Failed to write updated metadata cache for removed submission {self.submission_id}.")
+            else:
+                logger.warning(f"Could not determine metadata cache path for removed submission {self.submission_id}.")
+
+        # Emit success if no critical error occurred (pending is considered success for signaling)
+        if error_message:
+            self.signals.error.emit(error_message)
+        else:
+            self.signals.success.emit(self.submission_id) # Emit success with ID
+        self.signals.finished.emit()
+
+
+class BanWorker(QThread):
+    """Worker thread to ban a user."""
+    signals = WorkerSignals()
+
+    def __init__(self, subreddit: Subreddit, username: str, reason: str, message: Optional[str], reddit_instance):
+        super().__init__()
+        self.subreddit = subreddit
+        self.username = username
+        self.reason = reason
+        self.message = message
+        self.reddit_instance = reddit_instance # Needed? Subreddit object should be sufficient
+
+    def run(self):
+        try:
+            if not self.subreddit:
+                raise ValueError("Missing Subreddit object.")
+            if not self.username:
+                raise ValueError("Missing username.")
+            if not self.reason:
+                raise ValueError("Missing ban reason.")
+
+            if self.message:
+                self.subreddit.banned.add(self.username, ban_reason=self.reason, ban_message=self.message, note=self.reason)
+            else:
+                self.subreddit.banned.add(self.username, ban_reason=self.reason, note=self.reason)
+            logger.debug(f"Banned user {self.username} from {self.subreddit.display_name}")
+            self.signals.success.emit(f"User {self.username} banned from r/{self.subreddit.display_name}.")
+
+        except Exception as e:
+            logger.exception(f"Error banning user {self.username} from {self.subreddit.display_name} in worker: {e}")
+            self.signals.error.emit(f"Error banning {self.username}: {str(e)}")
+        finally:
+            self.signals.finished.emit()
+
 
 # --- Standalone Moderation/Report Functions ---
-# These need the active PRAW instance passed to them
+# These are the original synchronous functions. We'll keep them for now but UI will use workers.
 
 def approve_submission(submission_data, reddit_instance) -> bool:
     """
@@ -455,19 +630,21 @@ def approve_submission(submission_data, reddit_instance) -> bool:
     Returns:
         bool: True if successful, False otherwise.
     """
+    # This function is now primarily for reference or potential non-UI use.
+    # UI should use ApproveWorker.
     submission_id = getattr(submission_data, 'id', None)
     if not submission_id:
-        logger.error("Cannot approve submission: Missing ID.")
+        logger.error("SYNC: Cannot approve submission: Missing ID.")
         return False
     if not reddit_instance:
-        logger.error(f"Cannot approve submission {submission_id}: Missing PRAW instance.")
+        logger.error(f"SYNC: Cannot approve submission {submission_id}: Missing PRAW instance.")
         return False
 
     try:
         base_id = submission_id.split('_')[-1]
         praw_submission = reddit_instance.submission(id=base_id)
         praw_submission.mod.approve()
-        logger.debug(f"Successfully approved submission via API: {submission_id}")
+        logger.debug(f"SYNC: Successfully approved submission via API: {submission_id}")
 
         metadata_path = get_metadata_file_path(submission_id)
         if metadata_path:
@@ -481,18 +658,18 @@ def approve_submission(submission_data, reddit_instance) -> bool:
                 metadata['score'] = praw_submission.score
                 metadata['num_comments'] = praw_submission.num_comments
             except Exception as refresh_e:
-                logger.warning(f"Could not refresh score/comments for {submission_id} after approve: {refresh_e}")
+                    logger.warning(f"SYNC: Could not refresh score/comments for {submission_id} after approve: {refresh_e}")
 
             if write_metadata_file(metadata_path, metadata):
-                logger.debug(f"Updated cached metadata for {submission_id} to approved.")
+                logger.debug(f"SYNC: Updated cached metadata for {submission_id} to approved.")
             else:
-                logger.error(f"Failed to write updated metadata cache for approved submission {submission_id}.")
+                logger.error(f"SYNC: Failed to write updated metadata cache for approved submission {submission_id}.")
         else:
-            logger.warning(f"Could not determine metadata cache path for approved submission {submission_id}.")
+            logger.warning(f"SYNC: Could not determine metadata cache path for approved submission {submission_id}.")
 
         return True
     except Exception as e:
-        logger.exception(f"Error approving submission {submission_id}: {e}")
+        logger.exception(f"SYNC: Error approving submission {submission_id}: {e}")
         return False
 
 def remove_submission(submission_data, reddit_instance) -> bool:
@@ -506,37 +683,39 @@ def remove_submission(submission_data, reddit_instance) -> bool:
     Returns:
         bool: True if successful or pending, False otherwise.
     """
+    # This function is now primarily for reference or potential non-UI use.
+    # UI should use RemoveWorker.
     submission_id = getattr(submission_data, 'id', None)
     if not submission_id:
-        logger.error("Cannot remove submission: Missing ID.")
+        logger.error("SYNC: Cannot remove submission: Missing ID.")
         return False
     if not reddit_instance:
-        logger.error(f"Cannot remove submission {submission_id}: Missing PRAW instance.")
+        logger.error(f"SYNC: Cannot remove submission {submission_id}: Missing PRAW instance.")
         return False
 
-    moderation_status_update = "removed"
+    moderation_status_update = "removed" # Default status
     update_cache = False
 
     try:
         base_id = submission_id.split('_')[-1]
         praw_submission = reddit_instance.submission(id=base_id)
         praw_submission.mod.remove()
-        logger.debug(f"Successfully removed submission via API: {submission_id}")
+        logger.debug(f"SYNC: Successfully removed submission via API: {submission_id}")
         update_cache = True
 
     except prawcore.exceptions.Forbidden:
-        logger.error(f"Forbidden: You do not have permission to remove submission {submission_id}")
+        logger.error(f"SYNC: Forbidden: You do not have permission to remove submission {submission_id}")
         return False
     except prawcore.exceptions.RequestException as e:
         if "ConnectTimeout" in str(e) or "ConnectionError" in str(e):
-            logger.error(f"Network connection error while removing submission {submission_id}: {e}")
-            moderation_status_update = "removal_pending"
-            update_cache = True
+            logger.error(f"SYNC: Network connection error while removing submission {submission_id}: {e}")
+            moderation_status_update = "removal_pending" # Mark as pending on network error
+            update_cache = True # Still update cache to reflect pending state
         else:
-            logger.error(f"API request error while removing submission {submission_id}: {e}")
-            return False
+            logger.error(f"SYNC: API request error while removing submission {submission_id}: {e}")
+            return False # Treat other API errors as failure
     except Exception as e:
-        logger.exception(f"Unexpected error while removing submission {submission_id}: {e}")
+        logger.exception(f"SYNC: Unexpected error while removing submission {submission_id}: {e}")
         return False
 
     if update_cache:
@@ -544,16 +723,17 @@ def remove_submission(submission_data, reddit_instance) -> bool:
         if metadata_path:
             metadata = read_metadata_file(metadata_path) or {'id': submission_id}
             metadata['approved'] = False
-            metadata['removed'] = (moderation_status_update == "removed")
+            metadata['removed'] = (moderation_status_update == "removed") # Only True if actually removed
             metadata['moderation_status'] = moderation_status_update
             metadata['last_checked_utc'] = time.time()
             if write_metadata_file(metadata_path, metadata):
-                logger.debug(f"Updated cached metadata for {submission_id} to {moderation_status_update}.")
+                logger.debug(f"SYNC: Updated cached metadata for {submission_id} to {moderation_status_update}.")
             else:
-                logger.error(f"Failed to write updated metadata cache for removed submission {submission_id}.")
+                logger.error(f"SYNC: Failed to write updated metadata cache for removed submission {submission_id}.")
         else:
-            logger.warning(f"Could not determine metadata cache path for removed submission {submission_id}.")
+            logger.warning(f"SYNC: Could not determine metadata cache path for removed submission {submission_id}.")
 
+    # Return True only if status is 'removed' or 'removal_pending'
     return moderation_status_update in ["removed", "removal_pending"]
 
 def get_submission_reports(submission_data, reddit_instance) -> tuple[int, list]:
@@ -652,13 +832,15 @@ def ban_user(subreddit, username: str, reason: str, message: Optional[str] = Non
     Returns:
         bool: True if successful, False otherwise
     """
+    # This function is now primarily for reference or potential non-UI use.
+    # UI should use BanWorker.
     try:
         if message:
             subreddit.banned.add(username, ban_reason=reason, ban_message=message, note=reason)
         else:
             subreddit.banned.add(username, ban_reason=reason, note=reason)
-        logger.debug(f"Banned user {username} from {subreddit.display_name}")
+        logger.debug(f"SYNC: Banned user {username} from {subreddit.display_name}")
         return True
     except Exception as e:
-        logger.exception(f"Error banning user {username} from {subreddit.display_name}: {e}")
+        logger.exception(f"SYNC: Error banning user {username} from {subreddit.display_name}: {e}")
         return False

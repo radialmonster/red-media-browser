@@ -575,14 +575,14 @@ def process_media_url(url):
         logger.debug(f"No specific handler found for domain '{domain}'.")
 
     # --- Step 2: Apply Generic Transformations (after specific handlers) ---
-    # Handle RedGifs special case (if not already handled by a more specific redgifs handler)
-    # This check might be redundant if redgifs.com handler exists, but keep for safety
-    if "redgifs.com" in processed_url and not processed_url.endswith('.mp4'):
-        # Check if it's already a direct media link (e.g., .jpg from i.redgifs.com handler)
-        if not any(processed_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-             logger.debug(f"Processing non-mp4 RedGIFs URL: {processed_url}")
-             processed_url = get_redgifs_mp4_url(processed_url)
-             logger.debug(f"Processed RedGifs URL: {url} -> {processed_url}")
+    # Force all redgifs.com/watch/ and redgifs.com/ifr/ URLs to .mp4 video
+    if (
+        ("redgifs.com/watch/" in processed_url or "redgifs.com/ifr/" in processed_url)
+        and not processed_url.endswith('.mp4')
+    ):
+        logger.debug(f"Forcing RedGifs watch/ifr URL to mp4: {processed_url}")
+        processed_url = get_redgifs_mp4_url(processed_url)
+        logger.debug(f"Processed RedGifs URL: {url} -> {processed_url}")
 
     # Handle Reddit links that might contain RedGifs (if no specific handler matched)
     elif "reddit.com" in domain and best_match_domain is None: # Only if no reddit handler ran

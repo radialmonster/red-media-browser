@@ -198,10 +198,11 @@ class RedditGalleryModel:
 
     def fetch_snapshot(self, total=100, after=None) -> List[Any]:
         """
-        Fetch a larger batch of submissions, utilizing the metadata cache.
+        Fetch a batch of submissions, utilizing the metadata cache.
+        For "Fetch Next 100", set total=100 and after=fullname of last post.
 
         Args:
-            total: Total number of submissions to fetch
+            total: Number of submissions to fetch (default 100)
             after: Reddit fullname to fetch posts after
 
         Returns:
@@ -209,49 +210,35 @@ class RedditGalleryModel:
         """
         logger.info(f"Fetching snapshot (total={total}, after={after}) for {'user' if self.is_user_mode else 'subreddit'}: {self.source_name}")
         snapshot_results = []
-        processed_ids = set() # Keep track of IDs added to results
+        processed_ids = set()  # Keep track of IDs added to results
 
         # 1. Load the metadata index
         submission_index = load_submission_index()
         cache_dir = get_cache_dir()
 
-        # 2. Get potential Submission IDs/Objects from Reddit API
+        # 2. Get next page of Submission objects from Reddit API
         try:
             initial_listing = []
             params = {'limit': total}
-            if after:
-                params['after'] = after
-
-            # --- Fetch initial list from appropriate source ---
+            # PRAW's .new() does NOT accept 'after' as a direct argument, but the ListingGenerator supports .params
             if self.is_user_mode:
                 if not self.user:
                     logger.error("Cannot fetch user submissions, user object is None.")
                     return []
                 try:
-                    initial_listing = list(self.user.submissions.new(**params))
-                    logger.debug(f"Fetched {len(initial_listing)} initial items for user {self.source_name}")
+                    gen = self.user.submissions.new(limit=total)
+                    if after:
+                        gen.params['after'] = after
+                    initial_listing = list(gen)
+                    logger.debug(f"Fetched {len(initial_listing)} items for user {self.source_name} (after={after})")
                 except prawcore.exceptions.NotFound:
                     logger.warning(f"User '{self.source_name}' not found or inaccessible (404). Returning empty list.")
-                    return [] # Return empty list if user not found
+                    return []
                 except Exception as user_fetch_err:
-                    # Catch other potential errors during user fetch
                     logger.error(f"Error fetching submissions for user {self.source_name}: {user_fetch_err}")
-                    return [] # Return empty list on other errors too
-
-                # --- Add potential removed posts from logs ---
-                removed_post_fullnames = set()
-                if self.logs_ready:
-                    target_username_lower = self.source_name.lower()
-                    logger.debug(f"Checking logs for removed posts by {target_username_lower}...")
-                    for sub_name in self.moderated_subreddit_names:
-                        for entry in self.prefetched_logs.get(sub_name, []):
-                            if entry.get('author') == target_username_lower and entry.get('fullname'):
-                                removed_post_fullnames.add(entry['fullname'])
-                    if removed_post_fullnames:
-                         logger.info(f"Found {len(removed_post_fullnames)} potential removed posts in logs.")
-                         initial_listing.extend(list(removed_post_fullnames))
-
-            else: # Subreddit Mode
+                    return []
+                # Optionally: add removed posts from logs (not paginated, so skip for "next 100" fetches)
+            else:
                 if not self.subreddit:
                     logger.error("Cannot fetch subreddit submissions, subreddit object is None.")
                     return []
@@ -259,154 +246,37 @@ class RedditGalleryModel:
 
                 if is_mod:
                     logger.debug("Fetching moderator view sources...")
-                    merged_items = {}
-                    sources_to_fetch = {
-                        'new': lambda p: self.subreddit.new(**p),
-                        'reports': lambda p: self.subreddit.mod.reports(**p),
-                        'modqueue': lambda p: self.subreddit.mod.modqueue(**p),
-                    }
-                    limits = {'new': total, 'reports': total // 2, 'modqueue': total // 2}
-                    logger.debug(f"Fetching limits: {limits}")
-                    for name, fetch_func in sources_to_fetch.items():
-                        try:
-                            current_limit = limits.get(name, total)
-                            source_params = {'limit': current_limit}
-                            # Apply 'after' only to the 'new' listing for pagination consistency
-                            if after and name == 'new':
-                                source_params['after'] = after
-                            logger.debug(f"Fetching source '{name}' with params: {source_params}")
-                            count = 0
-                            for item in fetch_func(source_params):
-                                # Ensure we have a PRAW Submission object
-                                if not isinstance(item, Submission):
-                                    logger.warning(f"Skipping non-Submission item from '{name}': {type(item)}")
-                                    continue
-
-                                item_fullname = getattr(item, 'fullname', None)
-                                # Ensure we have a valid fullname (starts with t3_)
-                                if item_fullname and item_fullname.startswith('t3_'):
-                                    if item_fullname not in merged_items:
-                                        merged_items[item_fullname] = item # Use fullname as key
-                                        count += 1
-                                    # else: logger.debug(f"Item {item_fullname} from '{name}' already exists.")
-                                else:
-                                    logger.warning(f"Item from '{name}' missing valid fullname: ID={getattr(item, 'id', 'N/A')}")
-                            logger.debug(f"Added {count} items from source '{name}'. Total merged: {len(merged_items)}")
-                        except Exception as fetch_err:
-                            logger.error(f"Error fetching mod source '{name}': {fetch_err}")
-
-                    # --- Fetch IDs from Mod Log (removelink) ---
-                    mod_log_fullnames = set()
-                    try:
-                        # Fetch a reasonable number, maybe more than 25? Let's try 50.
-                        mod_log_limit = min(total // 2, 50)
-                        logger.debug(f"Fetching up to {mod_log_limit} 'removelink' entries from mod log...")
-                        mod_log_entries = list(self.subreddit.mod.log(action="removelink", limit=mod_log_limit))
-                        for entry in mod_log_entries:
-                             fullname = entry.target_fullname
-                             if fullname and fullname.startswith("t3_"):
-                                  mod_log_fullnames.add(fullname)
-                        logger.debug(f"Found {len(mod_log_fullnames)} unique fullnames in 'removelink' log.")
-                    except Exception as log_err:
-                         logger.error(f"Error fetching removed posts from mod log: {log_err}")
-
-                    # --- Fetch PRAW objects for Mod Log IDs not already present ---
-                    # Use fullname keys for consistency when checking existence
-                    fullnames_to_fetch_from_log = list(mod_log_fullnames - set(merged_items.keys()))
-                    if fullnames_to_fetch_from_log:
-                        logger.debug(f"Fetching {len(fullnames_to_fetch_from_log)} additional items found only in mod log...")
-                        try:
-                            # Fetch in batches if necessary, though reddit.info handles lists well
-                            fetched_log_items = list(self.reddit.info(fullnames=fullnames_to_fetch_from_log))
-                            added_count = 0
-                            for item in fetched_log_items:
-                                # Ensure we got a Submission object back
-                                if not isinstance(item, Submission):
-                                    logger.warning(f"Skipping non-Submission item from mod log info fetch: {type(item)}")
-                                    continue
-
-                                item_fullname = getattr(item, 'fullname', None) # Use fullname as key
-                                if item_fullname and item_fullname.startswith('t3_') and item_fullname not in merged_items:
-                                    merged_items[item_fullname] = item # Add using fullname key
-                                    added_count += 1
-                                # else: logger.debug(f"Item {item_fullname} from mod log fetch already exists or invalid.")
-                            logger.debug(f"Added {added_count} items from mod log fetch. Total merged: {len(merged_items)}")
-                        except Exception as info_err:
-                            logger.error(f"Error fetching items from mod log via reddit.info(): {info_err}")
-
-                    # --- Final combined list ---
-                    initial_listing = list(merged_items.values())
-                    # Sort the combined list by creation time (descending)
-                    initial_listing.sort(key=lambda x: getattr(x, 'created_utc', 0), reverse=True)
-                    logger.debug(f"Total items after merging all sources: {len(initial_listing)}")
-
-                else: # Regular user view
+                    # For 'Fetch Next 500', only paginate the 'new' listing with 'after'
+                    gen = self.subreddit.new(limit=total)
+                    if after:
+                        gen.params['after'] = after
+                    initial_listing = list(gen)
+                    logger.debug(f"Fetched {len(initial_listing)} items from mod 'new' listing (after={after})")
+                else:
                     logger.debug("Fetching regular view...")
-                    initial_listing = list(self.subreddit.new(**params))
+                    gen = self.subreddit.new(limit=total)
+                    if after:
+                        gen.params['after'] = after
+                    initial_listing = list(gen)
 
-            # --- 3. Process merged items against cache ---
-            # The initial_listing now contains PRAW objects, sorted by time.
-            # No need to collect IDs and re-fetch with reddit.info() again.
-            logger.debug(f"Processing {len(initial_listing)} merged submissions against cache...")
+            logger.debug(f"Processing {len(initial_listing)} submissions against cache...")
 
-            # --- Efficiency Improvement: Batch cache report data for moderator ---
-            if self.is_moderator:
-                for submission_obj in initial_listing:
-                    if not isinstance(submission_obj, Submission) or not hasattr(submission_obj, 'id'):
-                        continue
-                    submission_id = submission_obj.id
-                    metadata_path = get_metadata_file_path(submission_id)
-                    if metadata_path:
-                        try:
-                            mod_reports = getattr(submission_obj, 'mod_reports', [])
-                            user_reports = getattr(submission_obj, 'user_reports', [])
-                            formatted_reports = []
-                            for reason, moderator in mod_reports:
-                                formatted_reports.append(f"Moderator {moderator}: {reason}")
-                            user_report_count = 0
-                            for report_item in user_reports:
-                                try:
-                                    if isinstance(report_item, (list, tuple)) and len(report_item) >= 2:
-                                        reason, count = report_item[0], report_item[1]
-                                        if isinstance(count, int):
-                                            user_report_count += count
-                                            formatted_reports.append(f"Users ({count}): {reason}" if count > 1 else f"User: {reason}")
-                                        else:
-                                            user_report_count += 1
-                                            formatted_reports.append(f"User: {reason} ({count})")
-                                    else:
-                                        user_report_count += 1
-                                        formatted_reports.append(f"Report: {report_item}")
-                                except Exception as item_e:
-                                    user_report_count += 1
-                                    formatted_reports.append("Unprocessable report")
-                            total_reports = len(mod_reports) + user_report_count
-                            metadata = read_metadata_file(metadata_path) or {'id': submission_id}
-                            metadata['report_count'] = total_reports
-                            metadata['report_reasons'] = formatted_reports
-                            metadata['last_checked_utc'] = time.time()
-                            write_metadata_file(metadata_path, metadata)
-                        except Exception as e:
-                            logger.error(f"Error batch-caching reports for {submission_id}: {e}")
-
-            for submission_obj in initial_listing: # Iterate directly through the PRAW objects
-                # Ensure it's a valid object with an ID
+            for submission_obj in initial_listing:
                 if not isinstance(submission_obj, Submission) or not hasattr(submission_obj, 'id'):
                     logger.warning(f"Skipping invalid object during cache processing: {type(submission_obj)}")
                     continue
 
-                submission_id = submission_obj.id # Use the object's ID attribute
+                submission_id = submission_obj.id
 
                 # Check cache using the ID
                 cached_data = None
-                metadata_path_rel = submission_index.get(submission_id) # Index uses ID
+                metadata_path_rel = submission_index.get(submission_id)
                 if metadata_path_rel:
                     abs_metadata_path = os.path.abspath(os.path.join(cache_dir, metadata_path_rel.replace('/', os.sep)))
                     if os.path.exists(abs_metadata_path):
                         cached_data = read_metadata_file(abs_metadata_path)
                         if cached_data:
                             media_cache_path = cached_data.get('cache_path')
-                            # Use file_exists_in_cache for media file check
                             if media_cache_path and file_exists_in_cache(media_cache_path):
                                 logger.debug(f"Cache HIT for {submission_id}.")
                                 cached_obj = SimpleNamespace(**cached_data)
@@ -417,11 +287,10 @@ class RedditGalleryModel:
                         else:
                             logger.debug(f"Cache MISS for {submission_id}: Metadata invalid.")
                     else:
-                         logger.debug(f"Cache MISS for {submission_id}: Metadata path not found.")
+                        logger.debug(f"Cache MISS for {submission_id}: Metadata path not found.")
                 else:
                     logger.debug(f"Cache MISS for {submission_id}: Not in index.")
 
-                # Cache miss or invalid cache: Use the fetched PRAW object
                 logger.debug(f"Using fetched PRAW object for {submission_id}.")
                 snapshot_results.append(submission_obj)
 

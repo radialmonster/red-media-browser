@@ -231,6 +231,26 @@ class RedMediaBrowser(QMainWindow):
         self.next_button.setEnabled(False)
         nav_layout.addWidget(self.next_button)
 
+        # --- Mod-only Buttons ---
+        self.view_reports_button = QPushButton("View Reports")
+        self.view_reports_button.setToolTip("View posts in the mod reports queue")
+        self.view_reports_button.clicked.connect(self.view_reports)
+        self.view_reports_button.setVisible(False)
+        nav_layout.addWidget(self.view_reports_button)
+
+        self.view_removed_button = QPushButton("View Removed")
+        self.view_removed_button.setToolTip("View posts that have been removed")
+        self.view_removed_button.clicked.connect(self.view_removed)
+        self.view_removed_button.setVisible(False)
+        nav_layout.addWidget(self.view_removed_button)
+
+        # --- Fetch Next 500 Button ---
+        self.fetch_next_100_button = QPushButton("Fetch Next 500")
+        self.fetch_next_100_button.setToolTip("Fetch the next 500 posts and add them to the list")
+        self.fetch_next_100_button.clicked.connect(self.fetch_next_500)
+        self.fetch_next_100_button.setEnabled(False)
+        nav_layout.addWidget(self.fetch_next_100_button)
+
         main_layout.addLayout(nav_layout)
 
         # Status displays
@@ -560,6 +580,14 @@ class RedMediaBrowser(QMainWindow):
         # Reset pagination controls
         self.prev_button.setEnabled(False)
         self.next_button.setEnabled(len(self.current_snapshot) > self.snapshot_page_size)
+
+        # Enable/disable mod-only buttons and "Fetch Next 500"
+        is_mod = False
+        if self.current_model and not self.current_model.is_user_mode:
+            is_mod = self.current_model.check_user_moderation_status()
+        self.view_reports_button.setVisible(is_mod)
+        self.view_removed_button.setVisible(is_mod)
+        self.fetch_next_100_button.setEnabled(len(self.current_snapshot) > 0)
 
         # Update status
         self.is_loading_posts = False
@@ -1067,6 +1095,129 @@ class RedMediaBrowser(QMainWindow):
         logger.error(f"Ban failed: {error_message}")
         QMessageBox.warning(self, "Ban Error", f"Failed to ban user:\n{error_message}")
         self.ban_worker = None # Clear specific worker reference
+
+    # --- Fetch Next 500 Logic ---
+    def fetch_next_500(self):
+        """Fetch the next 500 posts after the last currently loaded post."""
+        if not self.current_model or not self.current_snapshot:
+            return
+
+        # Get the fullname of the last post in the current snapshot
+        last_post = self.current_snapshot[-1]
+        last_fullname = getattr(last_post, "fullname", None)
+        if not last_fullname:
+            # Try to construct fullname from id
+            post_id = getattr(last_post, "id", None)
+            if post_id:
+                last_fullname = f"t3_{post_id}"
+            else:
+                QMessageBox.warning(self, "Error", "Could not determine the last post's fullname.")
+                return
+
+        # Show loading indicator
+        self.loading_bar.show()
+        self.is_loading_posts = True
+        self.fetch_next_100_button.setEnabled(False)
+
+        # Start a thread to fetch the next 500 posts
+        self.next_500_fetcher = SnapshotFetcher(self.current_model, total=500, after=last_fullname)
+        self.next_500_fetcher.snapshotFetched.connect(self.on_next_500_fetched)
+        self.next_500_fetcher.start()
+
+    # --- View Reports Logic ---
+    def view_reports(self):
+        """Fetch and display up to 500 posts from the mod reports queue."""
+        if not self.current_model or self.current_model.is_user_mode or not hasattr(self.current_model, "subreddit"):
+            return
+        self.loading_bar.show()
+        self.is_loading_posts = True
+        self.view_reports_button.setEnabled(False)
+        try:
+            reports = list(self.current_model.subreddit.mod.reports(limit=500))
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to fetch reports: {e}")
+            self.loading_bar.hide()
+            self.is_loading_posts = False
+            self.view_reports_button.setEnabled(True)
+            return
+        self.current_snapshot = reports
+        self.snapshot_offset = 0
+        self.display_current_page()
+        self.statusBar.showMessage(f"Showing up to 500 reported posts")
+        self.source_label.setText(f"Subreddit: {self.current_model.source_name} - Reports ({len(reports)})")
+        self.loading_bar.hide()
+        self.is_loading_posts = False
+        self.view_reports_button.setEnabled(True)
+
+    # --- View Removed Logic ---
+    def view_removed(self):
+        """Fetch and display up to 500 removed posts (using mod log)."""
+        if not self.current_model or self.current_model.is_user_mode or not hasattr(self.current_model, "subreddit"):
+            return
+        self.loading_bar.show()
+        self.is_loading_posts = True
+        self.view_removed_button.setEnabled(False)
+        try:
+            # Use mod.log(action="removelink") for compatibility
+            removed_log = list(self.current_model.subreddit.mod.log(action="removelink", limit=500))
+            # Get the target_fullname for each log entry, then fetch the submissions
+            fullnames = [entry.target_fullname for entry in removed_log if getattr(entry, "target_fullname", "").startswith("t3_")]
+            if fullnames:
+                removed = list(self.current_model.subreddit._reddit.info(fullnames=fullnames))
+            else:
+                removed = []
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Failed to fetch removed posts: {e}")
+            self.statusBar.showMessage("Failed to fetch removed posts (see terminal for details)")
+            self.loading_bar.hide()
+            self.is_loading_posts = False
+            self.view_removed_button.setEnabled(True)
+            return
+        self.current_snapshot = removed
+        self.snapshot_offset = 0
+        self.display_current_page()
+        self.statusBar.showMessage(f"Showing up to 500 removed posts")
+        self.source_label.setText(f"Subreddit: {self.current_model.source_name} - Removed ({len(removed)})")
+        self.loading_bar.hide()
+        self.is_loading_posts = False
+        self.view_removed_button.setEnabled(True)
+
+    def on_next_500_fetched(self, new_posts):
+        """Append the next 500 posts to the current snapshot and update the UI."""
+        # Deduplicate: only add posts not already in current_snapshot
+        existing_ids = {getattr(post, "id", None) for post in self.current_snapshot}
+        unique_new_posts = [post for post in new_posts if getattr(post, "id", None) not in existing_ids]
+
+        if unique_new_posts:
+            self.current_snapshot.extend(unique_new_posts)
+            self.statusBar.showMessage(f"Fetched {len(unique_new_posts)} new posts. Total: {len(self.current_snapshot)}")
+        else:
+            self.statusBar.showMessage("No new posts found.")
+
+        # Enable/disable the button depending on whether we got a full batch
+        self.fetch_next_100_button.setEnabled(len(new_posts) == 500)
+
+        # Hide loading indicator
+        self.is_loading_posts = False
+        self.loading_bar.hide()
+
+        # Update next/prev buttons
+        self.next_button.setEnabled(self.snapshot_offset + self.snapshot_page_size < len(self.current_snapshot))
+        self.prev_button.setEnabled(self.snapshot_offset > 0)
+
+        # Update the source label
+        source_type = "User" if self.current_model.is_user_mode else "Subreddit"
+        source = self.source_input.text().strip()
+        self.source_label.setText(f"{source_type}: {source} - {len(self.current_snapshot)} posts")
+
+        # If we're at the end, show the new page
+        if self.snapshot_offset + self.snapshot_page_size >= len(self.current_snapshot) - len(unique_new_posts):
+            self.snapshot_offset = max(0, len(self.current_snapshot) - self.snapshot_page_size)
+            self.display_current_page()
+        else:
+            # Otherwise, just update the status bar
+            self.statusBar.showMessage(f"Fetched {len(unique_new_posts)} new posts. Total: {len(self.current_snapshot)}")
 
 # Main application entry point
 if __name__ == "__main__":

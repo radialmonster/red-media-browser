@@ -3,5 +3,6 @@
 /src/cache/
 /src/test/
 /src/config.json
+.venv/
 
 

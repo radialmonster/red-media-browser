@@ -27,6 +27,9 @@ from utils import (
 # Set up logging
 logger = logging.getLogger(__name__)
 
+# Simple cache for processed URLs to avoid duplicate processing
+_processed_url_cache = {}
+
 # Define registry for provider-specific handlers.
 provider_handlers = {}
 
@@ -547,6 +550,11 @@ def process_media_url(url):
     Determine the media provider and delegate URL processing.
     Corrected logic: Run handler first, then check cache with processed URL.
     """
+    # Check cache first to avoid duplicate processing
+    if url in _processed_url_cache:
+        logger.debug(f"Using cached processed URL for: {url}")
+        return _processed_url_cache[url]
+
     logger.debug(f"Processing media URL: {url}")
     processed_url = url # Start with the original URL
 
@@ -617,6 +625,8 @@ def process_media_url(url):
     final_cache_path = get_cache_path_for_url(processed_url)
     if final_cache_path and file_exists_in_cache(processed_url):
         logger.debug(f"Cache hit for FINAL processed URL '{processed_url}' at path: {final_cache_path}")
+        # Cache the result before returning
+        _processed_url_cache[url] = processed_url
         return processed_url # Return the URL corresponding to the cached file
 
     # --- Step 4: Return the URL to be downloaded ---
@@ -624,6 +634,9 @@ def process_media_url(url):
          logger.debug(f"Returning processed URL for download: {processed_url}")
     else:
          logger.debug(f"Returning original URL for download (no processing needed or handler failed): {url}")
+
+    # Cache the result before returning
+    _processed_url_cache[url] = processed_url
     return processed_url # Return the potentially modified URL
 
 

@@ -14,12 +14,21 @@ import shutil
 import json
 import time
 import threading
+import hashlib
 
-from urllib.parse import urlparse, unquote, quote, parse_qs, urljoin
+from urllib.parse import urlparse, unquote, quote, parse_qs
 from praw.models import Redditor, Subreddit
 
 # Basic Logging Configuration
 logger = logging.getLogger(__name__)
+
+# --- Media File Extension Constants ---
+IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
+VIDEO_EXTENSIONS = ['.mp4', '.webm', '.avi', '.mov', '.mkv', '.flv']
+ANIMATED_IMAGE_EXTENSIONS = ['.gif']
+
+# Directory structure constants
+MIN_ID_LENGTH_FOR_SUBDIRS = 6
 
 # --- File Cache Preload Globals ---
 _file_cache_set = None
@@ -39,52 +48,118 @@ def preload_file_cache():
             if fname.endswith('.json') or fname == 'submission_index.json':
                 continue
             # Store relative path from cache_dir for fast lookup
-            rel_path = os.path.relpath(os.path.join(root, fname), cache_dir)
-            file_set.add(rel_path.replace(os.sep, '/'))  # Use posix separators
+            try:
+                rel_path = os.path.relpath(os.path.join(root, fname), cache_dir)
+                file_set.add(rel_path.replace(os.sep, '/'))  # Use posix separators
+            except ValueError as e:
+                # Handle case where paths are on different drives (Windows)
+                logger.warning(f"Could not create relative path for {fname}: {e}")
+                # Use a normalized fallback that maintains consistency
+                abs_path = os.path.join(root, fname)
+                # Create a pseudo-relative path using the filename and parent dir
+                fallback_path = f"external/{os.path.basename(root)}/{fname}"
+                file_set.add(fallback_path.replace(os.sep, '/'))
     with _file_cache_lock:
         _file_cache_set = file_set
     logger.info(f"Preloaded file cache with {len(_file_cache_set)} media files.")
 
-def repair_cache_index():
+def force_repair_cache_index():
+    """Force a complete cache repair regardless of apparent consistency."""
+    return repair_cache_index(force_repair=True)
+
+def repair_cache_index(force_repair=False):
     """
     Scan all cached media files and ensure there is a metadata file and index entry for each.
     If missing, create a minimal metadata file and update the index.
+
+    Args:
+        force_repair (bool): If True, always run repair. If False, only repair if issues detected.
     """
-    logger.info("Starting cache repair/index warming...")
     cache_dir = get_cache_dir()
     metadata_dir = get_metadata_dir()
     index = load_submission_index()
-    repaired = 0
 
-    # Use the preloaded file cache set
+    # Quick check: if we don't have many cached files, repair is fast anyway
     global _file_cache_set
     if _file_cache_set is None:
         logger.warning("File cache not preloaded. Preloading now for repair.")
         preload_file_cache()
 
-    # Build a reverse lookup: cache_path -> submission_id
-    logger.info("Building reverse lookup for existing metadata files...")
-    cache_path_to_id = {}
+    num_cached_files = len(_file_cache_set)
+    num_index_entries = len(index)
+
+    # Only run repair if forced, or if there's a significant mismatch suggesting missing entries
+    if not force_repair:
+        # Be more lenient with the threshold - many index entries are metadata-only (text posts, failed downloads)
+        # Only trigger repair if we have significantly MORE media files than index entries (missing metadata)
+        # If index entries > media files, that's normal (text posts, failed downloads, etc.)
+
+        if num_index_entries >= num_cached_files:
+            # More index entries than files is normal, only repair if ratio is extreme
+            ratio = num_index_entries / max(num_cached_files, 1)
+            if ratio < 5.0:  # Allow up to 5x more index entries than media files
+                logger.debug(f"Cache appears consistent ({num_cached_files} files, {num_index_entries} index entries, ratio {ratio:.1f}x). Skipping repair.")
+                return
+            else:
+                logger.info(f"Excessive index entries detected ({num_cached_files} files vs {num_index_entries} index entries, ratio {ratio:.1f}x). Running cleanup repair...")
+        else:
+            # More files than index entries suggests missing metadata
+            variance_threshold = max(10, num_cached_files * 0.05)  # 5% or at least 10 files
+            missing_entries = num_cached_files - num_index_entries
+            if missing_entries < variance_threshold:
+                logger.debug(f"Cache appears consistent ({num_cached_files} files, {num_index_entries} index entries, {missing_entries} missing). Skipping repair.")
+                return
+            else:
+                logger.info(f"Missing index entries detected ({missing_entries} files without metadata). Running repair...")
+
+    logger.info("Starting cache repair/index warming...")
+    repaired = 0
+
+    # Build a set of all cache paths from metadata for O(1) lookup
+    logger.info("Building cache path lookup from metadata...")
+    existing_cache_paths = set()
+
     for sub_id, meta_rel in index.items():
         meta_path = os.path.join(cache_dir, meta_rel.replace('/', os.sep))
         if os.path.exists(meta_path):
             try:
                 with open(meta_path, 'r', encoding='utf-8') as f:
-                    meta = json.load(f)
-                    cpath = meta.get('cache_path')
-                    if cpath:
-                        cache_path_to_id[cpath] = sub_id
+                    # Quick check first
+                    content = f.read(1024)
+                    if '"cache_path"' in content:
+                        f.seek(0)
+                        try:
+                            meta = json.load(f)
+                            cache_path = meta.get('cache_path')
+                            if cache_path:
+                                # Normalize path separators for consistent comparison
+                                normalized_path = cache_path.replace('\\', '/').replace('/', os.sep)
+                                existing_cache_paths.add(os.path.normpath(normalized_path))
+                        except json.JSONDecodeError:
+                            continue
             except Exception:
                 continue
 
+    logger.info(f"Found {len(existing_cache_paths)} existing cache paths in metadata")
+    logger.info("Checking for missing metadata entries...")
+
     for rel_path in _file_cache_set:
         abs_path = os.path.join(cache_dir, rel_path)
-        if abs_path in cache_path_to_id:
+        normalized_abs_path = os.path.normpath(abs_path)
+
+        if normalized_abs_path in existing_cache_paths:
             continue  # Already indexed
 
         # Not found, create a new metadata file and index entry
         fname = os.path.basename(rel_path)
         base_id = os.path.splitext(fname)[0]
+
+        # Ensure the synthetic ID is long enough for standard directory structure
+        if len(base_id) < MIN_ID_LENGTH_FOR_SUBDIRS:
+            # Pad with hash to ensure consistent length
+            hash_suffix = hashlib.md5(rel_path.encode()).hexdigest()[:8]
+            base_id = f"{base_id}_{hash_suffix}"
+
         submission_id = f"cachefile_{base_id}"
         meta_path = get_metadata_file_path(submission_id)
         minimal_metadata = {
@@ -95,13 +170,20 @@ def repair_cache_index():
             "last_checked_utc": time.time(),
         }
         if write_metadata_file(meta_path, minimal_metadata):
-            rel_meta_path = os.path.relpath(meta_path, cache_dir).replace(os.sep, '/')
+            try:
+                rel_meta_path = os.path.relpath(meta_path, cache_dir).replace(os.sep, '/')
+            except ValueError:
+                # Handle case where paths are on different drives (Windows)
+                rel_meta_path = meta_path.replace(os.sep, '/')
             index[submission_id] = rel_meta_path
             repaired += 1
 
     if repaired > 0:
-        save_submission_index()
-        logger.info(f"Cache repair complete. Added {repaired} missing metadata/index entries.")
+        try:
+            save_submission_index()
+            logger.info(f"Cache repair complete. Added {repaired} missing metadata/index entries.")
+        except Exception as e:
+            logger.error(f"Cache repair failed to save index after adding {repaired} entries: {e}")
     else:
         logger.info("Cache repair complete. No missing entries found.")
 
@@ -110,10 +192,10 @@ def file_in_cache_preloaded(rel_path):
     Check if a file (relative to cache dir, posix style) is in the preloaded file cache set.
     """
     global _file_cache_set
-    if _file_cache_set is None:
-        logger.warning("File cache set not preloaded. Call preload_file_cache() first.")
-        return False
     with _file_cache_lock:
+        if _file_cache_set is None:
+            logger.warning("File cache set not preloaded. Call preload_file_cache() first.")
+            return False
         return rel_path in _file_cache_set
 
 # --- Metadata Cache Globals ---
@@ -141,8 +223,18 @@ def clean_filename(filename):
     """Clean a filename to make it safe for the filesystem."""
     if not filename:
         return "unknown_file"
-    # Replace problematic characters
-    return filename.replace('?', '_').replace('&', '_').replace('=', '_')
+    # Replace problematic characters for cross-platform filesystem safety
+    unsafe_chars = '<>:"|?*\\/'
+    for char in unsafe_chars:
+        filename = filename.replace(char, '_')
+    # Also handle query parameters and other URL artifacts
+    filename = filename.replace('&', '_').replace('=', '_')
+    # Remove or replace any remaining control characters
+    filename = ''.join(c if ord(c) >= 32 else '_' for c in filename)
+    # Ensure it's not too long (max 255 chars for most filesystems)
+    if len(filename) > 200:  # Leave room for extensions
+        filename = filename[:200]
+    return filename
     
 def normalize_redgifs_url(url):
     """
@@ -171,6 +263,38 @@ def ensure_json_url(url):
         url = url + ".json"
     return url
 
+def _extract_gallery_urls(media_metadata, submission_id_str, source_type):
+    """Helper function to extract URLs from gallery metadata."""
+    if not isinstance(media_metadata, dict):
+        logger.warning(f"media_metadata is not a dict for {submission_id_str} ({source_type}), type: {type(media_metadata)}")
+        return None
+
+    try:
+        urls = [
+            html.unescape(media['s']['u'])
+            for media in media_metadata.values()
+            if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']
+        ]
+        if urls:
+            logger.debug(f"Extracted {len(urls)} gallery URLs from {source_type} {submission_id_str}.")
+            return urls
+        logger.warning(f"{source_type.title()} gallery detected but no valid URLs found in media_metadata for {submission_id_str}")
+    except Exception as e:
+        logger.error(f"Error processing {source_type} gallery metadata for {submission_id_str}: {e}")
+
+    return None
+
+def _try_direct_url(data_source, submission_id_str, source_type):
+    """Helper function to extract direct URL from a data source."""
+    url = data_source.get('url') if hasattr(data_source, 'get') else getattr(data_source, 'url', None)
+    if url:
+        if any(url.lower().endswith(ext) for ext in IMAGE_EXTENSIONS):
+            logger.debug(f"Using direct image URL from {source_type} {submission_id_str}: {url}")
+            return [url]
+        logger.debug(f"{source_type.title()} URL found for {submission_id_str}, but not a direct image link: {url}")
+        return [url]  # Return anyway for further processing
+    return None
+
 def extract_image_urls(submission):
     """
     Given a submission object (PRAW or SimpleNamespace/dict), returns a list of image URLs.
@@ -182,162 +306,143 @@ def extract_image_urls(submission):
     # Check for crosspost first
     crosspost_parent_list = getattr(submission, 'crosspost_parent_list', None)
     if crosspost_parent_list and isinstance(crosspost_parent_list, list) and len(crosspost_parent_list) > 0:
-        parent_data = crosspost_parent_list[0]  # Expected to be a dictionary
+        parent_data = crosspost_parent_list[0]
         logger.debug(f"Processing {submission_id_str} as crosspost.")
 
-        # Check parent for gallery
-        parent_is_gallery = parent_data.get('is_gallery', False)
-        parent_media_metadata = parent_data.get('media_metadata', None)
+        # Try gallery first
+        if parent_data.get('is_gallery') and parent_data.get('media_metadata'):
+            gallery_urls = _extract_gallery_urls(parent_data.get('media_metadata'), submission_id_str, "crosspost parent")
+            if gallery_urls:
+                return gallery_urls
 
-        if parent_is_gallery and parent_media_metadata and isinstance(parent_media_metadata, dict):
-            try:
-                urls = [
-                    html.unescape(media['s']['u'])
-                    for media in parent_media_metadata.values()
-                    if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']
-                ]
-                if urls:
-                    logger.debug(f"Extracted {len(urls)} gallery URLs from crosspost parent {submission_id_str}.")
-                    return urls
-                logger.warning(
-                    f"Crosspost parent gallery detected but no valid URLs found in media_metadata for {submission_id_str}"
-                )
-            except Exception as e:
-                logger.error(f"Error processing crosspost parent gallery metadata for {submission_id_str}: {e}")
+        # Try direct URL
+        direct_urls = _try_direct_url(parent_data, submission_id_str, "crosspost parent")
+        if direct_urls:
+            return direct_urls
 
-        # Check parent for direct URL (if not a gallery or gallery extraction failed)
-        parent_url = parent_data.get('url', None)
-        if parent_url:
-            if any(parent_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
-                logger.debug(f"Using direct image URL from crosspost parent {submission_id_str}: {parent_url}")
-                return [parent_url]
-            logger.debug(
-                f"Crosspost parent URL found for {submission_id_str}, but not a direct image link: {parent_url}. Falling back."
-            )
-        else:
-            logger.debug(f"No gallery or direct URL found in crosspost parent for {submission_id_str}")
+        logger.debug(f"No gallery or direct URL found in crosspost parent for {submission_id_str}")
 
-    # If not crosspost (or crosspost processing failed/didn't find media)
+    # Process main submission
     logger.debug(f"Processing {submission_id_str} as regular post (or fallback from crosspost)")
 
-    # Check main submission for gallery
-    is_gallery = getattr(submission, 'is_gallery', False)
-    media_metadata = getattr(submission, 'media_metadata', None)
+    # Try gallery
+    if getattr(submission, 'is_gallery', False) and getattr(submission, 'media_metadata', None):
+        gallery_urls = _extract_gallery_urls(getattr(submission, 'media_metadata'), submission_id_str, "main submission")
+        if gallery_urls:
+            return gallery_urls
 
-    if is_gallery and media_metadata:
-        try:
-            if not isinstance(media_metadata, dict):
-                logger.warning(f"media_metadata is not a dict for {submission_id_str}, type: {type(media_metadata)}")
-                url = getattr(submission, 'url', None)
-                if url:
-                    logger.debug(f"Falling back to direct URL for non-dict media_metadata: {url}")
-                    return [url]
-                logger.error(
-                    f"Cannot extract gallery URLs (media_metadata not dict) and no fallback URL for {submission_id_str}"
-                )
-                return []
-
-            urls = [
-                html.unescape(media['s']['u'])
-                for media in media_metadata.values()
-                if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']
-            ]
-            if urls:
-                logger.debug(f"Extracted {len(urls)} gallery URLs from main submission {submission_id_str}.")
-                return urls
-            logger.warning(
-                f"Main submission gallery detected but no valid URLs found in media_metadata for {submission_id_str}"
-            )
-        except Exception as e:
-            logger.error(f"Error processing main submission gallery metadata for {submission_id_str}: {e}")
-
-    # Fallback to direct URL on main submission
-    url = getattr(submission, 'url', None)
-    if url:
-        if any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
-            logger.debug(f"Using direct image URL from main submission {submission_id_str}: {url}")
+        # Gallery failed, try direct URL fallback
+        url = getattr(submission, 'url', None)
+        if url:
+            logger.debug(f"Falling back to direct URL for gallery failure: {url}")
             return [url]
-        logger.warning(
-            f"Direct URL from main submission {submission_id_str} is not an image link: {url}. Returning anyway."
-        )
-        return [url]
+
+    # Try direct URL
+    direct_urls = _try_direct_url(submission, submission_id_str, "main submission")
+    if direct_urls:
+        return direct_urls
 
     logger.error(f"Could not extract any image URL for submission {submission_id_str}")
     return []
 
 def is_image_file(file_path):
     """Check if the file is an image based on extension."""
-    image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
     ext = os.path.splitext(file_path.lower())[1]
-    return ext in image_extensions
+    return ext in IMAGE_EXTENSIONS
 
 def is_video_file(file_path):
     """Check if the file is a video based on extension."""
-    video_extensions = ['.mp4', '.webm', '.avi', '.mov', '.mkv', '.flv']
     ext = os.path.splitext(file_path.lower())[1]
-    
+
     # Special case for RedGifs URLs that may not have proper extensions
     if 'redgifs.com' in file_path.lower() and any(domain in file_path.lower() for domain in ['media.redgifs.com', 'thumbs2.redgifs.com']):
         return True
-        
-    return ext in video_extensions
+
+    return ext in VIDEO_EXTENSIONS
 
 def is_animated_image(file_path):
     """Check if the file is an animated image (gif, etc)."""
-    return file_path.lower().endswith('.gif')  # Could be extended for other formats
+    ext = os.path.splitext(file_path.lower())[1]
+    return ext in ANIMATED_IMAGE_EXTENSIONS
+
+def _detect_redgifs_media_type(file_path):
+    """Helper function to detect media type for RedGifs URLs."""
+    ext = os.path.splitext(file_path.lower())[1]
+
+    if ext in IMAGE_EXTENSIONS and ext not in ANIMATED_IMAGE_EXTENSIONS:
+        logger.debug(f"RedGifs image detected: {file_path}")
+        return "image"
+    elif ext in ANIMATED_IMAGE_EXTENSIONS:
+        logger.debug(f"RedGifs animated image detected: {file_path}")
+        return "animated_image"
+    elif ext in VIDEO_EXTENSIONS or ext == '':  # Empty extension might be a video
+        logger.debug(f"RedGifs video detected: {file_path}")
+        return "video"
+
+    return None
+
+def _detect_media_type_by_signature(file_path):
+    """Helper function to detect media type by file signature/magic bytes."""
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(16)  # Read first 16 bytes for signature detection
+
+            # Check for MP4 signature (ftyp box)
+            if len(header) >= 8 and header[4:8] == b'ftyp':
+                return "video"
+
+            # WebM signature (matroska container)
+            if header.startswith(b'\x1a\x45\xdf\xa3'):
+                return "video"
+
+            # JPEG signature
+            if header.startswith(b'\xff\xd8\xff'):
+                return "image"
+
+            # PNG signature
+            if header.startswith(b'\x89\x50\x4e\x47\x0d\x0a\x1a\x0a'):
+                return "image"
+
+            # WebP signature
+            if len(header) >= 12 and header[0:4] == b'RIFF' and header[8:12] == b'WEBP':
+                return "image"
+
+            # BMP signature
+            if header.startswith(b'BM'):
+                return "image"
+
+            # GIF signature (and check if it's animated)
+            if header.startswith(b'GIF87a') or header.startswith(b'GIF89a'):
+                # We'd need more complex logic to check if it's animated
+                # Just assume GIF is animated for now
+                return "animated_image"
+
+    except Exception as e:
+        logger.error(f"Error determining file type from contents: {e}")
+
+    return None
 
 def get_media_type(file_path):
     """Determine the media type of a file."""
     # Special case for RedGifs content - check extension first
     if 'redgifs.com' in file_path.lower():
-        # Check file extension to determine if it's an image or video
-        ext = os.path.splitext(file_path.lower())[1]
-        if ext in ['.jpg', '.jpeg', '.png', '.webp']:
-            logger.debug(f"RedGifs image detected: {file_path}")
-            return "image"
-        elif ext in ['.gif']:
-            logger.debug(f"RedGifs animated image detected: {file_path}")
-            return "animated_image"
-        elif ext in ['.mp4', '.webm', '']:  # Empty extension might be a video
-            logger.debug(f"RedGifs video detected: {file_path}")
-            return "video"
-    
-    # Normal file type detection
+        redgifs_type = _detect_redgifs_media_type(file_path)
+        if redgifs_type:
+            return redgifs_type
+
+    # Normal file type detection by extension
     if is_image_file(file_path):
-        if is_animated_image(file_path):
-            return "animated_image"
-        return "image"
-    elif is_video_file(file_path):
+        return "animated_image" if is_animated_image(file_path) else "image"
+
+    if is_video_file(file_path):
         return "video"
-    
-    # If we get here, try to determine by checking the actual file
+
+    # If extension detection fails, try file signature detection
     if os.path.exists(file_path):
-        try:
-            # Check file signature/magic bytes for common media types
-            with open(file_path, 'rb') as f:
-                header = f.read(12)  # Read first 12 bytes for signature detection
-                
-                # Check for MP4 signature
-                if header.startswith(b'\x00\x00\x00\x18\x66\x74\x79\x70') or \
-                   header.startswith(b'\x00\x00\x00\x20\x66\x74\x79\x70'):
-                    return "video"
-                    
-                # JPEG signature
-                if header.startswith(b'\xff\xd8\xff'):
-                    return "image"
-                    
-                # PNG signature
-                if header.startswith(b'\x89\x50\x4e\x47\x0d\x0a\x1a\x0a'):
-                    return "image"
-                    
-                # GIF signature (and check if it's animated)
-                if header.startswith(b'GIF87a') or header.startswith(b'GIF89a'):
-                    # We'd need more complex logic to check if it's animated
-                    # Just assume GIF is animated for now
-                    return "animated_image"
-        except Exception as e:
-            logger.error(f"Error determining file type from contents: {e}")
-    
+        signature_type = _detect_media_type_by_signature(file_path)
+        if signature_type:
+            return signature_type
+
     # Default if all else fails
     return "unknown"
 
@@ -348,7 +453,11 @@ def file_exists_in_cache(url):
         logger.debug(f"file_exists_in_cache: No cache path for URL: {url}")
         return False
     cache_dir = get_cache_dir()
-    rel_path = os.path.relpath(cache_path, cache_dir).replace(os.sep, '/')
+    try:
+        rel_path = os.path.relpath(cache_path, cache_dir).replace(os.sep, '/')
+    except ValueError:
+        # Handle case where paths are on different drives (Windows)
+        rel_path = cache_path.replace(os.sep, '/')
     # Prefer preloaded set if available
     global _file_cache_set
     if _file_cache_set is not None:
@@ -366,6 +475,74 @@ def file_exists_in_cache(url):
         logger.debug(f"file_exists_in_cache: Disk MISS for {cache_path}")
     return exists
 
+def _normalize_url_for_caching(url):
+    """Helper function to normalize URL by removing query parameters for media files."""
+    try:
+        parsed_url = urlparse(url)
+        path = unquote(parsed_url.path)
+        filename = os.path.basename(path)
+
+        # If the URL has a query string and looks like an image/video, ignore the query for cache path
+        all_media_extensions = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+        if parsed_url.query and any(filename.lower().endswith(ext) for ext in all_media_extensions):
+            url_no_query = url.split('?', 1)[0]
+            parsed_url = urlparse(url_no_query)
+            path = unquote(parsed_url.path)
+            filename = os.path.basename(path)
+
+        return parsed_url, path, filename
+    except Exception:
+        return None, None, None
+
+def _handle_redgifs_filename(url, domain, filename):
+    """Helper function to handle RedGifs-specific filename logic."""
+    original_ext = os.path.splitext(filename)[1].lower()
+    all_media_extensions = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+
+    # If already has a valid media extension, keep as is
+    if original_ext in all_media_extensions:
+        return filename
+
+    # Handle watch/ifr URLs
+    if "/watch/" in url or "/ifr/" in url:
+        match = re.search(r'(?:watch|ifr)/([A-Za-z0-9]+)', url)
+        if match:
+            redgifs_id = match.group(1)
+            return f"{redgifs_id}.mp4"
+        else:
+            url_hash = hashlib.md5(url.encode()).hexdigest()
+            return f"redgif_watch_hash_{url_hash}.mp4"
+
+    # Handle i.redgifs.com URLs without extension
+    if not original_ext and "i.redgifs.com" in domain:
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        logger.warning(f"RedGifs URL has no extension, using hash: {url}")
+        return f"redgif_noext_hash_{url_hash}"
+
+    # Fallback for unhandled RedGifs formats
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    logger.warning(f"Unhandled RedGifs URL format for cache path, using hash: {url}")
+    return f"redgif_fallback_hash_{url_hash}{original_ext}"
+
+def _handle_missing_filename(url, domain):
+    """Helper function to generate filename when URL has no filename."""
+    if url.endswith('.mp4'):
+        extension = ".mp4"
+    elif url.endswith('.jpg') or url.endswith('.jpeg'):
+        extension = ".jpg"
+    elif url.endswith('.png'):
+        extension = ".png"
+    elif url.endswith('.gif'):
+        extension = ".gif"
+    elif url.endswith('.webm'):
+        extension = ".webm"
+    elif "redgifs.com" in domain:
+        extension = ".mp4"
+    else:
+        extension = ""
+
+    return f"downloaded_media{extension}"
+
 def get_cache_path_for_url(url):
     """
     Get the cache file path for a URL.
@@ -373,64 +550,24 @@ def get_cache_path_for_url(url):
     Strips query parameters for image/video URLs to ensure consistent cache hits.
     """
     try:
-        parsed_url = urlparse(url)
+        # Parse and normalize URL
+        parsed_url, path, filename = _normalize_url_for_caching(url)
+        if not parsed_url:
+            return None
+
         domain = parsed_url.netloc
         if not domain:
             return None
-
-        # Strip query parameters for image/video URLs
-        path = unquote(parsed_url.path)
-        filename = os.path.basename(path)
-        # If the URL has a query string and looks like an image/video, ignore the query for cache path
-        if parsed_url.query and any(filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.webm']):
-            url_no_query = url.split('?', 1)[0]
-            parsed_url = urlparse(url_no_query)
-            path = unquote(parsed_url.path)
-            filename = os.path.basename(path)
 
         domain_dir = get_domain_cache_dir(domain)
 
         # Special handling for RedGifs domains
         if "redgifs.com" in domain:
-            original_ext = os.path.splitext(filename)[1].lower()
-            if original_ext in ['.jpg', '.jpeg', '.png', 'gif', '.webp', '.mp4', '.webm']:
-                pass  # Keep filename as is
-            elif "/watch/" in url or "/ifr/" in url:
-                match = re.search(r'(?:watch|ifr)/([A-Za-z0-9]+)', url)
-                if match:
-                    redgifs_id = match.group(1)
-                    filename = f"{redgifs_id}.mp4"
-                else:
-                    import hashlib
-                    url_hash = hashlib.md5(url.encode()).hexdigest()
-                    filename = f"redgif_watch_hash_{url_hash}.mp4"
-            elif not original_ext and "i.redgifs.com" in domain:
-                import hashlib
-                url_hash = hashlib.md5(url.encode()).hexdigest()
-                logger.warning(f"RedGifs URL has no extension, using hash: {url}")
-                filename = f"redgif_noext_hash_{url_hash}"
-            else:
-                import hashlib
-                url_hash = hashlib.md5(url.encode()).hexdigest()
-                logger.warning(f"Unhandled RedGifs URL format for cache path, using hash: {url}")
-                filename = f"redgif_fallback_hash_{url_hash}{original_ext}"
+            filename = _handle_redgifs_filename(url, domain, filename)
 
         # Handle URLs without a filename (e.g., root path '/')
-        if not filename or filename == '/':
-            extension = ""
-            if url.endswith('.mp4'):
-                extension = ".mp4"
-            elif url.endswith('.jpg') or url.endswith('.jpeg'):
-                extension = ".jpg"
-            elif url.endswith('.png'):
-                extension = ".png"
-            elif url.endswith('.gif'):
-                extension = ".gif"
-            elif url.endswith('.webm'):
-                extension = ".webm"
-            elif "redgifs.com" in domain:
-                extension = ".mp4"
-            filename = f"downloaded_media{extension}"
+        elif not filename or filename == '/':
+            filename = _handle_missing_filename(url, domain)
 
         filename = clean_filename(filename)
         return os.path.join(domain_dir, filename)
@@ -456,7 +593,7 @@ def get_metadata_file_path(submission_id):
         
     # Remove prefix like 't3_' if present for directory structure
     base_id = submission_id.split('_')[-1]
-    if len(base_id) < 6: # Ensure we have enough characters for subdirs
+    if len(base_id) < MIN_ID_LENGTH_FOR_SUBDIRS: # Ensure we have enough characters for subdirs
         logger.warning(f"Submission ID too short for standard directory structure: {submission_id}")
         # Use a fallback structure or just place it directly? For now, place directly under prefix.
         prefix = submission_id.split('_')[0] if '_' in submission_id else 'unknown'
@@ -528,8 +665,15 @@ def save_submission_index():
                 json.dump(_submission_index, f, indent=2) # Use indent for readability
 
             # Rename temporary file to actual index file (atomic on most systems)
-            os.replace(temp_path, index_path)
-            logger.debug(f"Saved submission index with {len(_submission_index)} entries.")
+            try:
+                os.replace(temp_path, index_path)
+                logger.debug(f"Saved submission index with {len(_submission_index)} entries.")
+            except OSError as e:
+                # Fallback to copy + delete if replace fails
+                logger.warning(f"os.replace failed, using fallback copy method: {e}")
+                shutil.copy2(temp_path, index_path)
+                os.remove(temp_path)
+                logger.debug(f"Saved submission index with {len(_submission_index)} entries (fallback method).")
         except Exception as e:
             logger.exception(f"Error saving submission index: {e}")
             # Clean up temp file if it exists
@@ -566,7 +710,13 @@ def write_metadata_file(metadata_path, metadata):
             try:
                 with open(temp_path, 'w', encoding='utf-8') as f:
                     json.dump(metadata, f, indent=2)  # Use indent for readability
-                os.replace(temp_path, metadata_path)
+                try:
+                    os.replace(temp_path, metadata_path)
+                except OSError as e:
+                    # Fallback to copy + delete if replace fails
+                    logger.warning(f"os.replace failed for {metadata_path}, using fallback copy method: {e}")
+                    shutil.copy2(temp_path, metadata_path)
+                    os.remove(temp_path)
                 return True
             except Exception as e:
                 logger.exception(f"Error writing metadata file {metadata_path}: {e}")
@@ -677,8 +827,9 @@ def update_metadata_cache(submission, media_cache_path, final_media_url):
             with open(metadata_path, 'r', encoding='utf-8') as f:
                 existing = json.load(f)
             # Only update if something important has changed
-            compare_keys = ['cache_path', 'media_url', 'id']
-            if all(existing.get(k) == metadata.get(k) for k in compare_keys):
+            compare_keys = ['cache_path', 'media_url', 'id', 'title', 'score', 'num_comments', 'moderation_status']
+            # Allow for missing keys in either dict (consider them as different)
+            if all(existing.get(k) == metadata.get(k) for k in compare_keys if k in existing or k in metadata):
                 needs_update = False
         except Exception:
             needs_update = True
@@ -690,7 +841,11 @@ def update_metadata_cache(submission, media_cache_path, final_media_url):
 
         # Update the index
         index = load_submission_index() # Load current index (might be cached)
-        relative_metadata_path = os.path.relpath(metadata_path, get_cache_dir())
+        try:
+            relative_metadata_path = os.path.relpath(metadata_path, get_cache_dir())
+        except ValueError:
+            # Handle case where paths are on different drives (Windows)
+            relative_metadata_path = metadata_path
         relative_metadata_path = relative_metadata_path.replace(os.sep, '/')
         index[submission_id] = relative_metadata_path
         save_submission_index()
@@ -699,63 +854,3 @@ def update_metadata_cache(submission, media_cache_path, final_media_url):
         logger.debug(f"Metadata for submission {submission_id} is up to date; no update needed.")
     return True
 
-def clear_metadata_cache():
-    """Deletes all cached metadata JSON files and the index."""
-    metadata_dir = get_metadata_dir()
-    index_path = _get_index_path()
-    
-    logger.info("Clearing metadata cache...")
-    try:
-        if os.path.exists(metadata_dir):
-            shutil.rmtree(metadata_dir)
-            logger.debug(f"Removed metadata directory: {metadata_dir}")
-        # Recreate the base metadata directory
-        ensure_directory(metadata_dir)
-        
-        if os.path.exists(index_path):
-            os.remove(index_path)
-            logger.debug(f"Removed submission index file: {index_path}")
-            
-        # Clear the in-memory cache
-        global _submission_index
-        with _index_lock:
-             _submission_index = {}
-             
-        logger.info("Metadata cache cleared.")
-        return True
-    except Exception as e:
-        logger.exception(f"Error clearing metadata cache: {e}")
-        return False
-
-def clear_full_cache():
-    """Deletes all cached media files AND metadata."""
-    cache_dir = get_cache_dir()
-    logger.info("Clearing full cache (media and metadata)...")
-    try:
-        # List contents *before* deleting the main dir
-        items = os.listdir(cache_dir)
-        for item in items:
-            item_path = os.path.join(cache_dir, item)
-            try:
-                if os.path.isdir(item_path):
-                    shutil.rmtree(item_path)
-                    logger.debug(f"Removed directory: {item_path}")
-                else:
-                    os.remove(item_path)
-                    logger.debug(f"Removed file: {item_path}")
-            except Exception as item_e:
-                 logger.error(f"Error removing cache item {item_path}: {item_e}")
-                 
-        # Ensure cache dir exists after clearing
-        ensure_directory(cache_dir)
-        
-        # Clear the in-memory index cache
-        global _submission_index
-        with _index_lock:
-             _submission_index = {}
-             
-        logger.info("Full cache cleared.")
-        return True
-    except Exception as e:
-        logger.exception(f"Error clearing full cache: {e}")
-        return False

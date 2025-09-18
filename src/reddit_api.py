@@ -10,6 +10,7 @@ import logging
 from typing import List, Dict, Tuple, Optional, Set, Any
 import os
 import time
+import threading
 import praw
 import prawcore.exceptions
 from types import SimpleNamespace # Import SimpleNamespace
@@ -22,6 +23,9 @@ from utils import (
     load_submission_index, get_metadata_file_path, read_metadata_file,
     write_metadata_file, get_cache_dir, update_metadata_cache, file_exists_in_cache
 )
+
+# Import constants
+from constants import DEFAULT_POSTS_FETCH_LIMIT
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -163,46 +167,14 @@ class RedditGalleryModel:
             logger.exception(f"Unexpected error while checking moderation status: {e}")
             return False
 
-    def fetch_submissions(self, after=None, count=10) -> Tuple[List[Any], Optional[str]]:
-        """
-        DEPRECATED: Use fetch_snapshot instead for cache-aware fetching.
-        Fetch a page of submissions from Reddit (old method without caching).
 
-        Args:
-            after: Reddit fullname to fetch posts after
-            count: Number of posts to fetch
-
-        Returns:
-            Tuple of (list of submissions, 'after' parameter for next page)
-        """
-        logger.warning("fetch_submissions is deprecated, use fetch_snapshot.")
-        submissions = []
-        new_after = None
-        try:
-            if self.is_user_mode:
-                if not self.user: return [], None
-                user_params = {'limit': count}
-                if after: user_params['after'] = after
-                submissions = list(self.user.submissions.new(**user_params))
-            else:
-                if not self.subreddit: return [], None
-                sub_params = {'limit': count}
-                if after: sub_params['after'] = after
-                submissions = list(self.subreddit.new(**sub_params))
-
-            if submissions:
-                new_after = submissions[-1].name
-        except Exception as e:
-            logger.exception(f"Error in deprecated fetch_submissions: {e}")
-        return submissions, new_after
-
-    def fetch_snapshot(self, total=100, after=None) -> List[Any]:
+    def fetch_snapshot(self, total=DEFAULT_POSTS_FETCH_LIMIT, after=None) -> List[Any]:
         """
         Fetch a batch of submissions, utilizing the metadata cache.
         For "Fetch Next 100", set total=100 and after=fullname of last post.
 
         Args:
-            total: Number of submissions to fetch (default 100)
+            total: Number of submissions to fetch (default from constants)
             after: Reddit fullname to fetch posts after
 
         Returns:
@@ -277,7 +249,7 @@ class RedditGalleryModel:
                         cached_data = read_metadata_file(abs_metadata_path)
                         if cached_data:
                             media_cache_path = cached_data.get('cache_path')
-                            if media_cache_path and file_exists_in_cache(media_cache_path):
+                            if media_cache_path and os.path.exists(media_cache_path):
                                 logger.debug(f"Cache HIT for {submission_id}.")
                                 cached_obj = SimpleNamespace(**cached_data)
                                 snapshot_results.append(cached_obj)
@@ -307,7 +279,7 @@ class SnapshotFetcher(QThread):
     """
     snapshotFetched = pyqtSignal(list)
 
-    def __init__(self, model, total=100, after=None):
+    def __init__(self, model, total=DEFAULT_POSTS_FETCH_LIMIT, after=None):
         super().__init__()
         self.model = model
         self.total = total
@@ -485,125 +457,11 @@ class BanWorker(QThread):
             self.signals.finished.emit()
 
 
-# --- Standalone Moderation/Report Functions ---
-# These are the original synchronous functions. We'll keep them for now but UI will use workers.
+# --- Request Deduplication Cache ---
+_active_report_requests = {}
+_request_lock = threading.Lock()
 
-def approve_submission(submission_data, reddit_instance) -> bool:
-    """
-    Approve a Reddit submission and update its cached metadata.
-
-    Args:
-        submission_data: PRAW Submission object or SimpleNamespace from cache.
-        reddit_instance: Active PRAW instance for API calls.
-
-    Returns:
-        bool: True if successful, False otherwise.
-    """
-    # This function is now primarily for reference or potential non-UI use.
-    # UI should use ApproveWorker.
-    submission_id = getattr(submission_data, 'id', None)
-    if not submission_id:
-        logger.error("SYNC: Cannot approve submission: Missing ID.")
-        return False
-    if not reddit_instance:
-        logger.error(f"SYNC: Cannot approve submission {submission_id}: Missing PRAW instance.")
-        return False
-
-    try:
-        base_id = submission_id.split('_')[-1]
-        praw_submission = reddit_instance.submission(id=base_id)
-        praw_submission.mod.approve()
-        logger.debug(f"SYNC: Successfully approved submission via API: {submission_id}")
-
-        metadata_path = get_metadata_file_path(submission_id)
-        if metadata_path:
-            metadata = read_metadata_file(metadata_path) or {'id': submission_id}
-            metadata['approved'] = True
-            metadata['removed'] = False
-            metadata['moderation_status'] = "approved"
-            metadata['last_checked_utc'] = time.time()
-            try:
-                praw_submission.load()
-                metadata['score'] = praw_submission.score
-                metadata['num_comments'] = praw_submission.num_comments
-            except Exception as refresh_e:
-                    logger.warning(f"SYNC: Could not refresh score/comments for {submission_id} after approve: {refresh_e}")
-
-            if write_metadata_file(metadata_path, metadata):
-                logger.debug(f"SYNC: Updated cached metadata for {submission_id} to approved.")
-            else:
-                logger.error(f"SYNC: Failed to write updated metadata cache for approved submission {submission_id}.")
-        else:
-            logger.warning(f"SYNC: Could not determine metadata cache path for approved submission {submission_id}.")
-
-        return True
-    except Exception as e:
-        logger.exception(f"SYNC: Error approving submission {submission_id}: {e}")
-        return False
-
-def remove_submission(submission_data, reddit_instance) -> bool:
-    """
-    Remove a Reddit submission and update its cached metadata.
-
-    Args:
-        submission_data: PRAW Submission object or SimpleNamespace from cache.
-        reddit_instance: Active PRAW instance for API calls.
-
-    Returns:
-        bool: True if successful or pending, False otherwise.
-    """
-    # This function is now primarily for reference or potential non-UI use.
-    # UI should use RemoveWorker.
-    submission_id = getattr(submission_data, 'id', None)
-    if not submission_id:
-        logger.error("SYNC: Cannot remove submission: Missing ID.")
-        return False
-    if not reddit_instance:
-        logger.error(f"SYNC: Cannot remove submission {submission_id}: Missing PRAW instance.")
-        return False
-
-    moderation_status_update = "removed" # Default status
-    update_cache = False
-
-    try:
-        base_id = submission_id.split('_')[-1]
-        praw_submission = reddit_instance.submission(id=base_id)
-        praw_submission.mod.remove()
-        logger.debug(f"SYNC: Successfully removed submission via API: {submission_id}")
-        update_cache = True
-
-    except prawcore.exceptions.Forbidden:
-        logger.error(f"SYNC: Forbidden: You do not have permission to remove submission {submission_id}")
-        return False
-    except prawcore.exceptions.RequestException as e:
-        if "ConnectTimeout" in str(e) or "ConnectionError" in str(e):
-            logger.error(f"SYNC: Network connection error while removing submission {submission_id}: {e}")
-            moderation_status_update = "removal_pending" # Mark as pending on network error
-            update_cache = True # Still update cache to reflect pending state
-        else:
-            logger.error(f"SYNC: API request error while removing submission {submission_id}: {e}")
-            return False # Treat other API errors as failure
-    except Exception as e:
-        logger.exception(f"SYNC: Unexpected error while removing submission {submission_id}: {e}")
-        return False
-
-    if update_cache:
-        metadata_path = get_metadata_file_path(submission_id)
-        if metadata_path:
-            metadata = read_metadata_file(metadata_path) or {'id': submission_id}
-            metadata['approved'] = False
-            metadata['removed'] = (moderation_status_update == "removed") # Only True if actually removed
-            metadata['moderation_status'] = moderation_status_update
-            metadata['last_checked_utc'] = time.time()
-            if write_metadata_file(metadata_path, metadata):
-                logger.debug(f"SYNC: Updated cached metadata for {submission_id} to {moderation_status_update}.")
-            else:
-                logger.error(f"SYNC: Failed to write updated metadata cache for removed submission {submission_id}.")
-        else:
-            logger.warning(f"SYNC: Could not determine metadata cache path for removed submission {submission_id}.")
-
-    # Return True only if status is 'removed' or 'removal_pending'
-    return moderation_status_update in ["removed", "removal_pending"]
+# --- Standalone Report Functions ---
 
 def get_submission_reports(submission_data, reddit_instance) -> tuple[int, list]:
     """
@@ -621,14 +479,49 @@ def get_submission_reports(submission_data, reddit_instance) -> tuple[int, list]
         logger.error("Cannot get reports: Missing submission ID.")
         return (0, [])
 
+    # Check for active request to avoid duplicate API calls for the same submission
+    with _request_lock:
+        if submission_id in _active_report_requests:
+            logger.debug(f"Request for reports of {submission_id} already in progress, waiting...")
+            # Wait for the existing request to complete
+            existing_request = _active_report_requests[submission_id]
+        else:
+            # Mark this request as active
+            existing_request = threading.Event()
+            _active_report_requests[submission_id] = existing_request
+
+    # If we're waiting for an existing request, wait for it to complete then check cache
+    if submission_id in _active_report_requests and _active_report_requests[submission_id] != existing_request:
+        _active_report_requests[submission_id].wait(timeout=10)  # Wait up to 10 seconds
+        # Try cache again after the other request completes
+        metadata_path = get_metadata_file_path(submission_id)
+        if metadata_path:
+            metadata = read_metadata_file(metadata_path)
+            if metadata and 'report_count' in metadata:
+                last_checked = metadata.get('last_checked_utc', 0)
+                current_time = time.time()
+                if current_time - last_checked < 300:  # 5 minutes TTL
+                    report_count = metadata.get('report_count', 0)
+                    report_reasons = metadata.get('report_reasons', [])
+                    logger.debug(f"Using cached reports after deduplication wait for {submission_id}: {report_count} reports.")
+                    return (report_count, report_reasons)
+
     metadata_path = get_metadata_file_path(submission_id)
     if metadata_path:
         metadata = read_metadata_file(metadata_path)
-        if metadata and 'report_count' in metadata and 'report_reasons' in metadata:
-            report_count = metadata.get('report_count', 0)
-            report_reasons = metadata.get('report_reasons', [])
-            logger.debug(f"Using cached reports for {submission_id}: {report_count} reports.")
-            return (report_count, report_reasons)
+        if metadata and 'report_count' in metadata:
+            # Check if cached reports are still fresh (TTL: 5 minutes for reports)
+            last_checked = metadata.get('last_checked_utc', 0)
+            current_time = time.time()
+            cache_ttl_seconds = 300  # 5 minutes
+
+            if current_time - last_checked < cache_ttl_seconds:
+                report_count = metadata.get('report_count', 0)
+                report_reasons = metadata.get('report_reasons', [])
+                logger.debug(f"Using cached reports for {submission_id}: {report_count} reports (cached {int(current_time - last_checked)}s ago).")
+                return (report_count, report_reasons)
+            else:
+                logger.debug(f"Cached reports for {submission_id} expired ({int(current_time - last_checked)}s old), fetching fresh data.")
 
     logger.debug(f"No valid cache for reports of {submission_id}. Fetching from API.")
     if not reddit_instance:
@@ -687,29 +580,10 @@ def get_submission_reports(submission_data, reddit_instance) -> tuple[int, list]
     except Exception as e:
         logger.exception(f"Error getting reports for submission {submission_id}: {e}")
         return (0, [])
+    finally:
+        # Clean up the active request tracking
+        with _request_lock:
+            if submission_id in _active_report_requests:
+                _active_report_requests[submission_id].set()  # Signal completion
+                del _active_report_requests[submission_id]
 
-def ban_user(subreddit, username: str, reason: str, message: Optional[str] = None) -> bool:
-    """
-    Ban a user from a subreddit.
-
-    Args:
-        subreddit: PRAW Subreddit object
-        username: Username to ban
-        reason: Ban reason (for mod notes)
-        message: Optional message to send to the user
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    # This function is now primarily for reference or potential non-UI use.
-    # UI should use BanWorker.
-    try:
-        if message:
-            subreddit.banned.add(username, ban_reason=reason, ban_message=message, note=reason)
-        else:
-            subreddit.banned.add(username, ban_reason=reason, note=reason)
-        logger.debug(f"SYNC: Banned user {username} from {subreddit.display_name}")
-        return True
-    except Exception as e:
-        logger.exception(f"SYNC: Error banning user {username} from {subreddit.display_name}: {e}")
-        return False

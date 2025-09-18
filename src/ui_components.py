@@ -31,6 +31,13 @@ from media_handlers import process_media_url, MediaDownloadWorker
 import reddit_api
 from reddit_api import ApproveWorker, RemoveWorker, get_submission_reports
 
+# Import constants
+from constants import (
+    VIDEO_PLAYBACK_CHECK_INTERVAL_MS, VIDEO_ASPECT_RATIO_DELAY_MS,
+    PLAYBACK_MONITOR_INTERVAL_MS, FULLSCREEN_CLOSE_DELAY_MS,
+    GIF_FRAME_TIMER_MS, MIN_VALID_FILE_SIZE_BYTES, MAX_DISPLAYED_REPORT_COUNT
+)
+
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -135,7 +142,7 @@ class SimpleVideoFullscreenViewer(QWidget):
             # Set up a timer to check playback status
             self.playback_timer = QTimer(self)
             self.playback_timer.timeout.connect(self.check_playback)
-            self.playback_timer.start(500)  # Check more frequently
+            self.playback_timer.start(VIDEO_PLAYBACK_CHECK_INTERVAL_MS)  # Check more frequently
             
         except Exception as e:
             logger.exception(f"Error setting up simple fullscreen video: {e}")
@@ -167,19 +174,33 @@ class SimpleVideoFullscreenViewer(QWidget):
         if hasattr(self, 'playback_timer') and self.playback_timer:
             self.playback_timer.stop()
         
-        # Stop and release VLC resources
+        # Stop and release VLC resources asynchronously
         try:
             if hasattr(self, 'vlc_player') and self.vlc_player:
-                self.vlc_player.stop()
-                self.vlc_player.release()
+                # Store references for async cleanup
+                player_to_cleanup = self.vlc_player
+                instance_to_cleanup = getattr(self, 'vlc_instance', None)
+
+                # Immediately detach from widget
                 self.vlc_player = None
-                
-            if hasattr(self, 'vlc_instance') and self.vlc_instance:
-                self.vlc_instance.release()
                 self.vlc_instance = None
+
+                # Schedule async cleanup
+                def async_fullscreen_vlc_cleanup():
+                    try:
+                        if player_to_cleanup:
+                            player_to_cleanup.stop()
+                            player_to_cleanup.release()
+                        if instance_to_cleanup:
+                            instance_to_cleanup.release()
+                    except Exception as e:
+                        logger.debug(f"Error in async fullscreen VLC cleanup: {e}")
+
+                # Use QTimer for non-blocking cleanup
+                QTimer.singleShot(0, async_fullscreen_vlc_cleanup)
         except Exception as e:
-            logger.error(f"Error releasing VLC resources: {e}")
-        
+            logger.error(f"Error setting up async VLC cleanup: {e}")
+
         # Emit closed signal and close the widget
         self.closed.emit()
         self.close()
@@ -244,7 +265,7 @@ class FullScreenViewer(QDialog):
                 # Use a timer to manually restart the movie when it finishes
                 self.movie_timer = QTimer(self)
                 self.movie_timer.timeout.connect(self.check_movie_restart)
-                self.movie_timer.start(100)
+                self.movie_timer.start(GIF_FRAME_TIMER_MS)
         elif self.pixmap:
             scaled_pixmap = self.pixmap.scaled(
                 self.screen().size(),
@@ -472,8 +493,14 @@ class ThumbnailWidget(QWidget):
 
         # Fetch reports if moderator and not removed/deleted
         if self.is_moderator and not is_removed_or_deleted:
-            # Use the imported function directly
-            self.fetch_reports()
+            # Check if we already have report data from the initial reports fetch
+            # This avoids redundant API calls when viewing "reported posts"
+            if hasattr(self.praw_submission, 'mod_reports') and hasattr(self.praw_submission, 'user_reports'):
+                # We already have fresh report data, use it directly
+                self.extract_reports_from_submission()
+            else:
+                # Need to fetch reports via API
+                self.fetch_reports()
 
     def init_ui(self):
         """Initialize the UI layout and components."""
@@ -652,8 +679,8 @@ class ThumbnailWidget(QWidget):
             
             if direct_report_count > 0:
                 # Use a shorter format for report count to avoid width issues
-                if direct_report_count > 999:
-                    self.reports_button.setText(f"Rep(999+)")
+                if direct_report_count > MAX_DISPLAYED_REPORT_COUNT:
+                    self.reports_button.setText(f"Rep({MAX_DISPLAYED_REPORT_COUNT}+)")
                 else:
                     self.reports_button.setText(f"Rep({direct_report_count})")
                 logger.debug(f"Found reports during button creation: {direct_report_count} for post {self.praw_submission.id}")
@@ -711,7 +738,42 @@ class ThumbnailWidget(QWidget):
             self.remove_button.setToolTip("Network error occurred. Click to retry removing this submission")
             # Re-enable the button to allow retrying
             self.remove_button.setEnabled(True)
-    
+
+    def extract_reports_from_submission(self):
+        """Extract report data directly from PRAW submission object (when already available)."""
+        try:
+            mod_reports = getattr(self.praw_submission, 'mod_reports', [])
+            user_reports = getattr(self.praw_submission, 'user_reports', [])
+
+            formatted_reports = []
+            for reason, moderator in mod_reports:
+                formatted_reports.append(f"Mod: {reason} (by {moderator})")
+
+            user_report_count = 0
+            for reason, count in user_reports:
+                user_report_count += count
+                formatted_reports.append(f"User: {reason} ({count} reports)")
+
+            total_reports = len(mod_reports) + user_report_count
+            self.reports_count = total_reports
+            self.report_reasons = formatted_reports
+
+            # Update UI
+            if total_reports > 0:
+                if total_reports > MAX_DISPLAYED_REPORT_COUNT:
+                    self.reports_button.setText(f"Rep({MAX_DISPLAYED_REPORT_COUNT}+)")
+                else:
+                    self.reports_button.setText(f"Reports ({total_reports})")
+                self.reports_button.show()
+                logger.debug(f"Using cached report data: {total_reports} for post {self.submission_id}")
+            else:
+                self.reports_button.hide()
+
+        except Exception as e:
+            logger.exception(f"Error extracting reports from submission {self.submission_id}: {e}")
+            # Fallback to API fetch
+            self.fetch_reports()
+
     def fetch_reports(self):
         """Fetch reports for the current submission using the dedicated API function."""
         # Ensure we have the necessary data and instance
@@ -727,8 +789,8 @@ class ThumbnailWidget(QWidget):
             # Update UI to show reports button if there are reports
             if report_count > 0:
                 # Use a shorter format for report count to avoid width issues
-                if report_count > 999:
-                    self.reports_button.setText(f"Rep(999+)")
+                if report_count > MAX_DISPLAYED_REPORT_COUNT:
+                    self.reports_button.setText(f"Rep({MAX_DISPLAYED_REPORT_COUNT}+)")
                 else:
                     self.reports_button.setText(f"Reports ({report_count})")
                 self.reports_button.show()
@@ -907,7 +969,7 @@ class ThumbnailWidget(QWidget):
                     logger.debug(f"RedGifs video detected: {file_path}")
                     file_size = os.path.getsize(file_path)
                     
-                    if file_size < 1000:  # If less than 1KB, likely not valid
+                    if file_size < MIN_VALID_FILE_SIZE_BYTES:  # If less than 1KB, likely not valid
                         logger.error(f"RedGifs video file too small: {file_size} bytes")
                         self.imageLabel.setText("Invalid video file")
                     else:
@@ -1200,12 +1262,12 @@ class ThumbnailWidget(QWidget):
             self.vlc_player.audio_set_mute(True)
             
             # Use a timer to update the aspect ratio once the video starts playing
-            QTimer.singleShot(500, self.update_video_aspect_ratio)
+            QTimer.singleShot(VIDEO_ASPECT_RATIO_DELAY_MS, self.update_video_aspect_ratio)
             
             # Set up regular check for playback status to handle looping - match test file
             self.playback_monitor = QTimer(self)
             self.playback_monitor.timeout.connect(self.check_and_restart_playback)
-            self.playback_monitor.start(1000)  # Check every second
+            self.playback_monitor.start(PLAYBACK_MONITOR_INTERVAL_MS)  # Check every second
             
             # If we have moderation buttons, make sure they stay at the bottom
             if self.is_moderator and hasattr(self, 'moderation_layout'):
@@ -1274,33 +1336,39 @@ class ThumbnailWidget(QWidget):
                 # Optional: Delete the timer attribute immediately after stopping
                 # delattr(self, 'playback_monitor')
 
-            # Stop and release any playing video immediately
+            # Stop and release any playing video non-blocking
             if hasattr(self, 'vlc_player') and self.vlc_player:
                 logger.debug(f"Cleanup: Stopping VLC player for {self.submission_id}")
                 try:
-                    # Stop playback forcefully
-                    if self.vlc_player.is_playing():
-                        self.vlc_player.stop()
+                    # Store references for async cleanup
+                    player_to_cleanup = self.vlc_player
+                    instance_to_cleanup = getattr(self, 'vlc_instance', None)
 
-                    # Release player and instance
-                    self.vlc_player.release()
-                    if hasattr(self, 'vlc_instance') and self.vlc_instance:
-                         self.vlc_instance.release()
+                    # Immediately detach from widget to prevent UI blocking
+                    self.vlc_player = None
+                    self.vlc_instance = None
 
                     # Immediately remove the VLC widget if it exists
                     if hasattr(self, 'vlc_widget'):
                         self.vlc_widget.setParent(None)
-                        self.vlc_widget.deleteLater() # Still use deleteLater for the widget itself
-                        # Delete attributes immediately after release/detach
+                        self.vlc_widget.deleteLater()
                         delattr(self, 'vlc_widget')
 
-                    # Delete attributes immediately after release
-                    self.vlc_player = None
-                    if hasattr(self, 'vlc_instance'):
-                         self.vlc_instance = None
-                         delattr(self, 'vlc_instance') # Keep delattr for instance too
-                    delattr(self, 'vlc_player') # Keep delattr for player
-                    logger.debug(f"Cleanup: VLC resources released and attributes cleared for {self.submission_id}")
+                    # Schedule async cleanup to avoid blocking UI
+                    def async_vlc_cleanup():
+                        try:
+                            if player_to_cleanup.is_playing():
+                                player_to_cleanup.stop()
+                            player_to_cleanup.release()
+                            if instance_to_cleanup:
+                                instance_to_cleanup.release()
+                        except Exception as e:
+                            logger.debug(f"Error in async VLC cleanup: {e}")
+
+                    # Use QTimer to run cleanup on next event loop iteration
+                    QTimer.singleShot(0, async_vlc_cleanup)
+
+                    logger.debug(f"Cleanup: VLC resources scheduled for async cleanup for {self.submission_id}")
                 except Exception as e:
                     logger.exception(f"Error during VLC cleanup for {self.submission_id}: {e}")
                     # Ensure attributes are cleared even if release fails
@@ -1364,7 +1432,7 @@ class ThumbnailWidget(QWidget):
                 logger.debug(f"Opening system VLC player for: {self.current_video_path}")
                 self.launch_system_vlc(self.current_video_path)
                 # No need for a viewer reference since we're using the system VLC
-                QTimer.singleShot(500, self.on_fullscreen_closed)
+                QTimer.singleShot(FULLSCREEN_CLOSE_DELAY_MS, self.on_fullscreen_closed)
                 return
             else:
                 logger.error("No video path available")

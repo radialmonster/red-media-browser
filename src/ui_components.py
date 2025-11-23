@@ -21,12 +21,12 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSizePolicy,
     QDialog, QMessageBox, QLineEdit, QProgressBar, QScrollArea, QTextBrowser
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QThreadPool
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QThreadPool, QRunnable, QObject
 from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie, QIcon
 
 # Import caching utilities needed for moderation status
 from utils import get_media_type, get_metadata_file_path, read_metadata_file
-from media_handlers import process_media_url, MediaDownloadWorker
+from media_handlers import process_media_url, MediaDownloadWorker, get_cached_processed_url
 # Import specific API functions and workers
 import reddit_api
 from reddit_api import ApproveWorker, RemoveWorker, get_submission_reports
@@ -40,6 +40,76 @@ from constants import (
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+class VlcWorkerSignals(QObject):
+    finished = pyqtSignal(object, object, int) # vlc_instance, vlc_player, play_result
+
+class VlcWorker(QRunnable):
+    """Worker for initializing VLC player in a background thread."""
+    def __init__(self, video_path, hwnd):
+        super().__init__()
+        self.video_path = video_path
+        self.hwnd = hwnd
+        self.signals = VlcWorkerSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            # Create VLC instance with minimal arguments
+            instance_args = ['--quiet', '--loop', '--repeat']
+            vlc_instance = vlc.Instance(*instance_args)
+            vlc_player = vlc_instance.media_player_new()
+
+            # Set the window for rendering
+            if sys.platform.startswith('win'):
+                vlc_player.set_hwnd(self.hwnd)
+            elif sys.platform.startswith('linux'):
+                vlc_player.set_xwindow(self.hwnd)
+            elif sys.platform.startswith('darwin'):
+                vlc_player.set_nsobject(self.hwnd)
+
+            # Create media with robust path handling
+            media = vlc_instance.media_new_path(self.video_path)
+            media.add_option('input-repeat=-1')
+            media.add_option(':repeat')
+            media.add_option(':loop')
+            media.add_option(':file-caching=3000')
+            vlc_player.set_media(media)
+
+            # Start playback
+            play_result = vlc_player.play()
+            vlc_player.audio_set_mute(True)
+
+            self.signals.finished.emit(vlc_instance, vlc_player, play_result)
+
+        except Exception as e:
+            logger.error(f"Error in VlcWorker: {e}")
+
+class VlcCleanupWorker(QRunnable):
+    """Worker for cleaning up VLC resources in a background thread."""
+    def __init__(self, player, instance):
+        super().__init__()
+        self.player = player
+        self.instance = instance
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            if self.player:
+                # Stop playback if needed (this can block)
+                try:
+                    if self.player.is_playing():
+                        self.player.stop()
+                except Exception:
+                    pass
+                # Release player (this can block)
+                self.player.release()
+            if self.instance:
+                # Release instance (this can block)
+                self.instance.release()
+            logger.debug("Background VLC cleanup completed")
+        except Exception as e:
+            logger.debug(f"Error in background VLC cleanup: {e}")
 
 class ClickableLabel(QLabel):
     """
@@ -185,19 +255,9 @@ class SimpleVideoFullscreenViewer(QWidget):
                 self.vlc_player = None
                 self.vlc_instance = None
 
-                # Schedule async cleanup
-                def async_fullscreen_vlc_cleanup():
-                    try:
-                        if player_to_cleanup:
-                            player_to_cleanup.stop()
-                            player_to_cleanup.release()
-                        if instance_to_cleanup:
-                            instance_to_cleanup.release()
-                    except Exception as e:
-                        logger.debug(f"Error in async fullscreen VLC cleanup: {e}")
-
-                # Use QTimer for non-blocking cleanup
-                QTimer.singleShot(0, async_fullscreen_vlc_cleanup)
+                # Schedule async cleanup in background thread
+                cleanup_worker = VlcCleanupWorker(player_to_cleanup, instance_to_cleanup)
+                QThreadPool.globalInstance().start(cleanup_worker)
         except Exception as e:
             logger.error(f"Error setting up async VLC cleanup: {e}")
 
@@ -750,7 +810,19 @@ class ThumbnailWidget(QWidget):
                 formatted_reports.append(f"Mod: {reason} (by {moderator})")
 
             user_report_count = 0
-            for reason, count in user_reports:
+            for report_item in user_reports:
+                # Robust handling for user reports which can vary in structure
+                reason = "Unknown"
+                count = 1
+                
+                if isinstance(report_item, (list, tuple)):
+                    if len(report_item) >= 1:
+                        reason = str(report_item[0])
+                    if len(report_item) >= 2 and isinstance(report_item[1], int):
+                        count = report_item[1]
+                else:
+                    reason = str(report_item)
+                    
                 user_report_count += count
                 formatted_reports.append(f"User: {reason} ({count} reports)")
 
@@ -851,13 +923,15 @@ class ThumbnailWidget(QWidget):
         Shows loading indicator and handles caching.
         """
         # First check if we already have it in the QPixmapCache
-        processed_url = process_media_url(url)
-        cached_pixmap = QPixmapCache.find(processed_url)
+        # Use non-blocking check for cached processed URL
+        processed_url = get_cached_processed_url(url)
         
-        if cached_pixmap:
-            self.pixmap = cached_pixmap
-            self.update_pixmap()
-            return
+        if processed_url:
+            cached_pixmap = QPixmapCache.find(processed_url)
+            if cached_pixmap:
+                self.pixmap = cached_pixmap
+                self.update_pixmap()
+                return
         
         # Show loading indicator
         self.loadingBar.setValue(0)
@@ -876,8 +950,9 @@ class ThumbnailWidget(QWidget):
         worker.signals.progress.connect(lambda progress: 
             self._safe_update_progress(weak_self, progress))
         
-        worker.signals.finished.connect(lambda file_path: 
-            self._safe_call_finished(weak_self, file_path, processed_url))
+        # Updated signal connection to accept 3 arguments: file_path, processed_url, submission_data
+        worker.signals.finished.connect(lambda file_path, proc_url, _: 
+            self._safe_call_finished(weak_self, file_path, proc_url))
         
         worker.signals.error.connect(lambda error_msg: 
             self._safe_call_error(weak_self, error_msg))
@@ -1217,13 +1292,6 @@ class ThumbnailWidget(QWidget):
             if hasattr(self, 'imageLabel'):
                 self.imageLabel.hide()
             
-            # Enhanced VLC arguments for better compatibility with looping - match test file
-            instance_args = ['--quiet', '--loop', '--repeat']
-            
-            # Create VLC instance and player
-            self.vlc_instance = vlc.Instance(*instance_args)
-            self.vlc_player = self.vlc_instance.media_player_new()
-            
             # Create widget for VLC output in the same position as the image label
             self.vlc_widget = QWidget(self)
             self.vlc_widget.setStyleSheet("background-color: black;")
@@ -1232,42 +1300,10 @@ class ThumbnailWidget(QWidget):
             # Ensure the widget has the same size policy as the image label
             self.vlc_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-            # --- Removed overlay play button code ---
-
-            # Set the window for rendering
-            if sys.platform.startswith('win'):
-                self.vlc_player.set_hwnd(int(self.vlc_widget.winId()))
-            elif sys.platform.startswith('linux'):
-                self.vlc_player.set_xwindow(int(self.vlc_widget.winId()))
-            elif sys.platform.startswith('darwin'):
-                self.vlc_player.set_nsobject(int(self.vlc_widget.winId()))
-            
-            # Create media with robust path handling - match test file
-            media = self.vlc_instance.media_new_path(abs_video_path)
-            
-            # Set multiple looping options for redundancy - match test file
-            media.add_option('input-repeat=-1')  # Loop indefinitely
-            media.add_option(':repeat')  # Additional looping option
-            media.add_option(':loop')    # Another looping option
-            media.add_option(':file-caching=3000')  # Increase caching
-            
-            # Set the media
-            self.vlc_player.set_media(media)
-            
-            # Start playback
-            play_result = self.vlc_player.play()
-            logger.debug(f"Play result: {play_result}")
-            
-            # Mute audio
-            self.vlc_player.audio_set_mute(True)
-            
-            # Use a timer to update the aspect ratio once the video starts playing
-            QTimer.singleShot(VIDEO_ASPECT_RATIO_DELAY_MS, self.update_video_aspect_ratio)
-            
-            # Set up regular check for playback status to handle looping - match test file
-            self.playback_monitor = QTimer(self)
-            self.playback_monitor.timeout.connect(self.check_and_restart_playback)
-            self.playback_monitor.start(PLAYBACK_MONITOR_INTERVAL_MS)  # Check every second
+            # Start VLC initialization in background
+            worker = VlcWorker(abs_video_path, int(self.vlc_widget.winId()))
+            worker.signals.finished.connect(self.on_vlc_ready)
+            QThreadPool.globalInstance().start(worker)
             
             # If we have moderation buttons, make sure they stay at the bottom
             if self.is_moderator and hasattr(self, 'moderation_layout'):
@@ -1280,6 +1316,23 @@ class ThumbnailWidget(QWidget):
             if hasattr(self, 'imageLabel'):
                 self.imageLabel.setText(f"Video error: {str(e)}")
                 self.imageLabel.show()
+
+    def on_vlc_ready(self, instance, player, result):
+        """Handle VLC initialization completion."""
+        try:
+            self.vlc_instance = instance
+            self.vlc_player = player
+            logger.debug(f"VLC worker finished. Play result: {result}")
+
+            # Use a timer to update the aspect ratio once the video starts playing
+            QTimer.singleShot(VIDEO_ASPECT_RATIO_DELAY_MS, self.update_video_aspect_ratio)
+            
+            # Set up regular check for playback status to handle looping
+            self.playback_monitor = QTimer(self)
+            self.playback_monitor.timeout.connect(self.check_and_restart_playback)
+            self.playback_monitor.start(PLAYBACK_MONITOR_INTERVAL_MS)
+        except Exception as e:
+            logger.error(f"Error in on_vlc_ready: {e}")
 
     def check_and_restart_playback(self):
         """Check if playback has ended and restart if needed - same as test file"""
@@ -1319,6 +1372,26 @@ class ThumbnailWidget(QWidget):
             except Exception as e:
                 logger.error(f"Error setting video aspect ratio: {e}")
 
+    def cancel_active_workers(self):
+        """Cancel any active background workers."""
+        # Cancel moderation worker if active
+        if hasattr(self, 'mod_worker') and self.mod_worker and self.mod_worker.isRunning():
+            logger.debug(f"Cancelling active moderation worker for {self.submission_id}")
+            try:
+                # Disconnect signals to prevent post-cancellation updates
+                try: self.mod_worker.signals.success.disconnect()
+                except: pass
+                try: self.mod_worker.signals.error.disconnect()
+                except: pass
+                try: self.mod_worker.signals.finished.disconnect()
+                except: pass
+                
+                self.mod_worker.terminate()
+                self.mod_worker.wait(100) # Short wait
+            except Exception as e:
+                logger.error(f"Error cancelling moderation worker: {e}")
+            self.mod_worker = None
+
     def cleanup_current_media(self):
         """Clean up current media before loading a new one."""
         try:
@@ -1330,6 +1403,9 @@ class ThumbnailWidget(QWidget):
             return
             
         try:
+            # Cancel any active moderation workers
+            self.cancel_active_workers()
+
             # Stop the playback monitor immediately if active
             if hasattr(self, 'playback_monitor') and self.playback_monitor:
                 self.playback_monitor.stop()
@@ -1354,19 +1430,9 @@ class ThumbnailWidget(QWidget):
                         self.vlc_widget.deleteLater()
                         delattr(self, 'vlc_widget')
 
-                    # Schedule async cleanup to avoid blocking UI
-                    def async_vlc_cleanup():
-                        try:
-                            if player_to_cleanup.is_playing():
-                                player_to_cleanup.stop()
-                            player_to_cleanup.release()
-                            if instance_to_cleanup:
-                                instance_to_cleanup.release()
-                        except Exception as e:
-                            logger.debug(f"Error in async VLC cleanup: {e}")
-
-                    # Use QTimer to run cleanup on next event loop iteration
-                    QTimer.singleShot(0, async_vlc_cleanup)
+                    # Schedule async cleanup in BACKGROUND THREAD to avoid blocking UI
+                    cleanup_worker = VlcCleanupWorker(player_to_cleanup, instance_to_cleanup)
+                    QThreadPool.globalInstance().start(cleanup_worker)
 
                     logger.debug(f"Cleanup: VLC resources scheduled for async cleanup for {self.submission_id}")
                 except Exception as e:
@@ -1622,6 +1688,7 @@ class ThumbnailWidget(QWidget):
     def close(self):
         """Clean up resources when the widget is closed."""
         self.stop_all_media()
+        self.cancel_active_workers()
         super().close()
     
     def show_previous_image(self): # Line 1219 - Corrected indentation

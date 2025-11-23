@@ -246,8 +246,8 @@ class MediaPrefetchWorker(QRunnable):
                         if processed_url and processed_url != url:
                             # Check if already cached
                             import os
-                            from utils import get_cache_path
-                            cache_path = get_cache_path(processed_url)
+                            from utils import get_cache_path_for_url
+                            cache_path = get_cache_path_for_url(processed_url)
 
                             if not os.path.exists(cache_path):
                                 # Start media download
@@ -271,7 +271,7 @@ class MediaPrefetchWorker(QRunnable):
             logger.exception(f"Error in media prefetch worker: {e}")
             self.signals.error.emit(str(e), None)
         finally:
-            self.signals.finished.emit("prefetch_complete", None)
+            self.signals.finished.emit("prefetch_complete", "", None)
 
 
 class RedMediaBrowser(QMainWindow):
@@ -983,6 +983,12 @@ class RedMediaBrowser(QMainWindow):
                     except Exception as e:
                         logger.debug(f"Error during media cleanup in clear_content: {e}")
                         cleanup_success = False
+
+                # Explicitly close the widget to trigger its internal cleanup (workers, etc.)
+                try:
+                    widget.close()
+                except Exception as e:
+                    logger.debug(f"Error closing widget in clear_content: {e}")
 
                 # Remove widget from layout and schedule for deletion
                 self.content_layout.removeWidget(widget)

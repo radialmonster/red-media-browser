@@ -662,7 +662,10 @@ def save_submission_index():
         try:
             # Write to temporary file
             with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(_submission_index, f, indent=2) # Use indent for readability
+                # Create a copy to avoid "dictionary changed size during iteration" error
+                # since other threads might be modifying the global dict
+                index_copy = _submission_index.copy()
+                json.dump(index_copy, f, indent=2) # Use indent for readability
 
             # Rename temporary file to actual index file (atomic on most systems)
             try:

@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 # Simple cache for processed URLs to avoid duplicate processing
 _processed_url_cache = {}
 
+def get_cached_processed_url(url):
+    """
+    Get the processed URL from cache if available, otherwise return None.
+    This allows for non-blocking checks on the main thread.
+    """
+    return _processed_url_cache.get(url)
+
 # Define registry for provider-specific handlers.
 provider_handlers = {}
 
@@ -642,8 +649,8 @@ def process_media_url(url):
 
 # Signal class for worker communication
 class WorkerSignals(QObject):
-    # Emits the downloaded file path and the original submission object/dict
-    finished = pyqtSignal(str, object) 
+    # Emits the downloaded file path, the processed URL, and the original submission object/dict
+    finished = pyqtSignal(str, str, object) 
     progress = pyqtSignal(int)  # Emits download progress percentage
     error = pyqtSignal(str, object)     # Emits error message and the submission object/dict
 
@@ -658,11 +665,11 @@ class MediaDownloadWorker(QRunnable):
         self.original_url = url
         # Store the submission data (could be PRAW object or filtered dict)
         self.submission_data = submission_data 
-        # Process the URL immediately to get the target for caching/download
-        self.processed_url = process_media_url(url) 
+        # URL processing will happen in run() to avoid blocking the main thread
+        self.processed_url = None
         self.signals = WorkerSignals()
         submission_id = getattr(submission_data, 'id', 'UnknownID')
-        logger.debug(f"MediaDownloadWorker initialized for {submission_id}: original='{self.original_url}', processed='{self.processed_url}'")
+        logger.debug(f"MediaDownloadWorker initialized for {submission_id}: original='{self.original_url}'")
         
     @pyqtSlot()
     def run(self):
@@ -673,6 +680,10 @@ class MediaDownloadWorker(QRunnable):
         cache_path = None # Initialize cache_path
         submission_id = getattr(self.submission_data, 'id', 'UnknownID')
         try:
+            # Process the URL here (in background thread) to avoid blocking UI
+            self.processed_url = process_media_url(self.original_url)
+            logger.debug(f"MediaDownloadWorker processed URL for {submission_id}: {self.processed_url}")
+
             # Skip empty URLs
             if not self.processed_url:
                 logger.error(f"Empty processed URL for submission {submission_id}")
@@ -690,7 +701,7 @@ class MediaDownloadWorker(QRunnable):
                 logger.debug(f"File already cached for submission {submission_id}: {cache_path}")
                 # Update metadata even if file is cached (submission data might be newer)
                 update_metadata_cache(self.submission_data, cache_path, self.processed_url)
-                self.signals.finished.emit(cache_path, self.submission_data)
+                self.signals.finished.emit(cache_path, self.processed_url, self.submission_data)
                 return
 
             # Download the file using the processed URL
@@ -701,7 +712,7 @@ class MediaDownloadWorker(QRunnable):
             if file_path and os.path.exists(file_path):
                  logger.info(f"Download successful for {submission_id}. File: {file_path}") # Changed to INFO
                  update_metadata_cache(self.submission_data, file_path, self.processed_url)
-                 self.signals.finished.emit(file_path, self.submission_data)
+                 self.signals.finished.emit(file_path, self.processed_url, self.submission_data)
             else:
                  # This case should ideally not happen if download_file doesn't raise error
                  logger.error(f"Download completed but file path is invalid or file doesn't exist: {file_path} (Submission: {submission_id})")

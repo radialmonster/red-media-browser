@@ -31,12 +31,53 @@ from urllib.parse import urlparse, parse_qs, quote
 import praw
 import prawcore.exceptions
 
+DEFAULT_LOG_LEVEL = "INFO"
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 logger = logging.getLogger(__name__)
-if not logger.hasHandlers():
+
+def normalize_log_level(value) -> str:
+    """Return a supported logging level name, defaulting to INFO."""
+    if not isinstance(value, str):
+        return DEFAULT_LOG_LEVEL
+
+    normalized = value.strip().upper()
+    return normalized if normalized in logging.getLevelNamesMapping() else DEFAULT_LOG_LEVEL
+
+def get_log_level_from_config_file(config_path: str) -> str:
+    """
+    Read log level from config without triggering interactive config creation.
+
+    This is safe to call during startup before the GUI is initialized.
+    """
+    if not os.path.exists(config_path):
+        return DEFAULT_LOG_LEVEL
+
+    try:
+        with open(config_path, 'r') as config_file:
+            config = json.load(config_file)
+    except Exception:
+        return DEFAULT_LOG_LEVEL
+
+    return normalize_log_level(config.get("log_level", DEFAULT_LOG_LEVEL))
+
+def configure_logging(log_level: str) -> None:
+    """Configure the root logger for the application."""
+    normalized_level = normalize_log_level(log_level)
+    level = logging.getLevelNamesMapping()[normalized_level]
+    root_logger = logging.getLogger()
+
+    if root_logger.handlers:
+        root_logger.setLevel(level)
+        for handler in root_logger.handlers:
+            handler.setLevel(level)
+        return
+
     logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        datefmt='%Y-%m-%d %H:%M:%S'
+        level=level,
+        format=LOG_FORMAT,
+        datefmt=LOG_DATE_FORMAT
     )
 
 def create_config_file(config_path):
@@ -60,6 +101,8 @@ def create_config_file(config_path):
     print("Leave blank to use default paths (C:\\Program Files\\VideoLAN\\VLC\\vlc.exe on Windows,")
     print("/Applications/VLC.app/Contents/MacOS/VLC on macOS, or 'vlc' command on Linux).")
     vlc_path = input("VLC path [optional]: ").strip()
+    print(f"Optional: Set log verbosity [default: {DEFAULT_LOG_LEVEL}] (DEBUG, INFO, WARNING, ERROR, CRITICAL).")
+    log_level = normalize_log_level(input("Log level [optional]: ").strip() or DEFAULT_LOG_LEVEL)
 
     config_data = {
         "client_id": client_id,
@@ -68,7 +111,8 @@ def create_config_file(config_path):
         "refresh_token": refresh_token,
         "user_agent": user_agent,
         "default_subreddit": default_subreddit,
-        "vlc_path": vlc_path
+        "vlc_path": vlc_path,
+        "log_level": log_level
     }
 
     try:
@@ -97,6 +141,8 @@ def load_config(config_path):
     try:
         with open(config_path, 'r') as config_file:
             config = json.load(config_file)
+        config["log_level"] = normalize_log_level(config.get("log_level", DEFAULT_LOG_LEVEL))
+        configure_logging(config["log_level"])
         return config
     except Exception as e:
         logger.exception("Error reading configuration file", exc_info=e)
@@ -145,9 +191,11 @@ def update_config_with_new_token(config, config_path, new_token):
         new_token (str): The newly obtained refresh token.
     """
     config['refresh_token'] = new_token
+    config['log_level'] = normalize_log_level(config.get("log_level", DEFAULT_LOG_LEVEL))
     try:
         with open(config_path, 'w') as config_file:
             json.dump(config, config_file, indent=4)
+        configure_logging(config['log_level'])
         logger.info("Updated config.json with new refresh token.")
     except Exception as e:
         logger.exception("Failed to update config.json", exc_info=e)

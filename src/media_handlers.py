@@ -21,7 +21,8 @@ from PyQt6.QtCore import QObject, QRunnable, pyqtSignal, pyqtSlot
 
 from utils import (
     normalize_redgifs_url, ensure_json_url, get_cache_path_for_url,
-    file_exists_in_cache, get_domain_cache_dir, update_metadata_cache
+    file_exists_in_cache, get_domain_cache_dir, update_metadata_cache,
+    register_cached_file_path, get_existing_cache_path_for_url
 )
 
 # Set up logging
@@ -30,12 +31,39 @@ logger = logging.getLogger(__name__)
 # Simple cache for processed URLs to avoid duplicate processing
 _processed_url_cache = {}
 
+
+def _classify_url_normalization(original_url, normalized_url):
+    """Return a coarse reason category when URL normalization changes the cache key."""
+    if not original_url or not normalized_url or original_url == normalized_url:
+        return None
+
+    original_lower = original_url.lower()
+    normalized_lower = normalized_url.lower()
+
+    if '?' in original_url and '?' not in normalized_url:
+        return "query_stripped"
+    if urlparse(original_url).netloc.lower() != urlparse(normalized_url).netloc.lower():
+        return "host_rewritten"
+    if original_lower.endswith('.gifv') and normalized_lower.endswith('.mp4'):
+        return "gifv_to_mp4"
+    if (
+        ("redgifs.com/watch/" in original_lower or "redgifs.com/ifr/" in original_lower)
+        and normalized_lower.endswith('.mp4')
+    ):
+        return "redgifs_resolved"
+    return "provider_normalized"
+
 def get_cached_processed_url(url):
     """
     Get the processed URL from cache if available, otherwise return None.
     This allows for non-blocking checks on the main thread.
     """
     return _processed_url_cache.get(url)
+
+def cache_processed_url(original_url, processed_url):
+    """Store a resolved media URL for reuse by non-blocking cache fast paths."""
+    if original_url and processed_url:
+        _processed_url_cache[original_url] = processed_url
 
 # Define registry for provider-specific handlers.
 provider_handlers = {}
@@ -175,7 +203,7 @@ def get_redgifs_mp4_url(url: str) -> str:
     # Try to get an access token first (needed for API v2)
     try:
         token_url = "https://api.redgifs.com/v2/auth/temporary"
-        token_response = requests.get(token_url, headers=headers)
+        token_response = requests.get(token_url, headers=headers, timeout=10)
         if token_response.status_code == 200:
             token_data = token_response.json()
             access_token = token_data.get("token")
@@ -559,8 +587,17 @@ def process_media_url(url):
     """
     # Check cache first to avoid duplicate processing
     if url in _processed_url_cache:
+        cached_url = _processed_url_cache[url]
         logger.debug(f"Using cached processed URL for: {url}")
-        return _processed_url_cache[url]
+        normalization_reason = _classify_url_normalization(url, cached_url)
+        if normalization_reason:
+            logger.info(
+                "media_url_normalized reason=%s original_url=%s normalized_url=%s",
+                normalization_reason,
+                url,
+                cached_url,
+            )
+        return cached_url
 
     logger.debug(f"Processing media URL: {url}")
     processed_url = url # Start with the original URL
@@ -629,6 +666,15 @@ def process_media_url(url):
         processed_url = processed_url.replace('.gifv', '.mp4')
 
     # --- Step 3: Check Cache with the FINAL Processed URL ---
+    normalization_reason = _classify_url_normalization(url, processed_url)
+    if normalization_reason:
+        logger.info(
+            "media_url_normalized reason=%s original_url=%s normalized_url=%s",
+            normalization_reason,
+            url,
+            processed_url,
+        )
+
     final_cache_path = get_cache_path_for_url(processed_url)
     if final_cache_path and file_exists_in_cache(processed_url):
         logger.debug(f"Cache hit for FINAL processed URL '{processed_url}' at path: {final_cache_path}")
@@ -660,16 +706,22 @@ class MediaDownloadWorker(QRunnable):
     Worker for downloading media files asynchronously.
     Includes progress reporting, error handling, and metadata caching.
     """
-    def __init__(self, url, submission_data):
+    def __init__(self, url, submission_data, source="page_render"):
         super().__init__()
         self.original_url = url
         # Store the submission data (could be PRAW object or filtered dict)
         self.submission_data = submission_data 
+        self.source = source
         # URL processing will happen in run() to avoid blocking the main thread
         self.processed_url = None
         self.signals = WorkerSignals()
         submission_id = getattr(submission_data, 'id', 'UnknownID')
-        logger.debug(f"MediaDownloadWorker initialized for {submission_id}: original='{self.original_url}'")
+        logger.debug(
+            "MediaDownloadWorker initialized for %s: source=%s original='%s'",
+            submission_id,
+            self.source,
+            self.original_url,
+        )
         
     @pyqtSlot()
     def run(self):
@@ -686,40 +738,104 @@ class MediaDownloadWorker(QRunnable):
 
             # Skip empty URLs
             if not self.processed_url:
-                logger.error(f"Empty processed URL for submission {submission_id}")
+                logger.error(
+                    "Empty processed URL for submission %s (source=%s)",
+                    submission_id,
+                    self.source,
+                )
                 self.signals.error.emit("Empty processed URL", self.submission_data)
                 return
 
             # Determine cache path based on the *processed* URL
             cache_path = get_cache_path_for_url(self.processed_url)
             if not cache_path:
-                 logger.error(f"Could not determine cache path for processed URL: {self.processed_url} (Submission: {submission_id})")
+                 logger.error(
+                     "Could not determine cache path for processed URL: %s "
+                     "(submission=%s source=%s)",
+                     self.processed_url,
+                     submission_id,
+                     self.source,
+                 )
                  raise ValueError("Could not determine cache path")
 
-            # Check if already cached
-            if file_exists_in_cache(self.processed_url):
-                logger.debug(f"File already cached for submission {submission_id}: {cache_path}")
+            # Check if already cached, including equivalent extensions such as .jpeg/.jpg.
+            existing_cache_path = get_existing_cache_path_for_url(self.processed_url)
+            if existing_cache_path:
+                cache_path = existing_cache_path
+            cache_exists = existing_cache_path is not None
+            logger.info(
+                "media_request_decision source=%s submission_id=%s original_url=%s "
+                "processed_url=%s cache_path=%s cache_exists=%s will_download=%s",
+                self.source,
+                submission_id,
+                self.original_url,
+                self.processed_url,
+                cache_path,
+                cache_exists,
+                not cache_exists,
+            )
+
+            if cache_exists:
+                logger.info(
+                    "Media request satisfied from cache for submission %s "
+                    "(source=%s processed_url=%s cache_path=%s)",
+                    submission_id,
+                    self.source,
+                    self.processed_url,
+                    cache_path,
+                )
                 # Update metadata even if file is cached (submission data might be newer)
-                update_metadata_cache(self.submission_data, cache_path, self.processed_url)
+                update_metadata_cache(
+                    self.submission_data,
+                    cache_path,
+                    self.processed_url,
+                    original_media_url=self.original_url,
+                )
                 self.signals.finished.emit(cache_path, self.processed_url, self.submission_data)
                 return
 
             # Download the file using the processed URL
-            logger.info(f"Starting download for submission {submission_id} from {self.processed_url}") # Changed to INFO
+            logger.info(
+                "Starting download for submission %s from %s (source=%s)",
+                submission_id,
+                self.processed_url,
+                self.source,
+            )
             file_path = self.download_file(self.processed_url) # This returns the final cache_path
 
             # Update metadata cache after successful download
             if file_path and os.path.exists(file_path):
-                 logger.info(f"Download successful for {submission_id}. File: {file_path}") # Changed to INFO
-                 update_metadata_cache(self.submission_data, file_path, self.processed_url)
+                 logger.info(
+                     "Download successful for %s (source=%s). File: %s",
+                     submission_id,
+                     self.source,
+                     file_path,
+                 )
+                 update_metadata_cache(
+                     self.submission_data,
+                     file_path,
+                     self.processed_url,
+                     original_media_url=self.original_url,
+                 )
                  self.signals.finished.emit(file_path, self.processed_url, self.submission_data)
             else:
                  # This case should ideally not happen if download_file doesn't raise error
-                 logger.error(f"Download completed but file path is invalid or file doesn't exist: {file_path} (Submission: {submission_id})")
+                 logger.error(
+                     "Download completed but file path is invalid or file doesn't exist: %s "
+                     "(submission=%s source=%s)",
+                     file_path,
+                     submission_id,
+                     self.source,
+                 )
                  self.signals.error.emit("Download finished but file invalid", self.submission_data)
 
         except Exception as e:
-            logger.exception(f"Error downloading media for submission {submission_id}: {e}")
+            logger.exception(
+                "Error downloading media for submission %s (source=%s): %s",
+                submission_id,
+                self.source,
+                e,
+            )
             self.signals.error.emit(str(e), self.submission_data)
 
     def download_file(self, url):
@@ -828,11 +944,34 @@ class MediaDownloadWorker(QRunnable):
                             bytes_downloaded += len(chunk)
                             progress = int(100 * bytes_downloaded / content_length)
                             self.signals.progress.emit(progress)
+
+            content_type = response.headers.get('Content-Type', '').lower()
+            content_type_ext = self._extension_for_content_type(content_type)
+            current_ext = os.path.splitext(cache_path.lower())[1]
+            if content_type_ext and current_ext != content_type_ext:
+                new_cache_path = os.path.splitext(cache_path)[0] + content_type_ext
+                try:
+                    if not os.path.exists(new_cache_path):
+                        shutil.move(cache_path, new_cache_path)
+                        cache_path = new_cache_path
+                        logger.debug(
+                            "Renamed downloaded media based on Content-Type %s: %s",
+                            content_type,
+                            cache_path,
+                        )
+                    elif cache_path != new_cache_path:
+                        os.remove(cache_path)
+                        cache_path = new_cache_path
+                        logger.debug(
+                            "Content-Type-correct media file already exists: %s",
+                            cache_path,
+                        )
+                except Exception as e:
+                    logger.error(f"Error renaming file based on Content-Type: {e}")
             
             # Special handling for RedGIFs content
             if "redgifs.com" in url:
                 # Check content type to determine if it's an image or video
-                content_type = response.headers.get('Content-Type', '').lower()
                 # Use the URL *passed to download_file* to check the extension
                 original_ext = os.path.splitext(url.lower())[1]
                 is_image_url = original_ext in ['.jpg', '.jpeg', '.png', '.webp']
@@ -891,8 +1030,22 @@ class MediaDownloadWorker(QRunnable):
                         logger.error(f"Error renaming file to add .mp4 extension: {e}")
 
             # Success
+            register_cached_file_path(cache_path)
             return cache_path
         else:
             # Request failed
             logger.error(f"Failed to download {url}: HTTP status {response.status_code}")
             raise Exception(f"HTTP error {response.status_code}")
+
+    def _extension_for_content_type(self, content_type):
+        """Return a preferred file extension for common media content types."""
+        normalized = (content_type or "").split(";", 1)[0].strip().lower()
+        return {
+            "video/mp4": ".mp4",
+            "video/webm": ".webm",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }.get(normalized)

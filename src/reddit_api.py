@@ -13,6 +13,14 @@ import time
 import threading
 import praw
 import prawcore.exceptions
+# PRAW 8's Reddit.user.me() raises ReadOnlyException in read-only mode instead of
+# returning None. Import defensively so older PRAW and the stubbed test environment
+# (which provides no praw.exceptions) still load this module.
+try:
+    from praw.exceptions import ReadOnlyException
+except Exception:  # pragma: no cover - older PRAW or stubbed test environment
+    class ReadOnlyException(Exception):
+        """Fallback when praw.exceptions.ReadOnlyException is unavailable."""
 from types import SimpleNamespace # Import SimpleNamespace
 from PyQt6.QtCore import QThread, pyqtSignal, QObject # Import QObject for worker signals
 # Import the Submission class for type checking
@@ -21,14 +29,62 @@ from praw.models import Submission, Subreddit
 # Import caching utilities
 from utils import (
     load_submission_index, get_metadata_file_path, read_metadata_file,
-    write_metadata_file, get_cache_dir, update_metadata_cache, file_exists_in_cache
+    write_metadata_file, get_cache_dir, update_metadata_cache, file_exists_in_cache,
+    get_cached_submission_media_match
 )
 
 # Import constants
-from constants import DEFAULT_POSTS_FETCH_LIMIT
+from constants import DEFAULT_POSTS_FETCH_LIMIT, REPORT_CACHE_TTL_SECONDS
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+SNAPSHOT_METADATA_HYDRATION_FIELDS = (
+    'approved',
+    'removed',
+    'moderation_status',
+    'report_count',
+    'report_reasons',
+    'report_last_checked_utc',
+    'media_assets',
+    'cache_path',
+    'media_url',
+    'last_checked_utc',
+)
+
+
+class SnapshotFetchError(Exception):
+    """Raised when a snapshot load fails and the UI should show an error."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+def hydrate_submission_with_cached_metadata(submission: Submission, metadata: Dict[str, Any]) -> None:
+    """Attach cache-derived fields to a live submission without overwriting Reddit-owned fields."""
+    if not submission or not isinstance(metadata, dict):
+        return
+
+    for field in SNAPSHOT_METADATA_HYDRATION_FIELDS:
+        if field not in metadata:
+            continue
+
+        value = metadata[field]
+        if isinstance(value, list):
+            value = list(value)
+        elif isinstance(value, dict):
+            value = dict(value)
+
+        try:
+            setattr(submission, field, value)
+        except Exception as error:
+            logger.debug(
+                "Unable to hydrate cached field %s onto submission %s: %s",
+                field,
+                getattr(submission, 'id', 'unknown'),
+                error,
+            )
 
 def get_moderated_subreddits(reddit_instance) -> List[Dict[str, str]]:
     """
@@ -42,7 +98,11 @@ def get_moderated_subreddits(reddit_instance) -> List[Dict[str, str]]:
         Sorted alphabetically by display_name
     """
     try:
-        user = reddit_instance.user.me()
+        try:
+            user = reddit_instance.user.me()
+        except ReadOnlyException:
+            logger.error("Reddit instance is read-only; cannot fetch moderated subreddits without authentication.")
+            return []
         if not user:
             logger.error("Failed to get user information. User may not be authenticated.")
             return []
@@ -86,16 +146,20 @@ class ModeratedSubredditsFetcher(QThread):
 
     def run(self):
         mod_subreddits = get_moderated_subreddits(self.reddit_instance)
-        self.subredditsFetched.emit(mod_subreddits)
+        if not self.isInterruptionRequested():
+            self.subredditsFetched.emit(mod_subreddits)
 
 class RedditGalleryModel:
     """
     Model class for Reddit gallery data.
     Handles fetching and storing submissions from subreddits or user profiles.
     """
+    _cached_moderated_subreddit_names_by_user: Dict[str, Set[str]] = {}
+
     def __init__(self, name: str, is_user_mode: bool = False, reddit_instance=None,
                  prefetched_mod_logs: Optional[Dict[str, List[Dict]]] = None,
-                 mod_logs_ready: bool = False):
+                 mod_logs_ready: bool = False,
+                 moderated_subreddit_names: Optional[Set[str]] = None):
         """
         Initialize the gallery model.
 
@@ -105,6 +169,7 @@ class RedditGalleryModel:
             reddit_instance: PRAW Reddit instance to use
             prefetched_mod_logs: Dictionary of pre-fetched mod logs keyed by subreddit name.
             mod_logs_ready: Flag indicating if pre-fetched logs are ready.
+            moderated_subreddit_names: Already fetched moderated subreddit names.
         """
         self.is_user_mode = is_user_mode
         self.is_moderator = False # Specific to subreddit view, determined later
@@ -113,17 +178,13 @@ class RedditGalleryModel:
         self.reddit = reddit_instance # Store the PRAW instance
         self.prefetched_logs = prefetched_mod_logs if prefetched_mod_logs is not None else {}
         self.logs_ready = mod_logs_ready
-        self.moderated_subreddit_names = set() # Store names of subs the app user mods
+        self.moderated_subreddit_names = {
+            str(name).strip().lower()
+            for name in (moderated_subreddit_names or set())
+            if str(name).strip()
+        } # Store names of subs the app user mods
 
         if self.reddit:
-            # Fetch moderated subreddit names immediately for use later
-            try:
-                mod_subs_info = get_moderated_subreddits(self.reddit)
-                self.moderated_subreddit_names = {sub['name'] for sub in mod_subs_info}
-                logger.debug(f"Model initialized with {len(self.moderated_subreddit_names)} moderated subreddit names.")
-            except Exception as e:
-                logger.error(f"Error fetching moderated subreddits during model init: {e}")
-
             # Set up user or subreddit object
             if self.is_user_mode:
                 try:
@@ -138,6 +199,69 @@ class RedditGalleryModel:
                     logger.error(f"Error getting subreddit object for {name}: {e}")
                     self.subreddit = None # Handle potential errors
 
+        logger.debug(
+            f"Model initialized with {len(self.moderated_subreddit_names)} moderated subreddit names."
+        )
+
+    @classmethod
+    def clear_moderated_subreddit_cache(cls, username: Optional[str] = None) -> None:
+        """Clear cached moderated-subreddit names for one user or all users."""
+        if username is None:
+            cls._cached_moderated_subreddit_names_by_user.clear()
+            return
+
+        normalized_username = str(username).strip().lower()
+        if normalized_username:
+            cls._cached_moderated_subreddit_names_by_user.pop(normalized_username, None)
+
+    @classmethod
+    def set_cached_moderated_subreddit_names(cls, username: Optional[str], names: Set[str]) -> None:
+        """Store moderated-subreddit names fetched by the background worker."""
+        normalized_username = str(username or "").strip().lower()
+        if not normalized_username:
+            return
+
+        cls._cached_moderated_subreddit_names_by_user[normalized_username] = {
+            str(name).strip().lower()
+            for name in names
+            if str(name).strip()
+        }
+
+    def _get_authenticated_username(self) -> Optional[str]:
+        """Return the active authenticated username for cache namespacing."""
+        if not self.reddit:
+            return None
+
+        try:
+            user = self.reddit.user.me()
+        except ReadOnlyException:
+            logger.debug("Reddit instance is read-only; no authenticated username for mod cache.")
+            return None
+        except Exception as error:
+            logger.debug(f"Unable to determine authenticated username for mod cache: {error}")
+            return None
+
+        username = getattr(user, 'name', None)
+        if not username:
+            return None
+
+        return str(username).strip().lower() or None
+
+    def _get_cached_moderated_subreddit_names(self) -> Set[str]:
+        """Load moderated subreddit names once per authenticated user and reuse them across models."""
+        username = self._get_authenticated_username()
+        if not username:
+            mod_subs_info = get_moderated_subreddits(self.reddit)
+            return {sub['name'] for sub in mod_subs_info}
+
+        if username not in RedditGalleryModel._cached_moderated_subreddit_names_by_user:
+            mod_subs_info = get_moderated_subreddits(self.reddit)
+            RedditGalleryModel._cached_moderated_subreddit_names_by_user[username] = {
+                sub['name'] for sub in mod_subs_info
+            }
+
+        return set(RedditGalleryModel._cached_moderated_subreddit_names_by_user[username])
+
     def check_user_moderation_status(self) -> bool:
         """
         Check if the current Reddit user is a moderator of the current subreddit.
@@ -149,15 +273,8 @@ class RedditGalleryModel:
             return False
 
         try:
-            logger.debug("Performing moderator status check")
-            moderators = list(self.subreddit.moderator())
-            user = self.reddit.user.me()
-            if not user:
-                logger.warning("Could not get current user for mod check.")
-                return False
-            logger.debug(f"Current user: {user.name}")
-            logger.debug(f"Moderators in subreddit: {[mod.name for mod in moderators]}")
-            self.is_moderator = any(mod.name.lower() == user.name.lower() for mod in moderators)
+            subreddit_name = getattr(self.subreddit, 'display_name', self.source_name).lower()
+            self.is_moderator = subreddit_name in self.moderated_subreddit_names
             logger.debug(f"Moderator status for current user: {self.is_moderator}")
             return self.is_moderator
         except prawcore.exceptions.PrawcoreException as e:
@@ -182,7 +299,6 @@ class RedditGalleryModel:
         """
         logger.info(f"Fetching snapshot (total={total}, after={after}) for {'user' if self.is_user_mode else 'subreddit'}: {self.source_name}")
         snapshot_results = []
-        processed_ids = set()  # Keep track of IDs added to results
 
         # 1. Load the metadata index
         submission_index = load_submission_index()
@@ -191,12 +307,12 @@ class RedditGalleryModel:
         # 2. Get next page of Submission objects from Reddit API
         try:
             initial_listing = []
-            params = {'limit': total}
             # PRAW's .new() does NOT accept 'after' as a direct argument, but the ListingGenerator supports .params
             if self.is_user_mode:
                 if not self.user:
-                    logger.error("Cannot fetch user submissions, user object is None.")
-                    return []
+                    raise SnapshotFetchError(
+                        f"Unable to load user '{self.source_name}': user object is unavailable."
+                    )
                 try:
                     gen = self.user.submissions.new(limit=total)
                     if after:
@@ -204,32 +320,56 @@ class RedditGalleryModel:
                     initial_listing = list(gen)
                     logger.debug(f"Fetched {len(initial_listing)} items for user {self.source_name} (after={after})")
                 except prawcore.exceptions.NotFound:
-                    logger.warning(f"User '{self.source_name}' not found or inaccessible (404). Returning empty list.")
-                    return []
+                    logger.warning(f"User '{self.source_name}' not found or inaccessible (404).")
+                    raise SnapshotFetchError(f"User '{self.source_name}' was not found or is inaccessible.")
+                except prawcore.exceptions.Forbidden:
+                    logger.warning(f"User '{self.source_name}' is forbidden or inaccessible.")
+                    raise SnapshotFetchError(f"User '{self.source_name}' is inaccessible with the current account.")
+                except prawcore.exceptions.PrawcoreException as user_fetch_err:
+                    logger.error(f"PRAW error fetching submissions for user {self.source_name}: {user_fetch_err}")
+                    raise SnapshotFetchError(f"Reddit request failed while loading user '{self.source_name}'.")
                 except Exception as user_fetch_err:
-                    logger.error(f"Error fetching submissions for user {self.source_name}: {user_fetch_err}")
-                    return []
+                    logger.exception(f"Error fetching submissions for user {self.source_name}: {user_fetch_err}")
+                    raise SnapshotFetchError(f"Unexpected error while loading user '{self.source_name}'.")
                 # Optionally: add removed posts from logs (not paginated, so skip for "next 100" fetches)
             else:
                 if not self.subreddit:
-                    logger.error("Cannot fetch subreddit submissions, subreddit object is None.")
-                    return []
+                    raise SnapshotFetchError(
+                        f"Unable to load subreddit '{self.source_name}': subreddit object is unavailable."
+                    )
                 is_mod = self.check_user_moderation_status()
 
-                if is_mod:
-                    logger.debug("Fetching moderator view sources...")
-                    # For 'Fetch Next 500', only paginate the 'new' listing with 'after'
+                try:
+                    if is_mod:
+                        logger.debug("Fetching moderator view sources...")
+                    else:
+                        logger.debug("Fetching regular view...")
                     gen = self.subreddit.new(limit=total)
                     if after:
                         gen.params['after'] = after
                     initial_listing = list(gen)
-                    logger.debug(f"Fetched {len(initial_listing)} items from mod 'new' listing (after={after})")
-                else:
-                    logger.debug("Fetching regular view...")
-                    gen = self.subreddit.new(limit=total)
-                    if after:
-                        gen.params['after'] = after
-                    initial_listing = list(gen)
+                    if is_mod:
+                        logger.debug(f"Fetched {len(initial_listing)} items from mod 'new' listing (after={after})")
+                except prawcore.exceptions.NotFound:
+                    logger.warning(f"Subreddit '{self.source_name}' not found or inaccessible (404).")
+                    raise SnapshotFetchError(f"Subreddit '{self.source_name}' was not found or is inaccessible.")
+                except prawcore.exceptions.Forbidden:
+                    logger.warning(f"Subreddit '{self.source_name}' is forbidden or inaccessible.")
+                    raise SnapshotFetchError(
+                        f"Subreddit '{self.source_name}' is private or inaccessible with the current account."
+                    )
+                except prawcore.exceptions.PrawcoreException as subreddit_fetch_err:
+                    logger.error(
+                        f"PRAW error fetching submissions for subreddit {self.source_name}: {subreddit_fetch_err}"
+                    )
+                    raise SnapshotFetchError(
+                        f"Reddit request failed while loading subreddit '{self.source_name}'."
+                    )
+                except Exception as subreddit_fetch_err:
+                    logger.exception(
+                        f"Unexpected error fetching submissions for subreddit {self.source_name}: {subreddit_fetch_err}"
+                    )
+                    raise SnapshotFetchError(f"Unexpected error while loading subreddit '{self.source_name}'.")
 
             logger.debug(f"Processing {len(initial_listing)} submissions against cache...")
 
@@ -248,13 +388,13 @@ class RedditGalleryModel:
                     if os.path.exists(abs_metadata_path):
                         cached_data = read_metadata_file(abs_metadata_path)
                         if cached_data:
-                            media_cache_path = cached_data.get('cache_path')
-                            if media_cache_path and os.path.exists(media_cache_path):
+                            if get_cached_submission_media_match(cached_data):
                                 logger.debug(f"Cache HIT for {submission_id}.")
                                 cached_obj = SimpleNamespace(**cached_data)
                                 snapshot_results.append(cached_obj)
                                 continue
                             else:
+                                hydrate_submission_with_cached_metadata(submission_obj, cached_data)
                                 logger.debug(f"Cache MISS for {submission_id}: Media file missing.")
                         else:
                             logger.debug(f"Cache MISS for {submission_id}: Metadata invalid.")
@@ -269,15 +409,18 @@ class RedditGalleryModel:
             logger.info(f"Snapshot fetch complete. Returning {len(snapshot_results)} items.")
             return snapshot_results
 
+        except SnapshotFetchError:
+            raise
         except Exception as e:
             logger.exception(f"Error during snapshot fetch: {e}")
-            return []
+            raise SnapshotFetchError(f"Unexpected error while loading {self.source_name}.")
 
 class SnapshotFetcher(QThread):
     """
     Worker thread for asynchronous fetching of Reddit submission snapshots.
     """
     snapshotFetched = pyqtSignal(list)
+    snapshotFailed = pyqtSignal(str)
 
     def __init__(self, model, total=DEFAULT_POSTS_FETCH_LIMIT, after=None):
         super().__init__()
@@ -286,8 +429,20 @@ class SnapshotFetcher(QThread):
         self.after = after
 
     def run(self):
-        snapshot = self.model.fetch_snapshot(total=self.total, after=self.after)
-        self.snapshotFetched.emit(snapshot)
+        try:
+            snapshot = self.model.fetch_snapshot(total=self.total, after=self.after)
+        except SnapshotFetchError as error:
+            if not self.isInterruptionRequested():
+                self.snapshotFailed.emit(error.message)
+            return
+        except Exception as error:
+            logger.exception(f"Unexpected SnapshotFetcher failure for {self.model.source_name}: {error}")
+            if not self.isInterruptionRequested():
+                self.snapshotFailed.emit(f"Unexpected error while loading {self.model.source_name}.")
+            return
+
+        if not self.isInterruptionRequested():
+            self.snapshotFetched.emit(snapshot)
 
 # --- Worker Signals ---
 class WorkerSignals(QObject):
@@ -307,12 +462,11 @@ class WorkerSignals(QObject):
 
 class ApproveWorker(QThread):
     """Worker thread to approve a submission."""
-    signals = WorkerSignals()
-
     def __init__(self, submission_id: str, reddit_instance):
         super().__init__()
         self.submission_id = submission_id
         self.reddit_instance = reddit_instance
+        self.signals = WorkerSignals()
 
     def run(self):
         try:
@@ -358,12 +512,11 @@ class ApproveWorker(QThread):
 
 class RemoveWorker(QThread):
     """Worker thread to remove a submission."""
-    signals = WorkerSignals()
-
     def __init__(self, submission_id: str, reddit_instance):
         super().__init__()
         self.submission_id = submission_id
         self.reddit_instance = reddit_instance
+        self.signals = WorkerSignals()
 
     def run(self):
         moderation_status_update = "removed"
@@ -424,8 +577,6 @@ class RemoveWorker(QThread):
 
 class BanWorker(QThread):
     """Worker thread to ban a user."""
-    signals = WorkerSignals()
-
     def __init__(self, subreddit: Subreddit, username: str, reason: str, message: Optional[str], reddit_instance):
         super().__init__()
         self.subreddit = subreddit
@@ -433,6 +584,7 @@ class BanWorker(QThread):
         self.reason = reason
         self.message = message
         self.reddit_instance = reddit_instance # Needed? Subreddit object should be sufficient
+        self.signals = WorkerSignals()
 
     def run(self):
         try:
@@ -463,6 +615,32 @@ _request_lock = threading.Lock()
 
 # --- Standalone Report Functions ---
 
+def _read_fresh_report_cache(submission_id: str) -> Optional[tuple[int, list]]:
+    """Return cached report data when it exists and is still fresh."""
+    metadata_path = get_metadata_file_path(submission_id)
+    if not metadata_path:
+        return None
+
+    metadata = read_metadata_file(metadata_path)
+    if not metadata or 'report_count' not in metadata:
+        return None
+
+    last_checked = (
+        metadata.get('report_last_checked_utc')
+        or metadata.get('last_checked_utc', 0)
+    )
+    current_time = time.time()
+    if current_time - last_checked >= REPORT_CACHE_TTL_SECONDS:
+        logger.debug(
+            f"Cached reports for {submission_id} expired ({int(current_time - last_checked)}s old), fetching fresh data."
+        )
+        return None
+
+    return (
+        metadata.get('report_count', 0),
+        metadata.get('report_reasons', []),
+    )
+
 def get_submission_reports(submission_data, reddit_instance) -> tuple[int, list]:
     """
     Get reports for a submission, checking cache first.
@@ -479,58 +657,38 @@ def get_submission_reports(submission_data, reddit_instance) -> tuple[int, list]
         logger.error("Cannot get reports: Missing submission ID.")
         return (0, [])
 
-    # Check for active request to avoid duplicate API calls for the same submission
-    with _request_lock:
-        if submission_id in _active_report_requests:
-            logger.debug(f"Request for reports of {submission_id} already in progress, waiting...")
-            # Wait for the existing request to complete
-            existing_request = _active_report_requests[submission_id]
-        else:
-            # Mark this request as active
-            existing_request = threading.Event()
-            _active_report_requests[submission_id] = existing_request
+    cached_reports = _read_fresh_report_cache(submission_id)
+    if cached_reports is not None:
+        logger.debug(
+            f"Using cached reports for {submission_id}: {cached_reports[0]} reports."
+        )
+        return cached_reports
 
-    # If we're waiting for an existing request, wait for it to complete then check cache
-    if submission_id in _active_report_requests and _active_report_requests[submission_id] != existing_request:
-        _active_report_requests[submission_id].wait(timeout=10)  # Wait up to 10 seconds
-        # Try cache again after the other request completes
-        metadata_path = get_metadata_file_path(submission_id)
-        if metadata_path:
-            metadata = read_metadata_file(metadata_path)
-            if metadata and 'report_count' in metadata:
-                last_checked = metadata.get('last_checked_utc', 0)
-                current_time = time.time()
-                if current_time - last_checked < 300:  # 5 minutes TTL
-                    report_count = metadata.get('report_count', 0)
-                    report_reasons = metadata.get('report_reasons', [])
-                    logger.debug(f"Using cached reports after deduplication wait for {submission_id}: {report_count} reports.")
-                    return (report_count, report_reasons)
+    while True:
+        with _request_lock:
+            existing_request = _active_report_requests.get(submission_id)
+            if existing_request is None:
+                _active_report_requests[submission_id] = threading.Event()
+                break
 
-    metadata_path = get_metadata_file_path(submission_id)
-    if metadata_path:
-        metadata = read_metadata_file(metadata_path)
-        if metadata and 'report_count' in metadata:
-            # Check if cached reports are still fresh (TTL: 5 minutes for reports)
-            last_checked = metadata.get('last_checked_utc', 0)
-            current_time = time.time()
-            cache_ttl_seconds = 300  # 5 minutes
-
-            if current_time - last_checked < cache_ttl_seconds:
-                report_count = metadata.get('report_count', 0)
-                report_reasons = metadata.get('report_reasons', [])
-                logger.debug(f"Using cached reports for {submission_id}: {report_count} reports (cached {int(current_time - last_checked)}s ago).")
-                return (report_count, report_reasons)
-            else:
-                logger.debug(f"Cached reports for {submission_id} expired ({int(current_time - last_checked)}s old), fetching fresh data.")
-
-    logger.debug(f"No valid cache for reports of {submission_id}. Fetching from API.")
-    if not reddit_instance:
-        logger.error(f"Cannot fetch reports for {submission_id}: Missing PRAW instance.")
-        return (0, [])
+        logger.debug(f"Request for reports of {submission_id} already in progress, waiting...")
+        existing_request.wait(timeout=10)
+        cached_reports = _read_fresh_report_cache(submission_id)
+        if cached_reports is not None:
+            logger.debug(
+                f"Using cached reports after deduplication wait for {submission_id}: {cached_reports[0]} reports."
+            )
+            return cached_reports
 
     try:
+        logger.debug(f"No valid cache for reports of {submission_id}. Fetching from API.")
+        if not reddit_instance:
+            logger.error(f"Cannot fetch reports for {submission_id}: Missing PRAW instance.")
+            return (0, [])
+
         base_id = submission_id.split('_')[-1]
         praw_submission = reddit_instance.submission(id=base_id)
+        metadata_path = get_metadata_file_path(submission_id)
 
         mod_reports = getattr(praw_submission, 'mod_reports', [])
         user_reports = getattr(praw_submission, 'user_reports', [])
@@ -565,7 +723,7 @@ def get_submission_reports(submission_data, reddit_instance) -> tuple[int, list]
             metadata = read_metadata_file(metadata_path) or {'id': submission_id}
             metadata['report_count'] = total_reports
             metadata['report_reasons'] = formatted_reports
-            metadata['last_checked_utc'] = time.time()
+            metadata['report_last_checked_utc'] = time.time()
             if write_metadata_file(metadata_path, metadata):
                 logger.debug(f"Cached fetched reports for {submission_id}.")
             else:

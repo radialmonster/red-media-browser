@@ -21,12 +21,19 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSizePolicy,
     QDialog, QMessageBox, QLineEdit, QProgressBar, QScrollArea, QTextBrowser
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QThreadPool, QRunnable, QObject
+from PyQt6.QtCore import Qt, QSize, QRect, QTimer, pyqtSignal, QThreadPool, QRunnable, QObject
 from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie, QIcon
 
 # Import caching utilities needed for moderation status
-from utils import get_media_type, get_metadata_file_path, read_metadata_file
-from media_handlers import process_media_url, MediaDownloadWorker, get_cached_processed_url
+from utils import (
+    get_media_type, get_metadata_file_path, read_metadata_file,
+    get_cache_path_for_url, file_exists_in_cache, get_cached_submission_media_match,
+    update_report_metadata_cache, get_existing_cache_path_for_url
+)
+from media_handlers import (
+    process_media_url, MediaDownloadWorker, get_cached_processed_url,
+    cache_processed_url
+)
 # Import specific API functions and workers
 import reddit_api
 from reddit_api import ApproveWorker, RemoveWorker, get_submission_reports
@@ -35,7 +42,8 @@ from reddit_api import ApproveWorker, RemoveWorker, get_submission_reports
 from constants import (
     VIDEO_PLAYBACK_CHECK_INTERVAL_MS, VIDEO_ASPECT_RATIO_DELAY_MS,
     PLAYBACK_MONITOR_INTERVAL_MS, FULLSCREEN_CLOSE_DELAY_MS,
-    GIF_FRAME_TIMER_MS, MIN_VALID_FILE_SIZE_BYTES, MAX_DISPLAYED_REPORT_COUNT
+    GIF_FRAME_TIMER_MS, MIN_VALID_FILE_SIZE_BYTES, MAX_DISPLAYED_REPORT_COUNT,
+    REPORT_CACHE_TTL_SECONDS
 )
 
 # Set up logging
@@ -43,6 +51,92 @@ logger = logging.getLogger(__name__)
 
 class VlcWorkerSignals(QObject):
     finished = pyqtSignal(object, object, int) # vlc_instance, vlc_player, play_result
+
+
+class AspectRatioVideoWidget(QWidget):
+    """Black letterbox container that keeps the VLC render surface uncropped."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.aspect_ratio = None
+        self.video_surface = QWidget(self)
+        self.video_surface.setStyleSheet("background-color: black;")
+        self.video_surface.setMinimumWidth(0)
+        self.video_surface.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Ignored,
+        )
+        self.setStyleSheet("background-color: black;")
+        self.setMinimumWidth(0)
+        self.setMinimumHeight(160)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Expanding,
+        )
+
+    def set_aspect_ratio(self, width, height):
+        if width > 0 and height > 0:
+            self.aspect_ratio = width / height
+            self._layout_video_surface()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_video_surface()
+
+    def _layout_video_surface(self):
+        container_width = max(0, self.width())
+        container_height = max(0, self.height())
+        if container_width <= 0 or container_height <= 0:
+            return
+
+        if not self.aspect_ratio or self.aspect_ratio <= 0:
+            self.video_surface.setGeometry(0, 0, container_width, container_height)
+            return
+
+        container_ratio = container_width / container_height
+        if container_ratio > self.aspect_ratio:
+            video_height = container_height
+            video_width = max(1, int(video_height * self.aspect_ratio))
+        else:
+            video_width = container_width
+            video_height = max(1, int(video_width / self.aspect_ratio))
+
+        x = max(0, (container_width - video_width) // 2)
+        y = max(0, (container_height - video_height) // 2)
+        self.video_surface.setGeometry(QRect(x, y, video_width, video_height))
+
+
+class ReportFetchSignals(QObject):
+    finished = pyqtSignal(str, int, list)
+    error = pyqtSignal(str, str)
+
+
+class ReportFetchWorker(QRunnable):
+    """Fetch moderation report metadata without blocking thumbnail construction."""
+
+    def __init__(self, submission_id, submission_data, reddit_instance):
+        super().__init__()
+        self.submission_id = submission_id
+        self.submission_data = submission_data
+        self.reddit_instance = reddit_instance
+        self.signals = ReportFetchSignals()
+        self.setAutoDelete(False)
+
+    def run(self):
+        try:
+            report_count, report_reasons = get_submission_reports(
+                self.submission_data,
+                self.reddit_instance,
+            )
+            self.signals.finished.emit(
+                self.submission_id,
+                int(report_count or 0),
+                list(report_reasons or []),
+            )
+        except Exception as error:
+            logger.exception("Report fetch worker failed for %s: %s", self.submission_id, error)
+            self.signals.error.emit(self.submission_id, str(error))
+
 
 class VlcWorker(QRunnable):
     """Worker for initializing VLC player in a background thread."""
@@ -75,6 +169,11 @@ class VlcWorker(QRunnable):
             media.add_option(':loop')
             media.add_option(':file-caching=3000')
             vlc_player.set_media(media)
+            try:
+                vlc_player.video_set_scale(0)
+                vlc_player.video_set_crop_geometry(None)
+            except Exception:
+                pass
 
             # Start playback
             play_result = vlc_player.play()
@@ -466,8 +565,24 @@ class ThumbnailWidget(QWidget):
     # Signal emitted when media is ready for display
     mediaReady = pyqtSignal()
 
+    # Signal emitted when moderation state changes for this submission.
+    moderationStateChanged = pyqtSignal(str, str)
+    CACHED_SUBMISSION_FIELDS = (
+        "approved",
+        "removed",
+        "moderation_status",
+        "report_count",
+        "report_reasons",
+        "report_last_checked_utc",
+        "media_assets",
+        "cache_path",
+        "media_url",
+        "last_checked_utc",
+    )
+
     def __init__(self, images, title, source_url, submission,
-                 subreddit_name, has_multiple_images, post_url, is_moderator, reddit_instance, vlc_path=None):
+                 subreddit_name, has_multiple_images, post_url, is_moderator,
+                 reddit_instance, vlc_path=None, prefetch_state_getter=None):
         """
         Initialize ThumbnailWidget for a Reddit post.
 
@@ -496,6 +611,7 @@ class ThumbnailWidget(QWidget):
         self.subreddit_name = subreddit_name
         self.has_multiple_images = has_multiple_images
         self.is_moderator = is_moderator
+        self.prefetch_state_getter = prefetch_state_getter
 
         # Media display state
         self.pixmap = None
@@ -507,20 +623,34 @@ class ThumbnailWidget(QWidget):
         self.fullscreen_viewer = None
         self.original_title = title
         self.mod_worker = None # To hold reference to active moderation worker
+        self.report_worker = None
+        self.current_media_request_url = None
+        self.cached_submission_metadata = {}
+        self.render_media_source = "unknown"
+        self.render_media_cached_before_render = False
+        self.render_media_prefetch_hit = False
+        self.render_media_started_foreground_download = False
+        self.render_media_waiting_at_build = False
+        self.render_media_was_waiting_at_build = False
+        self.render_media_timed_out = False
+        self.render_media_ready_after_summary = False
 
         # Reports data
         self.reports_count = 0
         self.report_reasons = []
 
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        self.cached_submission_metadata = self._load_cached_submission_metadata()
         self.init_ui()
 
         # Check if post is removed/deleted (no images and specific flags)
         is_removed_or_deleted = False
         if not self.images:
-            removed_by_cat = getattr(self.praw_submission, 'removed_by_category', None)
-            banned_by = getattr(self.praw_submission, 'banned_by', None)
-            author_name = getattr(self.praw_submission, 'author', None)
+            submission_fields = getattr(self.praw_submission, "__dict__", {})
+            removed_by_cat = submission_fields.get('removed_by_category')
+            banned_by = submission_fields.get('banned_by')
+            author_name = submission_fields.get('author')
             is_author_deleted = author_name == "[deleted]" or author_name is None
 
             if removed_by_cat or banned_by or is_author_deleted:
@@ -555,12 +685,87 @@ class ThumbnailWidget(QWidget):
         if self.is_moderator and not is_removed_or_deleted:
             # Check if we already have report data from the initial reports fetch
             # This avoids redundant API calls when viewing "reported posts"
-            if hasattr(self.praw_submission, 'mod_reports') and hasattr(self.praw_submission, 'user_reports'):
+            submission_fields = getattr(self.praw_submission, "__dict__", {})
+            if 'mod_reports' in submission_fields and 'user_reports' in submission_fields:
                 # We already have fresh report data, use it directly
                 self.extract_reports_from_submission()
             else:
                 # Need to fetch reports via API
                 self.fetch_reports()
+
+    def _apply_cached_submission_metadata(self, metadata):
+        """Cache lightweight submission metadata locally and mirror it onto live submissions."""
+        if not isinstance(metadata, dict):
+            return {}
+
+        cached_metadata = {}
+        for field in self.CACHED_SUBMISSION_FIELDS:
+            if field not in metadata:
+                continue
+
+            value = metadata[field]
+            if isinstance(value, list):
+                value = list(value)
+            elif isinstance(value, dict):
+                value = dict(value)
+
+            cached_metadata[field] = value
+            try:
+                setattr(self.praw_submission, field, value)
+            except Exception:
+                logger.debug("Could not mirror cached field %s onto submission %s", field, self.submission_id)
+
+        self.cached_submission_metadata = cached_metadata
+        return cached_metadata
+
+    def _load_cached_submission_metadata(self, force_disk=False):
+        """Load cached metadata from inline submission fields first, then disk if needed."""
+        inline_metadata = {}
+        for field in self.CACHED_SUBMISSION_FIELDS:
+            if hasattr(self.praw_submission, field):
+                inline_metadata[field] = getattr(self.praw_submission, field)
+
+        if inline_metadata and not force_disk:
+            self.cached_submission_metadata = dict(inline_metadata)
+            return self.cached_submission_metadata
+
+        metadata_path = get_metadata_file_path(self.submission_id)
+        if not metadata_path:
+            self.cached_submission_metadata = dict(inline_metadata)
+            return self.cached_submission_metadata
+
+        metadata = read_metadata_file(metadata_path)
+        if not metadata:
+            self.cached_submission_metadata = dict(inline_metadata)
+            return self.cached_submission_metadata
+
+        return self._apply_cached_submission_metadata(metadata)
+
+    def _set_reports_button_state(self, report_count):
+        """Apply a consistent visible/hidden state for the reports button."""
+        if report_count > 0:
+            if report_count > MAX_DISPLAYED_REPORT_COUNT:
+                self.reports_button.setText(f"Rep({MAX_DISPLAYED_REPORT_COUNT}+)")
+            else:
+                self.reports_button.setText(f"Reports ({report_count})")
+            self.reports_button.show()
+        else:
+            self.reports_button.hide()
+
+    def _persist_report_cache(self):
+        """Persist current report metadata so rebuilt tiles can reuse it."""
+        try:
+            updated = update_report_metadata_cache(
+                self.praw_submission,
+                self.reports_count,
+                self.report_reasons,
+            )
+            if updated:
+                self.cached_submission_metadata['report_count'] = self.reports_count
+                self.cached_submission_metadata['report_reasons'] = list(self.report_reasons or [])
+                self.cached_submission_metadata['report_last_checked_utc'] = time.time()
+        except Exception:
+            logger.exception("Failed to persist report metadata for submission %s", self.submission_id)
 
     def init_ui(self):
         """Initialize the UI layout and components."""
@@ -574,14 +779,17 @@ class ThumbnailWidget(QWidget):
         self.titleLabel.setFixedHeight(40)
         self.titleLabel.setWordWrap(True)
         self.titleLabel.setStyleSheet("font-weight: bold;")
+        self.titleLabel.setMinimumWidth(0)
         self.titleLabel.clicked.connect(self.open_post_url)
 
         title_container = QWidget()
         title_container.setFixedHeight(40)
+        title_container.setMinimumWidth(0)
+        title_container.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         title_layout = QHBoxLayout(title_container)
         title_layout.setContentsMargins(0, 0, 0, 0)
         title_layout.setSpacing(8)
-        self.titleLabel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.titleLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         # Restore title to full width
         # (Removed setMaximumWidth and playTitleLabel)
         title_layout.addWidget(self.titleLabel)
@@ -592,6 +800,8 @@ class ThumbnailWidget(QWidget):
         self.subredditLabel.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
         self.subredditLabel.setStyleSheet("font-size: 9pt; color: grey;")
         self.subredditLabel.setFixedHeight(20)
+        self.subredditLabel.setMinimumWidth(0)
+        self.subredditLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
         # Author, Subreddit, and URL info section
         self.infoLayout = QHBoxLayout()
@@ -618,6 +828,11 @@ class ThumbnailWidget(QWidget):
         self.authorLabel.setText(username)
         self.authorLabel.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.authorLabel.setFixedHeight(20)
+        self.authorLabel.setMinimumWidth(0)
+        self.authorLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.authorLabel.setCursor(
+            Qt.CursorShape.ArrowCursor if username == "unknown" else Qt.CursorShape.PointingHandCursor
+        )
         self.authorLabel.clicked.connect(lambda u=username: self.authorClicked.emit(u) if u != "unknown" else None)
         self.infoLayout.addWidget(self.authorLabel)
         self.infoLayout.addSpacing(10)
@@ -628,15 +843,20 @@ class ThumbnailWidget(QWidget):
         self.postUrlLabel = ClickableLabel(self.source_url)
         self.postUrlLabel.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.postUrlLabel.setFixedHeight(20)
+        self.postUrlLabel.setMinimumWidth(0)
+        self.postUrlLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.postUrlLabel.setCursor(Qt.CursorShape.ArrowCursor)
         self.infoLayout.addWidget(self.postUrlLabel)
         self.layout.addLayout(self.infoLayout)
 
         # Image/video display section
         self.imageLabel = ClickableLabel()
         self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.imageLabel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.imageLabel.setMinimumWidth(0)
+        self.imageLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.imageLabel.setStyleSheet("background-color: #1a1a1a;")
         self.imageLabel.setScaledContents(False)
+        self.imageLabel.setCursor(Qt.CursorShape.PointingHandCursor)
         self.imageLabel.clicked.connect(self.open_fullscreen_view)
         self.layout.addWidget(self.imageLabel, 1)
 
@@ -762,18 +982,9 @@ class ThumbnailWidget(QWidget):
     
     def update_moderation_status_ui(self):
         """Update the moderation button appearance based on the current status from cache."""
-        # Fetch status from cached metadata
-        status = None
-        metadata_path = get_metadata_file_path(self.submission_id)
-        if metadata_path:
-            metadata = read_metadata_file(metadata_path)
-            if metadata:
-                status = metadata.get('moderation_status')
-                logger.debug(f"Moderation status for {self.submission_id} from cache: {status}")
-            else:
-                logger.debug(f"No metadata found for {self.submission_id} at {metadata_path}")
-        else:
-            logger.debug(f"Could not determine metadata path for {self.submission_id}")
+        cached_metadata = self.cached_submission_metadata or self._load_cached_submission_metadata()
+        status = cached_metadata.get('moderation_status')
+        logger.debug(f"Moderation status for {self.submission_id} from cache: {status}")
 
         # Reset styles first
         self.approve_button.setStyleSheet("")
@@ -829,17 +1040,14 @@ class ThumbnailWidget(QWidget):
             total_reports = len(mod_reports) + user_report_count
             self.reports_count = total_reports
             self.report_reasons = formatted_reports
+            self.cached_submission_metadata['report_count'] = total_reports
+            self.cached_submission_metadata['report_reasons'] = list(formatted_reports)
+            self.cached_submission_metadata['report_last_checked_utc'] = time.time()
+            self._persist_report_cache()
 
             # Update UI
-            if total_reports > 0:
-                if total_reports > MAX_DISPLAYED_REPORT_COUNT:
-                    self.reports_button.setText(f"Rep({MAX_DISPLAYED_REPORT_COUNT}+)")
-                else:
-                    self.reports_button.setText(f"Reports ({total_reports})")
-                self.reports_button.show()
-                logger.debug(f"Using cached report data: {total_reports} for post {self.submission_id}")
-            else:
-                self.reports_button.hide()
+            self._set_reports_button_state(total_reports)
+            logger.debug(f"Using cached report data: {total_reports} for post {self.submission_id}")
 
         except Exception as e:
             logger.exception(f"Error extracting reports from submission {self.submission_id}: {e}")
@@ -847,35 +1055,117 @@ class ThumbnailWidget(QWidget):
             self.fetch_reports()
 
     def fetch_reports(self):
-        """Fetch reports for the current submission using the dedicated API function."""
+        """Fetch reports for the current submission without blocking the UI thread."""
         # Ensure we have the necessary data and instance
         if not self.praw_submission or not self.reddit_instance:
             logger.warning(f"Cannot fetch reports for {self.submission_id}: Missing submission data or Reddit instance.")
             return
         try:
-            # Use the imported function directly
-            report_count, report_reasons = get_submission_reports(self.praw_submission, self.reddit_instance)
-            self.reports_count = report_count
-            self.report_reasons = report_reasons
+            cached_metadata = self.cached_submission_metadata or self._load_cached_submission_metadata()
+            last_checked = (
+                cached_metadata.get('report_last_checked_utc')
+                or cached_metadata.get('last_checked_utc', 0)
+            )
+            if (
+                'report_count' in cached_metadata and
+                'report_reasons' in cached_metadata and
+                time.time() - last_checked < REPORT_CACHE_TTL_SECONDS
+            ):
+                self.reports_count = cached_metadata.get('report_count', 0)
+                self.report_reasons = list(cached_metadata.get('report_reasons') or [])
+                self._set_reports_button_state(self.reports_count)
+                logger.debug(f"Using inline cached report metadata for post {self.submission_id}: {self.reports_count}")
+                return
 
-            # Update UI to show reports button if there are reports
-            if report_count > 0:
-                # Use a shorter format for report count to avoid width issues
-                if report_count > MAX_DISPLAYED_REPORT_COUNT:
-                    self.reports_button.setText(f"Rep({MAX_DISPLAYED_REPORT_COUNT}+)")
-                else:
-                    self.reports_button.setText(f"Reports ({report_count})")
-                self.reports_button.show()
-                logger.debug(f"Fetched reports via API function: {report_count} for post {self.praw_submission.id}")
-            else:
-                self.reports_button.hide()
-                logger.debug(f"No reports found via API function for post {self.praw_submission.id}")
+            if self.report_worker is not None:
+                logger.debug("Report fetch already active for post %s", self.submission_id)
+                return
+
+            worker = ReportFetchWorker(
+                self.submission_id,
+                self.praw_submission,
+                self.reddit_instance,
+            )
+            self.report_worker = worker
+            weak_self = weakref.ref(self)
+            worker.signals.finished.connect(
+                lambda submission_id, report_count, report_reasons:
+                ThumbnailWidget._safe_report_finished(
+                    weak_self,
+                    worker,
+                    submission_id,
+                    report_count,
+                    report_reasons,
+                ),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            worker.signals.error.connect(
+                lambda submission_id, error_message:
+                ThumbnailWidget._safe_report_error(
+                    weak_self,
+                    worker,
+                    submission_id,
+                    error_message,
+                ),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            QThreadPool.globalInstance().start(worker)
 
         except Exception as e:
             logger.exception(f"Error fetching reports via API function: {e}")
             # If there's any error, hide the reports button
             if hasattr(self, 'reports_button'):
                 self.reports_button.hide()
+
+    @staticmethod
+    def _safe_report_finished(weak_self, worker, submission_id, report_count, report_reasons):
+        widget = weak_self()
+        if widget is None:
+            return
+        try:
+            widget.on_report_fetch_finished(worker, submission_id, report_count, report_reasons)
+        except RuntimeError:
+            logger.debug("Widget was deleted before report fetch completed")
+
+    @staticmethod
+    def _safe_report_error(weak_self, worker, submission_id, error_message):
+        widget = weak_self()
+        if widget is None:
+            return
+        try:
+            widget.on_report_fetch_error(worker, submission_id, error_message)
+        except RuntimeError:
+            logger.debug("Widget was deleted before report fetch error handling")
+
+    def on_report_fetch_finished(self, worker, submission_id, report_count, report_reasons):
+        """Apply asynchronously fetched report metadata to this thumbnail."""
+        if worker is not self.report_worker or submission_id != self.submission_id:
+            return
+
+        self.report_worker = None
+        self.reports_count = report_count
+        self.report_reasons = list(report_reasons or [])
+        self.cached_submission_metadata['report_count'] = report_count
+        self.cached_submission_metadata['report_reasons'] = list(self.report_reasons)
+        self.cached_submission_metadata['report_last_checked_utc'] = time.time()
+
+        # The worker already persists fetched reports; this mirrors the cache state
+        # for rebuilt thumbnails without forcing another main-thread disk write.
+        self._set_reports_button_state(report_count)
+        if report_count > 0:
+            logger.debug("Fetched reports asynchronously: %s for post %s", report_count, self.submission_id)
+        else:
+            logger.debug("No reports found asynchronously for post %s", self.submission_id)
+
+    def on_report_fetch_error(self, worker, submission_id, error_message):
+        """Handle async report lookup errors without disrupting page navigation."""
+        if worker is not self.report_worker or submission_id != self.submission_id:
+            return
+
+        self.report_worker = None
+        logger.error("Report fetch failed for %s: %s", submission_id, error_message)
+        if hasattr(self, 'reports_button'):
+            self.reports_button.hide()
     
     def show_reports(self):
         """Show dialog with report details."""
@@ -922,18 +1212,64 @@ class ThumbnailWidget(QWidget):
         Start asynchronous loading of media from URL.
         Shows loading indicator and handles caching.
         """
+        self.current_media_request_url = url
+        self.render_media_source = "unknown"
+        self.render_media_cached_before_render = False
+        self.render_media_prefetch_hit = False
+        self.render_media_started_foreground_download = False
+        self.render_media_waiting_at_build = False
+        self.render_media_was_waiting_at_build = False
+        self.render_media_timed_out = False
+        self.render_media_ready_after_summary = False
+
         # First check if we already have it in the QPixmapCache
         # Use non-blocking check for cached processed URL
         processed_url = get_cached_processed_url(url)
-        
-        if processed_url:
-            cached_pixmap = QPixmapCache.find(processed_url)
+
+        cache_keys = [key for key in (processed_url, url) if key]
+        for cache_key in cache_keys:
+            cached_pixmap = QPixmapCache.find(cache_key)
             if cached_pixmap:
                 self.pixmap = cached_pixmap
+                self.render_media_source = "pixmap_cache"
+                self.render_media_cached_before_render = True
+                self.loadingBar.hide()
+                self.loadingStateChanged.emit(False)
                 self.update_pixmap()
+                self.is_media_loaded = True
+                self.mediaReady.emit()
                 return
+
+        cached_media_path, cached_media_url = self._get_cached_media_match(url, processed_url)
+        if cached_media_path:
+            self.render_media_cached_before_render = True
+            if self._is_prefetch_cache_hit(url, cached_media_url or processed_url or url):
+                self.render_media_source = "prefetch_cache"
+                self.render_media_prefetch_hit = True
+            else:
+                self.render_media_source = "disk_cache"
+            weak_self = weakref.ref(self)
+            resolved_url = cached_media_url or processed_url or url
+
+            def load_cached_media():
+                widget = weak_self()
+                if widget is None:
+                    return
+                try:
+                    widget.on_media_downloaded(
+                        cached_media_path,
+                        resolved_url,
+                        requested_url=url,
+                    )
+                except RuntimeError:
+                    logger.debug("Widget was deleted before cached media could load")
+
+            QTimer.singleShot(0, load_cached_media)
+            return
         
         # Show loading indicator
+        self.render_media_source = "foreground_download"
+        self.render_media_started_foreground_download = True
         self.loadingBar.setValue(0)
         self.loadingBar.show()
         self.loadingStateChanged.emit(True)
@@ -943,7 +1279,7 @@ class ThumbnailWidget(QWidget):
         
         # Create a download worker, passing the submission data
         # self.praw_submission holds either the PRAW object or the SimpleNamespace from cache
-        worker = MediaDownloadWorker(url, self.praw_submission)
+        worker = MediaDownloadWorker(url, self.praw_submission, source="page_render")
         
         # Connect signals with safety checks
         # Use lambda functions with try/except to prevent crashes if widget is deleted
@@ -951,14 +1287,103 @@ class ThumbnailWidget(QWidget):
             self._safe_update_progress(weak_self, progress))
         
         # Updated signal connection to accept 3 arguments: file_path, processed_url, submission_data
-        worker.signals.finished.connect(lambda file_path, proc_url, _: 
-            self._safe_call_finished(weak_self, file_path, proc_url))
+        worker.signals.finished.connect(lambda file_path, proc_url, _, requested_url=url: 
+            self._safe_call_finished(weak_self, file_path, proc_url, requested_url))
         
-        worker.signals.error.connect(lambda error_msg: 
-            self._safe_call_error(weak_self, error_msg))
+        worker.signals.error.connect(lambda error_msg, _, requested_url=url: 
+            self._safe_call_error(weak_self, error_msg, requested_url))
         
         # Start the worker
         QThreadPool.globalInstance().start(worker)
+
+    def _is_prefetch_cache_hit(self, original_url, resolved_url):
+        """Return True when a cached media match came from the prefetch pipeline."""
+        if not callable(self.prefetch_state_getter):
+            return False
+
+        try:
+            prefetch_data = self.prefetch_state_getter(original_url, resolved_url)
+        except Exception as e:
+            logger.debug(f"Prefetch state lookup failed for {self.submission_id}: {e}")
+            return False
+
+        return bool(prefetch_data and prefetch_data.get("status") == "cached")
+
+    def _get_cached_media_match(self, original_url, processed_url=None):
+        """Return a cached file path plus the media URL that produced it."""
+        for candidate_url in (processed_url, original_url):
+            if not candidate_url:
+                continue
+            try:
+                cache_path = get_existing_cache_path_for_url(candidate_url)
+                if cache_path:
+                    return cache_path, candidate_url
+            except Exception as e:
+                logger.debug(f"Cache-path lookup failed for {candidate_url}: {e}")
+
+        metadata_match = self._get_cached_submission_media_match(original_url)
+        if metadata_match:
+            return metadata_match
+
+        return None, None
+
+    def _get_cached_submission_media_match(self, requested_url):
+        """
+        Use cached submission metadata as a fast path when URL processing state is cold.
+
+        This is primarily for revisits to provider-backed posts whose final media URL was
+        already resolved in an earlier session/page visit.
+        """
+        inline_metadata = {}
+        for field in ("media_assets", "cache_path", "media_url", "last_checked_utc"):
+            if hasattr(self.praw_submission, field):
+                inline_metadata[field] = getattr(self.praw_submission, field)
+
+        if inline_metadata:
+            metadata_match = get_cached_submission_media_match(inline_metadata, requested_url)
+            if metadata_match:
+                cache_path, cached_media_url, asset_requested_url = metadata_match
+                if requested_url and cached_media_url:
+                    cache_processed_url(requested_url, cached_media_url)
+                if asset_requested_url and cached_media_url:
+                    cache_processed_url(asset_requested_url, cached_media_url)
+                return cache_path, cached_media_url or requested_url
+
+        submission_id = getattr(self.praw_submission, "id", None)
+        if not submission_id:
+            return None
+
+        metadata_path = get_metadata_file_path(submission_id)
+        if not metadata_path:
+            return None
+
+        metadata = read_metadata_file(metadata_path)
+        if not metadata:
+            return None
+
+        metadata_match = get_cached_submission_media_match(metadata, requested_url)
+        if not metadata_match:
+            return None
+
+        cache_path, cached_media_url, asset_requested_url = metadata_match
+        if requested_url and cached_media_url:
+            cache_processed_url(requested_url, cached_media_url)
+        if asset_requested_url and cached_media_url:
+            cache_processed_url(asset_requested_url, cached_media_url)
+
+        return cache_path, cached_media_url or requested_url
+
+    def _store_pixmap_cache_entries(self, pixmap, media_url):
+        """Insert an image pixmap under both raw and processed URL cache keys when available."""
+        cache_keys = {
+            key for key in (
+                media_url,
+                self.current_media_request_url,
+                self.images[self.current_index] if self.images else None,
+            ) if key
+        }
+        for cache_key in cache_keys:
+            QPixmapCache.insert(cache_key, pixmap)
     
     @staticmethod
     def _safe_update_progress(weak_ref, progress):
@@ -971,26 +1396,26 @@ class ThumbnailWidget(QWidget):
             pass
     
     @staticmethod
-    def _safe_call_finished(weak_ref, file_path, url):
+    def _safe_call_finished(weak_ref, file_path, url, requested_url):
         try:
             instance = weak_ref()
             if instance is not None and hasattr(instance, 'on_media_downloaded'):
-                instance.on_media_downloaded(file_path, url)
+                instance.on_media_downloaded(file_path, url, requested_url=requested_url)
         except RuntimeError:
             # Widget was deleted between the check and the call
             pass
     
     @staticmethod
-    def _safe_call_error(weak_ref, error_msg):
+    def _safe_call_error(weak_ref, error_msg, requested_url=None):
         try:
             instance = weak_ref()
             if instance is not None and hasattr(instance, 'on_media_error'):
-                instance.on_media_error(error_msg)
+                instance.on_media_error(error_msg, requested_url=requested_url)
         except RuntimeError:
             # Widget was deleted between the check and the call
             pass
     
-    def on_media_downloaded(self, file_path, url):
+    def on_media_downloaded(self, file_path, url, requested_url=None):
         """Handle completed media download."""
         # First check if this widget has been deleted
         try:
@@ -1003,6 +1428,14 @@ class ThumbnailWidget(QWidget):
         
         if not file_path:
             self.on_media_error("Download failed")
+            return
+
+        if requested_url and requested_url != self.current_media_request_url:
+            logger.debug(
+                "Ignoring stale media completion for %s; active request is %s",
+                requested_url,
+                self.current_media_request_url,
+            )
             return
             
         # Hide loading indicator
@@ -1031,11 +1464,13 @@ class ThumbnailWidget(QWidget):
                 except Exception:
                     pass
                 if media_type == "video":
-                    self.postUrlLabel.setStyleSheet("color: #4CAF50; text-decoration: underline; cursor: pointer;")
+                    self.postUrlLabel.setStyleSheet("color: #4CAF50; text-decoration: underline;")
+                    self.postUrlLabel.setCursor(Qt.CursorShape.PointingHandCursor)
                     self.postUrlLabel.setToolTip("Open video fullscreen")
                     self.postUrlLabel.clicked.connect(self.open_fullscreen_view)
                 else:
                     self.postUrlLabel.setStyleSheet("")
+                    self.postUrlLabel.setCursor(Qt.CursorShape.ArrowCursor)
                     self.postUrlLabel.setToolTip("")
             
             if media_type == "video":
@@ -1079,7 +1514,8 @@ class ThumbnailWidget(QWidget):
                     # Create the special GIF display widget if it doesn't exist
                     if not hasattr(self, 'gifDisplay') or self.gifDisplay is None:
                         self.gifDisplay = AnimatedGifDisplay(self)
-                        self.gifDisplay.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+                        self.gifDisplay.setMinimumWidth(0)
+                        self.gifDisplay.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
                         self.gifDisplay.setCursor(self.imageLabel.cursor())  # Copy cursor style
                         self.gifDisplay.mousePressEvent = lambda event: self.open_fullscreen_view()  # Make clickable
                         
@@ -1106,7 +1542,7 @@ class ThumbnailWidget(QWidget):
             elif media_type == "image":
                 pix = QPixmap(file_path)
                 if not pix.isNull():
-                    QPixmapCache.insert(url, pix)
+                    self._store_pixmap_cache_entries(pix, url)
                     self.pixmap = pix
                     
                     # Make sure the standard imageLabel is visible (not gif widget)
@@ -1185,31 +1621,84 @@ class ThumbnailWidget(QWidget):
             
         # Do not call start() as this causes the flashing
 
-    def on_media_error(self, error_msg):
+    def on_media_error(self, error_msg, requested_url=None):
         """Handle media download/loading errors."""
+        if requested_url and requested_url != self.current_media_request_url:
+            logger.debug(
+                "Ignoring stale media error for %s; active request is %s",
+                requested_url,
+                self.current_media_request_url,
+            )
+            return
+
         logger.error(f"Media error: {error_msg}")
         self.loadingBar.hide()
         self.loadingStateChanged.emit(False)
+
+        image_error_text, detail_error_text = self._build_media_error_display(
+            error_msg,
+            requested_url=requested_url,
+        )
         
         # Set constrained width for error messages to prevent layout stretching
         self.imageLabel.setMaximumWidth(300)  # Limit width to prevent stretching
-        self.imageLabel.setText("Media loading failed")
+        self.imageLabel.setText(image_error_text)
         self.imageLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         # Set a fixed height to maintain consistent grid layout
         self.imageLabel.setMinimumHeight(200)
         self.imageLabel.setMaximumHeight(200)
-        
-        # Truncate long error messages to prevent layout issues
-        if len(error_msg) > 50:
-            short_error = error_msg[:47] + "..."
-        else:
-            short_error = error_msg
-        self.postUrlLabel.setText(f"Error: {short_error}")
+        self.postUrlLabel.setText(detail_error_text)
         
         # Ensure we emit mediaReady so the grid layout can properly arrange widgets
         self.is_media_loaded = True
         self.mediaReady.emit()
+
+    def _build_media_error_display(self, error_msg, requested_url=None):
+        """Return user-facing error text for the tile body and detail label."""
+        active_url = requested_url or self.current_media_request_url
+        normalized_error = str(error_msg or "")
+        normalized_error_lower = normalized_error.lower()
+        normalized_url = str(active_url or "")
+
+        unavailable_markers = (
+            "404 client error",
+            "410 client error",
+            "not found",
+            "gone",
+            "failed to resolve",
+            "name resolution",
+            "getaddrinfo failed",
+        )
+        if any(marker in normalized_error_lower for marker in unavailable_markers):
+            hostname = ""
+            try:
+                hostname = urlparse(normalized_url).netloc
+            except Exception:
+                hostname = ""
+
+            if hostname:
+                detail_text = (
+                    f"Media URL unavailable on {hostname}. Consider removing post."
+                )
+            else:
+                detail_text = "Media URL unavailable. Consider removing post."
+
+            return (
+                "Media URL unavailable",
+                detail_text,
+            )
+
+        # Truncate long error messages to prevent layout issues
+        if len(normalized_error) > 50:
+            short_error = normalized_error[:47] + "..."
+        else:
+            short_error = normalized_error
+
+        return (
+            "Media loading failed",
+            f"Error: {short_error}",
+        )
     
     def update_pixmap(self):
         """Update the displayed image with proper scaling."""
@@ -1292,13 +1781,11 @@ class ThumbnailWidget(QWidget):
             if hasattr(self, 'imageLabel'):
                 self.imageLabel.hide()
             
-            # Create widget for VLC output in the same position as the image label
-            self.vlc_widget = QWidget(self)
-            self.vlc_widget.setStyleSheet("background-color: black;")
-            self.layout.insertWidget(2, self.vlc_widget)
-
-            # Ensure the widget has the same size policy as the image label
-            self.vlc_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            # Create a letterbox container for VLC output in the same position as the image label.
+            self.vlc_container = AspectRatioVideoWidget(self)
+            self.vlc_widget = self.vlc_container.video_surface
+            self.video_aspect_update_attempts = 0
+            self.layout.insertWidget(2, self.vlc_container, 1)
 
             # Start VLC initialization in background
             worker = VlcWorker(abs_video_path, int(self.vlc_widget.winId()))
@@ -1356,19 +1843,23 @@ class ThumbnailWidget(QWidget):
         """Update the aspect ratio of the video to maintain proper display."""
         if hasattr(self, 'vlc_player') and self.vlc_player:
             try:
+                try:
+                    self.vlc_player.video_set_scale(0)
+                    self.vlc_player.video_set_crop_geometry(None)
+                except Exception:
+                    pass
+
                 native_size = self.vlc_player.video_get_size(0)
                 if native_size and native_size[0] > 0 and native_size[1] > 0:
-                    aspect_ratio_str = f"{native_size[0]}:{native_size[1]}"
-                    self.vlc_player.video_set_aspect_ratio(aspect_ratio_str)
-                    logger.debug(f"Set video aspect ratio to {native_size[0]}:{native_size[1]}")
-                    
-                    # Special handling for portrait videos (taller than wide)
-                    is_portrait = native_size[1] > native_size[0]
-                    if is_portrait and hasattr(self, 'vlc_widget'):
-                        # Set maximum width for portrait videos to prevent layout disruption
-                        max_width = int(self.vlc_widget.height() * native_size[0] / native_size[1])
-                        self.vlc_widget.setMaximumWidth(max_width)
-                        logger.debug(f"Portrait video detected, setting max width to {max_width}")
+                    self.video_aspect_update_attempts = 0
+                    if hasattr(self, 'vlc_container'):
+                        self.vlc_container.set_aspect_ratio(native_size[0], native_size[1])
+                    logger.debug(f"Set inline video surface ratio to {native_size[0]}:{native_size[1]}")
+                else:
+                    attempts = getattr(self, 'video_aspect_update_attempts', 0)
+                    if attempts < 5:
+                        self.video_aspect_update_attempts = attempts + 1
+                        QTimer.singleShot(250, self.update_video_aspect_ratio)
             except Exception as e:
                 logger.error(f"Error setting video aspect ratio: {e}")
 
@@ -1385,12 +1876,19 @@ class ThumbnailWidget(QWidget):
                 except: pass
                 try: self.mod_worker.signals.finished.disconnect()
                 except: pass
-                
-                self.mod_worker.terminate()
-                self.mod_worker.wait(100) # Short wait
             except Exception as e:
                 logger.error(f"Error cancelling moderation worker: {e}")
             self.mod_worker = None
+
+        if hasattr(self, 'report_worker') and self.report_worker is not None:
+            try:
+                try: self.report_worker.signals.finished.disconnect()
+                except (TypeError, RuntimeError): pass
+                try: self.report_worker.signals.error.disconnect()
+                except (TypeError, RuntimeError): pass
+            except Exception as e:
+                logger.error(f"Error disconnecting report worker for {self.submission_id}: {e}")
+            self.report_worker = None
 
     def cleanup_current_media(self):
         """Clean up current media before loading a new one."""
@@ -1424,10 +1922,12 @@ class ThumbnailWidget(QWidget):
                     self.vlc_player = None
                     self.vlc_instance = None
 
-                    # Immediately remove the VLC widget if it exists
+                    # Immediately remove the VLC container/surface if it exists
+                    if hasattr(self, 'vlc_container'):
+                        self.vlc_container.setParent(None)
+                        self.vlc_container.deleteLater()
+                        delattr(self, 'vlc_container')
                     if hasattr(self, 'vlc_widget'):
-                        self.vlc_widget.setParent(None)
-                        self.vlc_widget.deleteLater()
                         delattr(self, 'vlc_widget')
 
                     # Schedule async cleanup in BACKGROUND THREAD to avoid blocking UI
@@ -1447,6 +1947,9 @@ class ThumbnailWidget(QWidget):
                     except AttributeError: pass
                     if hasattr(self, 'vlc_widget'):
                          try: delattr(self, 'vlc_widget')
+                         except AttributeError: pass
+                    if hasattr(self, 'vlc_container'):
+                         try: delattr(self, 'vlc_container')
                          except AttributeError: pass
 
 
@@ -1666,7 +2169,20 @@ class ThumbnailWidget(QWidget):
         """Handle successful moderation action from worker."""
         if submission_id == self.submission_id:
             logger.info(f"Moderation action successful for {self.submission_id}")
+            self._load_cached_submission_metadata(force_disk=True)
+            updated_status = self.cached_submission_metadata.get('moderation_status', '')
+            try:
+                setattr(self.praw_submission, 'moderation_status', updated_status)
+                setattr(self.praw_submission, 'removed', updated_status == "removed")
+                if updated_status == "removed":
+                    setattr(self.praw_submission, 'approved', False)
+                elif updated_status == "approved":
+                    setattr(self.praw_submission, 'approved', True)
+                    setattr(self.praw_submission, 'removed', False)
+            except Exception:
+                pass
             self.update_moderation_status_ui() # Update UI based on new cache status
+            self.moderationStateChanged.emit(self.submission_id, updated_status)
         else:
             logger.warning(f"Received success signal for wrong submission ID: {submission_id} (expected {self.submission_id})")
 
@@ -1675,6 +2191,7 @@ class ThumbnailWidget(QWidget):
         logger.error(f"Moderation action failed for {self.submission_id}: {error_message}")
         QMessageBox.warning(self, "Moderation Error", f"Failed to perform action:\n{error_message}")
         # Re-enable buttons and revert text based on current cache status
+        self._load_cached_submission_metadata(force_disk=True)
         self.update_moderation_status_ui()
 
     def on_mod_worker_finished(self):

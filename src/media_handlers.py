@@ -580,6 +580,75 @@ def reddit_video_handler(url: str) -> str:
 # Register the Reddit video handler
 register_handler("v.redd.it", reddit_video_handler)
 
+
+def gfycat_page_handler(url: str) -> str:
+    """
+    Handle legacy gfycat.com URLs.
+
+    The gfycat.com host is defunct and no longer resolves (direct fetches fail
+    with DNS NameResolutionError and clutter logs). RedGifs imported a large
+    portion of gfycat's library under the same slug, so rewrite
+    ``gfycat.com/<slug>`` to a ``redgifs.com/watch/<slug>`` URL which the RedGifs
+    resolver can turn into a playable mp4. This avoids repeatedly retrying the
+    dead host while recovering the media when a RedGifs mirror exists.
+
+    Args:
+        url (str): The legacy gfycat.com URL.
+
+    Returns:
+        str: A redgifs.com watch URL when a slug can be extracted, otherwise the
+        original URL unchanged.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+
+    # gfycat paths look like /<slug>, /gifs/detail/<slug>, /ifr/<slug>, etc.
+    # The meaningful slug is always the final non-empty path segment.
+    path_parts = [p for p in parsed.path.split('/') if p]
+    if not path_parts:
+        logger.debug("gfycat handler: no slug found in URL '%s'; returning unchanged.", url)
+        return url
+
+    # Strip any file extension and gfycat's occasional "-size_restricted" suffixes.
+    slug = path_parts[-1].split('.')[0].split('-')[0]
+    if not slug:
+        logger.debug("gfycat handler: empty slug after normalization for '%s'; returning unchanged.", url)
+        return url
+
+    redgifs_url = f"https://www.redgifs.com/watch/{slug.lower()}"
+    logger.info(
+        "gfycat host is defunct; rewriting %s -> %s for RedGifs resolution",
+        url,
+        redgifs_url,
+    )
+    return redgifs_url
+
+# Register the legacy gfycat handler (host no longer resolves; route to RedGifs)
+register_handler("gfycat.com", gfycat_page_handler)
+
+
+def is_reddit_post_url(url: str) -> bool:
+    """
+    Return True when a reddit.com URL points at a specific post permalink
+    (a ``/comments/<id>/...`` page) that may embed media, rather than a
+    subreddit listing, user profile, or other non-post page.
+
+    Used to avoid running the embedded-RedGifs JSON extraction path on URLs like
+    ``https://www.reddit.com/r/somesub/`` which would otherwise fetch
+    ``<subreddit>.json``, log a 404 stack trace, and fall back to caching the
+    listing URL as if it were a media target.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if "reddit.com" not in parsed.netloc.lower():
+        return False
+    return "/comments/" in parsed.path.lower()
+
+
 def process_media_url(url):
     """
     Determine the media provider and delegate URL processing.
@@ -636,7 +705,18 @@ def process_media_url(url):
         processed_url = get_redgifs_mp4_url(processed_url)
         logger.debug(f"Processed RedGifs URL: {url} -> {processed_url}")
 
-    # Handle Reddit links that might contain RedGifs (if no specific handler matched)
+    # Subreddit listings, user profiles, etc. are not embeddable media posts.
+    # Skip the embedded-RedGifs JSON fetch for them to avoid 404 stack traces on
+    # <subreddit>.json and quietly treat them as unsupported media.
+    elif (
+        "reddit.com" in domain
+        and best_match_domain is None
+        and not is_reddit_post_url(url)
+    ):
+        logger.info("media_unsupported reason=non_post_reddit_url url=%s", url)
+        # Keep processed_url as the original; no extraction attempted.
+
+    # Handle Reddit post links that might contain RedGifs (if no specific handler matched)
     elif "reddit.com" in domain and best_match_domain is None: # Only if no reddit handler ran
         logger.debug("Checking Reddit URL for potential embedded RedGifs...")
         try:

@@ -3,6 +3,8 @@
 /src/cache/
 /src/test/
 /src/config.json
+/src/.codex-cli/
+/src/.npm-cache/
 .venv/
 
 

@@ -121,6 +121,7 @@ def repair_cache_index(force_repair=False):
     logger.info("Starting cache repair/index warming...")
     repaired = 0
     migrated = 0
+    report_backfilled = 0
 
     # Build a set of all cache paths from metadata for O(1) lookup
     logger.info("Building cache path lookup from metadata...")
@@ -139,6 +140,17 @@ def repair_cache_index(force_repair=False):
                     meta.get('media_url') and
                     not _normalize_metadata_media_assets(meta)
                 )
+                # Backfill the dedicated report-freshness field onto legacy metadata
+                # that recorded reports before `report_last_checked_utc` existed. Report
+                # reads already fall back to `last_checked_utc`, so behavior is unchanged
+                # either way, but writing the dedicated field here makes legacy records
+                # unambiguous for offline/external tooling. Only seed it when reports were
+                # actually cached (`report_count` present) and a legacy timestamp exists.
+                needs_report_backfill = (
+                    'report_count' in meta
+                    and meta.get('report_last_checked_utc') is None
+                    and meta.get('last_checked_utc') is not None
+                )
                 if legacy_match:
                     meta['media_assets'] = [{
                         'requested_url': None,
@@ -146,10 +158,17 @@ def repair_cache_index(force_repair=False):
                         'cache_path': meta.get('cache_path'),
                         'last_checked_utc': meta.get('last_checked_utc'),
                     }]
+                if needs_report_backfill:
+                    meta['report_last_checked_utc'] = meta['last_checked_utc']
+
+                if legacy_match or needs_report_backfill:
                     if write_metadata_file(meta_path, meta):
-                        migrated += 1
+                        if legacy_match:
+                            migrated += 1
+                        if needs_report_backfill:
+                            report_backfilled += 1
                     else:
-                        logger.warning(f"Failed to backfill media_assets for metadata: {meta_path}")
+                        logger.warning(f"Failed to backfill metadata fields for: {meta_path}")
 
                 for normalized_path in _iter_metadata_cache_paths(meta):
                     existing_cache_paths.add(normalized_path)
@@ -199,12 +218,17 @@ def repair_cache_index(force_repair=False):
         try:
             save_submission_index()
             logger.info(
-                f"Cache repair complete. Added {repaired} missing metadata/index entries and migrated {migrated} legacy metadata files."
+                f"Cache repair complete. Added {repaired} missing metadata/index entries, "
+                f"migrated {migrated} legacy metadata files, and backfilled "
+                f"report_last_checked_utc on {report_backfilled} records."
             )
         except Exception as e:
             logger.error(f"Cache repair failed to save index after adding {repaired} entries: {e}")
-    elif migrated > 0:
-        logger.info(f"Cache repair complete. Migrated {migrated} legacy metadata files.")
+    elif migrated > 0 or report_backfilled > 0:
+        logger.info(
+            f"Cache repair complete. Migrated {migrated} legacy metadata files and "
+            f"backfilled report_last_checked_utc on {report_backfilled} records."
+        )
     else:
         logger.info("Cache repair complete. No missing entries found.")
 

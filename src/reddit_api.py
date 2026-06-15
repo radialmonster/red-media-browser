@@ -178,9 +178,19 @@ class RedditGalleryModel:
         self.reddit = reddit_instance # Store the PRAW instance
         self.prefetched_logs = prefetched_mod_logs if prefetched_mod_logs is not None else {}
         self.logs_ready = mod_logs_ready
+
+        if moderated_subreddit_names is None and self.reddit is not None:
+            # No names supplied by the caller: hydrate once per authenticated user
+            # from the shared cross-model cache. Gated on an explicit ``None`` (not an
+            # empty set) so the app's normal construction path -- which always passes
+            # its own set -- never triggers an extra me()/moderator_subreddits() call.
+            names_source = self._get_cached_moderated_subreddit_names()
+        else:
+            names_source = moderated_subreddit_names or set()
+
         self.moderated_subreddit_names = {
             str(name).strip().lower()
-            for name in (moderated_subreddit_names or set())
+            for name in names_source
             if str(name).strip()
         } # Store names of subs the app user mods
 

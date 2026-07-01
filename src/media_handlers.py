@@ -786,14 +786,15 @@ class MediaDownloadWorker(QRunnable):
     Worker for downloading media files asynchronously.
     Includes progress reporting, error handling, and metadata caching.
     """
-    def __init__(self, url, submission_data, source="page_render"):
+    def __init__(self, url, submission_data, source="page_render", processed_url=None):
         super().__init__()
         self.original_url = url
         # Store the submission data (could be PRAW object or filtered dict)
-        self.submission_data = submission_data 
+        self.submission_data = submission_data
         self.source = source
-        # URL processing will happen in run() to avoid blocking the main thread
-        self.processed_url = None
+        # URL processing will happen in run() to avoid blocking the main thread,
+        # unless the caller (e.g. the prefetch path) already resolved it.
+        self.processed_url = processed_url
         self.signals = WorkerSignals()
         submission_id = getattr(submission_data, 'id', 'UnknownID')
         logger.debug(
@@ -812,9 +813,13 @@ class MediaDownloadWorker(QRunnable):
         cache_path = None # Initialize cache_path
         submission_id = getattr(self.submission_data, 'id', 'UnknownID')
         try:
-            # Process the URL here (in background thread) to avoid blocking UI
-            self.processed_url = process_media_url(self.original_url)
-            logger.debug(f"MediaDownloadWorker processed URL for {submission_id}: {self.processed_url}")
+            # Process the URL here (in background thread) to avoid blocking UI.
+            # Skip the (potentially network-bound) resolution when the caller
+            # already supplied a resolved URL — the prefetch scanner does this
+            # so RedGifs/Imgur/Reddit-JSON URLs are not resolved twice.
+            if self.processed_url is None:
+                self.processed_url = process_media_url(self.original_url)
+                logger.debug(f"MediaDownloadWorker processed URL for {submission_id}: {self.processed_url}")
 
             # Skip empty URLs
             if not self.processed_url:

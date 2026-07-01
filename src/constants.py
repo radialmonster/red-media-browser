@@ -22,6 +22,10 @@ PREFETCH_RETRY_MAX_ATTEMPTS = 2
 UI_UPDATE_DELAY_MS = 50
 MOD_STATUS_DELAY_MS = 5000
 THREAD_TERMINATION_TIMEOUT_MS = 2000
+# Delay between a page render and the next-page media prefetch. Coalesced via a
+# restartable single-shot timer so rapid paging re-arms it instead of stacking
+# multiple prefetch triggers; short enough that the next page gets a head start.
+MEDIA_PREFETCH_RENDER_DELAY_MS = 500
 
 # Video/Media Playback Constants (in milliseconds)
 VIDEO_PLAYBACK_CHECK_INTERVAL_MS = 500

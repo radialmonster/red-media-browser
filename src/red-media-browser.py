@@ -56,6 +56,7 @@ from media_handlers import process_media_url, MediaDownloadWorker, WorkerSignals
 from constants import (
     PIXMAP_CACHE_SIZE_MB, POSTS_FETCH_LIMIT, DEFAULT_POSTS_FETCH_LIMIT, MOD_LOG_FETCH_LIMIT,
     UI_UPDATE_DELAY_MS, MOD_STATUS_DELAY_MS, THREAD_TERMINATION_TIMEOUT_MS,
+    MEDIA_PREFETCH_RENDER_DELAY_MS,
     SNAPSHOT_GRID_COLUMNS, SNAPSHOT_GRID_CELL_MIN_WIDTH, SNAPSHOT_GRID_CELL_MIN_HEIGHT,
     DEFAULT_PREFETCH_MEDIA_LIMIT, DEFAULT_MAX_CONCURRENT_PREFETCH_DOWNLOADS,
     DEFAULT_POST_PREFETCH_BUFFER_SIZE, MAX_AUTO_PREFETCHED_POSTS,
@@ -451,6 +452,14 @@ class MediaPrefetchWorker(QRunnable):
         self.submissions_to_prefetch = submissions_to_prefetch
         self.batch_id = batch_id
         self.signals = WorkerSignals()
+        # Cooperative cancellation flag. Set by the UI thread on shutdown or
+        # when a newer batch supersedes this one so the scanner stops paying
+        # for process_media_url() calls whose results would be discarded.
+        self._cancelled = False
+
+    def cancel(self):
+        """Request the scanner stop before its next URL. Safe to call off-thread."""
+        self._cancelled = True
 
     def run(self):
         """Prefetch media files for given submissions."""
@@ -471,6 +480,18 @@ class MediaPrefetchWorker(QRunnable):
                 len(self.submissions_to_prefetch),
             )
             for submission in self.submissions_to_prefetch:
+                # Tear down promptly on shutdown, and stop scanning once a newer
+                # batch has superseded this one (cancel() is set by the UI when
+                # start_media_prefetch runs again or the window is closing).
+                if self.main_window.is_shutting_down or self._cancelled:
+                    logger.info(
+                        "MediaPrefetchWorker aborting scan early batch_id=%s "
+                        "shutdown=%s cancelled=%s",
+                        self.batch_id,
+                        self.main_window.is_shutting_down,
+                        self._cancelled,
+                    )
+                    break
                 if not hasattr(submission, 'id'):
                     continue
 
@@ -678,6 +699,10 @@ class RedMediaBrowser(QMainWindow):
         self.next_prefetch_fetcher = None
         self.prefetched_next_batch = None
         self.prefetched_next_after = None
+        # Set when the user clicks Next while a post-prefetch is in flight for the
+        # current tail; on_next_prefetch_fetched then navigates instead of just
+        # extending, so we consume the in-flight fetch instead of retiring it.
+        self.next_batch_navigation_pending = False
         self.post_prefetch_buffer_size = DEFAULT_POST_PREFETCH_BUFFER_SIZE
         self.max_auto_prefetched_posts = MAX_AUTO_PREFETCHED_POSTS
         self.next_500_fetcher = None
@@ -719,6 +744,13 @@ class RedMediaBrowser(QMainWindow):
         self.active_prefetch_downloads = set()
         self.prefetch_mutex = QMutex()  # Thread safety for prefetch data
         self.is_shutting_down = False
+        # Restartable single-shot timer that triggers the next-page media
+        # prefetch after a page render. Calling start() again while it is
+        # running re-arms it, so rapid paging coalesces into one trigger
+        # instead of stacking independent singleShot timers.
+        self.media_prefetch_timer = QTimer(self)
+        self.media_prefetch_timer.setSingleShot(True)
+        self.media_prefetch_timer.timeout.connect(self.start_media_prefetch)
         self.prefetch_stats = {
             'scheduled': 0,
             'started': 0,
@@ -1471,6 +1503,7 @@ class RedMediaBrowser(QMainWindow):
         self._cancel_content_fetch_workers()
         self.prefetched_next_batch = None
         self.prefetched_next_after = None
+        self.next_batch_navigation_pending = False
 
         self.loading_bar.show()
         self.is_loading_posts = True
@@ -1754,7 +1787,9 @@ class RedMediaBrowser(QMainWindow):
             self._update_pagination_buttons(snapshot)
 
             if not self.is_loading_posts:
-                QTimer.singleShot(2000, self.start_media_prefetch)
+                # Re-arm (not stack) the media-prefetch timer so rapid paging
+                # coalesces into a single trigger after the user settles.
+                self.media_prefetch_timer.start(MEDIA_PREFETCH_RENDER_DELAY_MS)
                 QTimer.singleShot(0, self._maybe_prefetch_next_batch)
 
             self.cleanup_prefetch_data()
@@ -2226,6 +2261,9 @@ class RedMediaBrowser(QMainWindow):
             if retried:
                 batch_record['downloads_retried'] += 1
 
+        # Intentionally outside the lock: _log_prefetch_batch_async_outcome_if_complete
+        # re-acquires prefetch_mutex internally. Do not move this call inside the
+        # `with` block above — it would deadlock (QMutex is not recursive).
         self._log_prefetch_batch_async_outcome_if_complete(batch_id)
 
     def _log_prefetch_batch_async_outcome_if_complete(self, batch_id: Optional[int]) -> None:
@@ -2265,6 +2303,17 @@ class RedMediaBrowser(QMainWindow):
     def _abort_prefetch_activity(self, reason: str) -> None:
         """Retire queued/inflight prefetch bookkeeping and log each unfinished batch once."""
         self.is_shutting_down = True
+        # Stop the restartable media-prefetch trigger so it cannot fire during /
+        # after teardown. RuntimeError covers the QTimer's underlying C++ object
+        # already being destroyed during Qt teardown; AttributeError covers the
+        # timer never having been initialized (partial startup, early shutdown,
+        # or stub environments where the attribute resolves to a non-QTimer).
+        timer = getattr(self, "media_prefetch_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except (RuntimeError, AttributeError):
+                pass
 
         with QMutexLocker(self.prefetch_mutex):
             queued_downloads = list(self.prefetch_download_queue.values())
@@ -2931,6 +2980,7 @@ class RedMediaBrowser(QMainWindow):
         if 'next_prefetch_fetcher' not in exclude:
             self.prefetched_next_batch = None
             self.prefetched_next_after = None
+            self.next_batch_navigation_pending = False
 
     def cleanup_worker(self, worker) -> None:
         """Remove a specific worker from the active workers list."""
@@ -3013,22 +3063,41 @@ class RedMediaBrowser(QMainWindow):
             self.next_button.setEnabled(True)
             return
 
-        if self.prefetched_next_after == last_fullname and self.prefetched_next_batch is not None:
-            logger.info("Using prefetched next batch after post: %s", last_fullname)
-            prefetched_posts = self.prefetched_next_batch
-            self.prefetched_next_batch = None
-            self.prefetched_next_after = None
-            if self.next_prefetch_fetcher is not None:
-                self.cleanup_worker(self.next_prefetch_fetcher)
-                self.next_prefetch_fetcher = None
-            QTimer.singleShot(0, lambda posts=prefetched_posts: self._integrate_next_batch(posts))
+        in_flight_prefetch = (
+            self.next_prefetch_fetcher is not None
+            and self.prefetched_next_after == last_fullname
+        )
+        prefetch_running = False
+        if in_flight_prefetch:
+            try:
+                prefetch_running = self.next_prefetch_fetcher.isRunning()
+            except RuntimeError:
+                prefetch_running = False
+
+        if in_flight_prefetch and prefetch_running:
+            # A background post-prefetch for this exact cursor is still in
+            # flight. Await it instead of retiring the worker and starting a
+            # duplicate SnapshotFetcher against the same `after` cursor. When
+            # it lands, on_next_prefetch_fetched will integrate *and* navigate.
+            logger.info(
+                "Deferring foreground fetch to in-flight prefetch after post: %s",
+                last_fullname,
+            )
+            self.next_batch_navigation_pending = True
+            self.next_button.setEnabled(False)
+            self.status_bar.showMessage("Fetching next batch of posts...")
+            self.loading_bar.show()
+            self.is_loading_posts = True
             return
 
+        # No usable in-flight prefetch for this cursor — drop any stale one so
+        # its result cannot be mistaken for the foreground fetch we now start.
         if self.next_prefetch_fetcher is not None:
             self._retire_worker(self.next_prefetch_fetcher)
             self.next_prefetch_fetcher = None
-            self.prefetched_next_batch = None
-            self.prefetched_next_after = None
+        self.prefetched_next_batch = None
+        self.prefetched_next_after = None
+        self.next_batch_navigation_pending = False
 
         logger.info(f"Starting fetch for next batch after post: {last_fullname}")
 
@@ -3074,8 +3143,11 @@ class RedMediaBrowser(QMainWindow):
         remaining_loaded_posts = len(self.current_snapshot) - (self.snapshot_offset + self.snapshot_page_size)
         if remaining_loaded_posts > self.post_prefetch_buffer_size:
             return
-        if remaining_loaded_posts >= self.max_auto_prefetched_posts:
-            return
+        # The rolling prefetch self-limits: on_next_prefetch_fetched eagerly
+        # extends the snapshot by ~DEFAULT_POSTS_FETCH_LIMIT posts, which pushes
+        # remaining_loaded_posts back above post_prefetch_buffer_size and makes
+        # the next chain call return early. The end of the listing is bounded by
+        # the can_fetch_more_posts guard above.
 
         last_fullname = self._get_last_fullname(self.all_current_snapshot or self.current_snapshot)
         if not last_fullname:
@@ -3120,6 +3192,33 @@ class RedMediaBrowser(QMainWindow):
             if getattr(post, "id", None) not in existing_ids
         ]
 
+        # If the foreground Next click deferred to this in-flight prefetch,
+        # take the navigate-to-new-page path (mirroring on_next_batch_fetched)
+        # instead of the silent background-extend path.
+        navigate_to_new_page = self.next_batch_navigation_pending
+        self.next_batch_navigation_pending = False
+
+        self.can_fetch_more_posts = len(posts) >= DEFAULT_POSTS_FETCH_LIMIT
+        if posts:
+            last_fullname = self._get_last_fullname(list(posts))
+            if last_fullname:
+                self.current_after = last_fullname
+
+        if self.next_prefetch_fetcher is not None:
+            self.cleanup_worker(self.next_prefetch_fetcher)
+            self.next_prefetch_fetcher = None
+        self.prefetched_next_batch = None
+        self.prefetched_next_after = None
+
+        if navigate_to_new_page:
+            logger.info(
+                "In-flight prefetch consumed by foreground Next; integrating and "
+                "navigating to %s unique posts.",
+                len(unique_new_posts),
+            )
+            self._integrate_next_batch(unique_new_posts)
+            return
+
         if unique_new_posts:
             self.all_current_snapshot.extend(unique_new_posts)
             if self.is_filtered and self.current_model and self.current_model.is_user_mode:
@@ -3128,17 +3227,6 @@ class RedMediaBrowser(QMainWindow):
                 )
             self._refresh_visible_snapshots()
 
-        self.can_fetch_more_posts = len(posts) >= DEFAULT_POSTS_FETCH_LIMIT
-        if posts:
-            last_fullname = self._get_last_fullname(list(posts))
-            if last_fullname:
-                self.current_after = last_fullname
-
-        self.prefetched_next_batch = None
-        self.prefetched_next_after = None
-        if self.next_prefetch_fetcher is not None:
-            self.cleanup_worker(self.next_prefetch_fetcher)
-            self.next_prefetch_fetcher = None
         self._update_pagination_buttons(self.current_filtered_snapshot if self.is_filtered else self.current_snapshot)
         logger.info(
             "Next batch prefetch complete. Appended %s unique posts; loaded visible posts=%s.",
@@ -3156,11 +3244,21 @@ class RedMediaBrowser(QMainWindow):
             return
 
         logger.debug("Next batch prefetch failed: %s", error_message)
+        was_pending_navigation = self.next_batch_navigation_pending
+        self.next_batch_navigation_pending = False
         self.prefetched_next_batch = None
         self.prefetched_next_after = None
         if self.next_prefetch_fetcher is not None:
             self.cleanup_worker(self.next_prefetch_fetcher)
             self.next_prefetch_fetcher = None
+
+        if was_pending_navigation:
+            # The user is waiting on the foreground Next click; the in-flight
+            # prefetch they deferred to just failed, so fall back to a fresh
+            # foreground SnapshotFetcher (next_prefetch_fetcher is now cleared,
+            # so fetch_next_batch will take its slow path).
+            logger.info("In-flight prefetch failed; starting foreground fetch.")
+            QTimer.singleShot(0, self.fetch_next_batch)
 
     # --- Fetch Next 500 Logic ---
     def fetch_next_500(self) -> None:
@@ -4666,6 +4764,7 @@ class RedMediaBrowser(QMainWindow):
                 queued_download['original_url'],
                 queued_download['submission_data'],
                 source="prefetch",
+                processed_url=queued_download['processed_url'],
             )
             worker.signals.finished.connect(
                 lambda file_path, finished_processed_url, submission_data,
@@ -4864,6 +4963,18 @@ class RedMediaBrowser(QMainWindow):
                         break
 
             if unique_submissions:
+                # Any still-running scanner is now scanning a superseded window
+                # (the user has moved on); ask it to stop so its process_media_url
+                # network calls do not keep running. Already-queued downloads are
+                # unaffected — only further scanning is suppressed.
+                with QMutexLocker(self.prefetch_mutex):
+                    superseded_workers = list(self.prefetch_workers)
+                for stale_worker in superseded_workers:
+                    try:
+                        stale_worker.cancel()
+                    except Exception:
+                        logger.debug("Failed to cancel superseded prefetch worker", exc_info=True)
+
                 self.prefetch_batch_counter += 1
                 batch_id = self.prefetch_batch_counter
                 logger.info(

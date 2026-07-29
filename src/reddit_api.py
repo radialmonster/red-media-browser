@@ -7,11 +7,11 @@ pagination, and moderation actions.
 """
 
 import logging
-from typing import List, Dict, Tuple, Optional, Set, Any
+from typing import List, Dict, Optional, Set, Any
 import os
 import time
 import threading
-import praw
+import math
 import prawcore.exceptions
 # PRAW 8's Reddit.user.me() raises ReadOnlyException in read-only mode instead of
 # returning None. Import defensively so older PRAW and the stubbed test environment
@@ -29,7 +29,7 @@ from praw.models import Submission, Subreddit
 # Import caching utilities
 from utils import (
     load_submission_index, get_metadata_file_path, read_metadata_file,
-    write_metadata_file, get_cache_dir, update_metadata_cache, file_exists_in_cache,
+    write_metadata_file, get_cache_dir,
     get_cached_submission_media_match
 )
 
@@ -632,24 +632,44 @@ def _read_fresh_report_cache(submission_id: str) -> Optional[tuple[int, list]]:
         return None
 
     metadata = read_metadata_file(metadata_path)
-    if not metadata or 'report_count' not in metadata:
+    if not isinstance(metadata, dict) or 'report_count' not in metadata:
         return None
 
+    report_last_checked = metadata.get('report_last_checked_utc')
     last_checked = (
-        metadata.get('report_last_checked_utc')
-        or metadata.get('last_checked_utc', 0)
+        metadata.get('last_checked_utc', 0)
+        if report_last_checked is None
+        else report_last_checked
     )
+    try:
+        last_checked = float(last_checked)
+    except (TypeError, ValueError):
+        logger.warning("Cached reports for %s have an invalid freshness timestamp.", submission_id)
+        return None
+
     current_time = time.time()
-    if current_time - last_checked >= REPORT_CACHE_TTL_SECONDS:
+    cache_age = current_time - last_checked
+    if (
+        not math.isfinite(last_checked)
+        or cache_age < 0
+        or cache_age >= REPORT_CACHE_TTL_SECONDS
+    ):
         logger.debug(
-            f"Cached reports for {submission_id} expired ({int(current_time - last_checked)}s old), fetching fresh data."
+            "Cached reports for %s are stale or have an invalid freshness timestamp, fetching fresh data.",
+            submission_id,
         )
         return None
 
-    return (
-        metadata.get('report_count', 0),
-        metadata.get('report_reasons', []),
-    )
+    report_count = metadata.get('report_count')
+    report_reasons = metadata.get('report_reasons', [])
+    if isinstance(report_count, bool) or not isinstance(report_count, int):
+        logger.warning("Cached reports for %s have an invalid report count.", submission_id)
+        return None
+    if report_count < 0 or not isinstance(report_reasons, list):
+        logger.warning("Cached reports for %s have invalid report details.", submission_id)
+        return None
+
+    return report_count, list(report_reasons)
 
 def get_submission_reports(submission_data, reddit_instance) -> tuple[int, list]:
     """

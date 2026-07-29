@@ -25,10 +25,8 @@ import json
 import logging
 import sys
 import webbrowser
-import re
-from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import urlparse, parse_qs
 
-import praw
 import prawcore.exceptions
 
 DEFAULT_LOG_LEVEL = "INFO"

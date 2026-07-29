@@ -11,31 +11,30 @@ import sys
 import logging
 import weakref
 import time
+import datetime
 import webbrowser
 import html
-from typing import List, Optional, Dict, Any, Callable
-
 import vlc
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSizePolicy,
-    QDialog, QMessageBox, QLineEdit, QProgressBar, QScrollArea, QTextBrowser
+    QDialog, QMessageBox, QLineEdit, QProgressBar, QScrollArea, QTextBrowser,
+    QFrame
 )
 from PyQt6.QtCore import Qt, QSize, QRect, QTimer, pyqtSignal, QThreadPool, QRunnable, QObject
-from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie, QIcon
+from PyQt6.QtGui import QPixmap, QPixmapCache, QMovie
 
 # Import caching utilities needed for moderation status
 from utils import (
     get_media_type, get_metadata_file_path, read_metadata_file,
-    get_cache_path_for_url, file_exists_in_cache, get_cached_submission_media_match,
+    get_cached_submission_media_match,
     update_report_metadata_cache, get_existing_cache_path_for_url
 )
 from media_handlers import (
-    process_media_url, MediaDownloadWorker, get_cached_processed_url,
+    MediaDownloadWorker, get_cached_processed_url,
     cache_processed_url
 )
 # Import specific API functions and workers
-import reddit_api
 from reddit_api import ApproveWorker, RemoveWorker, get_submission_reports
 
 # Import constants
@@ -510,6 +509,253 @@ class BanUserDialog(QDialog):
         self.result_type = "private"
         self.accept()
 
+class DuplicateGroupPreviewDialog(QDialog):
+    """
+    Dialog for visually verifying posts that share the same cached media.
+
+    Renders one card per post, showing the cached thumbnail (image/GIF/video
+    aware) alongside author, subreddit, title, timestamp and permalink. Used by
+    the Duplicate Media review view to confirm that grouped posts are in fact
+    the same media.
+    """
+
+    THUMBNAIL_SIZE = 200
+
+    def __init__(self, group, posts, parent=None, on_view_author=None):
+        super().__init__(parent)
+        # The preview reads a persisted cache index, so tolerate a stale or
+        # partially-written record rather than failing to open the entire
+        # group.  The caller already filters posts, but keeping this boundary
+        # defensive also makes the dialog safe to reuse independently.
+        self.group = group if isinstance(group, dict) else {}
+        self.posts = [post for post in (posts or []) if isinstance(post, dict)]
+        self.on_view_author = on_view_author
+        self._movies = []  # keep QMovie references alive
+
+        self.setWindowTitle("Duplicate Media Group Preview")
+        self.resize(960, 760)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        header_label = QLabel(self._build_header_text())
+        header_label.setWordWrap(True)
+        header_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        header_label.setStyleSheet("font-weight: bold; padding: 4px; background-color: #3a3a3a; color: #fff;")
+        layout.addWidget(header_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(8)
+
+        sorted_posts = self._sort_posts(self.posts)
+        if not sorted_posts:
+            empty = QLabel("No posts available for this group.")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            content_layout.addWidget(empty)
+        else:
+            for post in sorted_posts:
+                content_layout.addWidget(self._build_post_card(post))
+        content_layout.addStretch(1)
+
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
+
+    @staticmethod
+    def _sort_posts(posts):
+        def key(post):
+            author = str(post.get("author") or "").lower()
+            created = post.get("created_utc") or 0
+            try:
+                created = float(created)
+            except (TypeError, ValueError):
+                created = 0.0
+            return (author, -created)
+        return sorted((post for post in posts if isinstance(post, dict)), key=key)
+
+    def _build_header_text(self):
+        group = self.group
+        match_type = group.get("match_type") or "match"
+        author_count = group.get("author_count") or 0
+        post_count = group.get("post_count") or len(self.posts)
+        if match_type == "visual_image":
+            threshold = group.get("visual_distance_threshold") or 0
+            match_label = f"Visual match (dHash distance <= {threshold})"
+        elif match_type == "sha256":
+            match_label = "Exact match (SHA256)"
+        elif match_type == "url":
+            match_label = "Same URL"
+        else:
+            match_label = match_type
+
+        media_label = (
+            group.get("media_sha256")
+            or group.get("image_visual_hash")
+            or group.get("media_url")
+            or ""
+        )
+        if media_label:
+            media_label = str(media_label)[:24]
+
+        parts = [match_label, f"{author_count} users", f"{post_count} posts"]
+        if media_label:
+            parts.append(media_label)
+        return "  |  ".join(parts)
+
+    def _build_post_card(self, post):
+        card = QFrame()
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        card.setStyleSheet("QFrame { background-color: #2b2b2b; border: 1px solid #444; }")
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(8, 8, 8, 8)
+        card_layout.setSpacing(10)
+
+        card_layout.addWidget(self._build_thumbnail(post), 0, Qt.AlignmentFlag.AlignTop)
+
+        info = QLabel(self._build_post_text(post))
+        info.setWordWrap(True)
+        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        info.setStyleSheet("color: #ddd;")
+        card_layout.addWidget(info, 1)
+
+        buttons = QVBoxLayout()
+        buttons.setSpacing(4)
+
+        author = str(post.get("author") or "").strip()
+        if (self.on_view_author is not None
+                and author
+                and author.lower() not in {"[deleted]", "unknown", "none"}):
+            author_button = QPushButton(f"View u/{author}")
+            author_button.clicked.connect(
+                lambda checked=False, name=author: self._view_author(name)
+            )
+            buttons.addWidget(author_button)
+
+        permalink = self._normalize_permalink(post.get("permalink"))
+        if permalink:
+            open_button = QPushButton("Open Post")
+            open_button.clicked.connect(
+                lambda checked=False, url=permalink: webbrowser.open(url)
+            )
+            buttons.addWidget(open_button)
+
+        buttons.addStretch(1)
+        button_wrap = QWidget()
+        button_wrap.setLayout(buttons)
+        button_wrap.setFixedWidth(160)
+        card_layout.addWidget(button_wrap, 0, Qt.AlignmentFlag.AlignTop)
+
+        return card
+
+    def _build_thumbnail(self, post):
+        label = QLabel()
+        size = self.THUMBNAIL_SIZE
+        label.setFixedSize(size, size)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("background-color: #1e1e1e; color: #aaa;")
+
+        cache_path = str(post.get("cache_path") or "")
+        if not (cache_path and os.path.exists(cache_path)):
+            url = str(post.get("media_url") or post.get("requested_url") or "No URL")
+            label.setWordWrap(True)
+            label.setText(f"Not cached\n{url[:36]}")
+            return label
+
+        try:
+            media_type = get_media_type(cache_path)
+        except Exception:
+            media_type = "unknown"
+
+        if media_type == "image":
+            pix = QPixmap(cache_path)
+            if pix.isNull():
+                label.setText("Invalid image")
+            else:
+                label.setPixmap(pix.scaled(
+                    size, size,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                ))
+        elif media_type == "animated_image":
+            movie = QMovie(cache_path)
+            movie.setCacheMode(QMovie.CacheMode.CacheAll)
+            movie.jumpToFrame(0)
+            native = movie.currentPixmap().size()
+            if not native.isEmpty():
+                scaled = native.scaled(
+                    size, size,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                movie.setScaledSize(scaled)
+            label.setMovie(movie)
+            movie.start()
+            self._movies.append(movie)
+        elif media_type == "video":
+            filename = os.path.basename(cache_path)
+            if len(filename) > 28:
+                filename = filename[:25] + "..."
+            label.setText(f"Video\n{filename}")
+        else:
+            label.setText("Unknown media")
+        return label
+
+    def _build_post_text(self, post):
+        author = str(post.get("author") or "[deleted]")
+        subreddit = str(post.get("subreddit") or "")
+        title = html.escape(str(post.get("title") or "").replace("\n", " ").strip())
+
+        head_parts = [f"<b>u/{html.escape(author)}</b>"]
+        if subreddit:
+            head_parts.append(f"r/{html.escape(subreddit)}")
+        lines = ["  |  ".join(head_parts)]
+
+        if title:
+            lines.append(title)
+
+        created = post.get("created_utc")
+        if created:
+            try:
+                dt = datetime.datetime.fromtimestamp(
+                    float(created), tz=datetime.timezone.utc
+                ).strftime("%Y-%m-%d %H:%M UTC")
+                lines.append(f"Posted: {dt}")
+            except (OverflowError, TypeError, ValueError, OSError):
+                pass
+
+        url = post.get("media_url") or post.get("requested_url")
+        if url:
+            lines.append(f"<span style='color:#888'>{html.escape(str(url))}</span>")
+
+        return "<br>".join(lines)
+
+    @staticmethod
+    def _normalize_permalink(permalink):
+        if not permalink:
+            return ""
+        permalink = str(permalink).strip()
+        if permalink.startswith("http://") or permalink.startswith("https://"):
+            return permalink
+        if permalink.startswith("/"):
+            return "https://www.reddit.com" + permalink
+        return "https://www.reddit.com/" + permalink
+
+    def _view_author(self, author):
+        self.accept()
+        if self.on_view_author is not None:
+            self.on_view_author(author)
+
+
 class ReportsDialog(QDialog):
     """
     Dialog for displaying reports on a Reddit submission.
@@ -549,8 +795,6 @@ class ReportsDialog(QDialog):
         self.close_button.clicked.connect(self.accept)
         layout.addWidget(self.close_button)
 
-from PyQt6.QtCore import QEvent
-
 class ThumbnailWidget(QWidget):
     """
     Widget for displaying a single Reddit post with thumbnail image/video.
@@ -582,7 +826,8 @@ class ThumbnailWidget(QWidget):
 
     def __init__(self, images, title, source_url, submission,
                  subreddit_name, has_multiple_images, post_url, is_moderator,
-                 reddit_instance, vlc_path=None, prefetch_state_getter=None):
+                 reddit_instance, vlc_path=None, prefetch_state_getter=None,
+                 prefetch_request_handler=None):
         """
         Initialize ThumbnailWidget for a Reddit post.
 
@@ -612,6 +857,9 @@ class ThumbnailWidget(QWidget):
         self.has_multiple_images = has_multiple_images
         self.is_moderator = is_moderator
         self.prefetch_state_getter = prefetch_state_getter
+        # Lets a visible tile join/promote an already-running prefetch instead
+        # of opening a second request for the same cache target.
+        self.prefetch_request_handler = prefetch_request_handler
 
         # Media display state
         self.pixmap = None
@@ -895,15 +1143,25 @@ class ThumbnailWidget(QWidget):
         self.rightArrowButton.clicked.connect(self.show_next_image)
         self.rightArrowButton.setToolTip("Next image")
         
-        # Update enabled states
-        self.leftArrowButton.setEnabled(len(self.images) > 1)
-        self.rightArrowButton.setEnabled(len(self.images) > 1)
-        
         # Add to layout
         self.arrowLayout.addWidget(self.leftArrowButton)
         self.arrowLayout.addWidget(self.imageCountLabel)
         self.arrowLayout.addWidget(self.rightArrowButton)
         self.layout.addLayout(self.arrowLayout)
+        self._update_gallery_navigation_controls()
+
+    def _update_gallery_navigation_controls(self):
+        """Synchronize gallery counter and arrow availability with the page."""
+        image_count = len(self.images)
+        if image_count:
+            self.current_index = max(0, min(self.current_index, image_count - 1))
+
+        if hasattr(self, 'imageCountLabel'):
+            self.imageCountLabel.setText(f"Image {self.current_index + 1}/{image_count}")
+        if hasattr(self, 'leftArrowButton'):
+            self.leftArrowButton.setEnabled(image_count > 1 and self.current_index > 0)
+        if hasattr(self, 'rightArrowButton'):
+            self.rightArrowButton.setEnabled(image_count > 1 and self.current_index < image_count - 1)
     
     def create_moderation_buttons(self):
         """Initialize moderation buttons for moderators."""
@@ -1268,14 +1526,38 @@ class ThumbnailWidget(QWidget):
             return
         
         # Show loading indicator
-        self.render_media_source = "foreground_download"
-        self.render_media_started_foreground_download = True
         self.loadingBar.setValue(0)
         self.loadingBar.show()
         self.loadingStateChanged.emit(True)
         
         # Create a weak reference to avoid memory leaks
         weak_self = weakref.ref(self)
+
+        if callable(self.prefetch_request_handler):
+            def prefetched_ready(file_path, processed_url):
+                widget = weak_self()
+                if widget is not None:
+                    widget._safe_call_finished(weak_self, file_path, processed_url, url)
+
+            def prefetched_failed(error_message):
+                widget = weak_self()
+                if widget is not None:
+                    widget._start_foreground_media_download(url, weak_self)
+
+            try:
+                if self.prefetch_request_handler(url, prefetched_ready, prefetched_failed):
+                    self.render_media_source = "prefetch_wait"
+                    self.render_media_waiting_at_build = True
+                    return
+            except Exception as e:
+                logger.debug("Could not join prefetched media for %s: %s", self.submission_id, e)
+
+        self._start_foreground_media_download(url, weak_self)
+
+    def _start_foreground_media_download(self, url, weak_self):
+        """Start a direct media request after cache/prefetch handoff misses."""
+        self.render_media_source = "foreground_download"
+        self.render_media_started_foreground_download = True
         
         # Create a download worker, passing the submission data
         # self.praw_submission holds either the PRAW object or the SimpleNamespace from cache
@@ -1489,9 +1771,10 @@ class ThumbnailWidget(QWidget):
                         # Use the weak reference in the lambda
                         def safe_play_video():
                             widget = self_ref()
-                            if widget is not None:
+                            if (widget is not None
+                                    and requested_url == widget.current_media_request_url):
                                 try:
-                                    widget.play_video(file_path)
+                                    widget.play_video(file_path, requested_url=requested_url)
                                 except RuntimeError:
                                     # Widget was deleted
                                     logger.debug("Widget was deleted before delayed video play")
@@ -1500,7 +1783,7 @@ class ThumbnailWidget(QWidget):
                         QTimer.singleShot(200, safe_play_video)
                 else:
                     # Regular video
-                    self.play_video(file_path)
+                    self.play_video(file_path, requested_url=requested_url)
             elif media_type == "animated_image":
                 # Clean up any existing media first
                 self.cleanup_current_media()
@@ -1755,13 +2038,12 @@ class ThumbnailWidget(QWidget):
         logger.debug(f"Setting movie scaled size to: {new_width}x{new_height}")
         self.movie.setScaledSize(new_size)
     
-    def play_video(self, video_path, no_hw=False):
+    def play_video(self, video_path, no_hw=False, requested_url=None):
         """
         Play a video using VLC.
         Sets up the VLC instance and media player.
         """
         abs_video_path = os.path.abspath(video_path)
-        self.current_video_path = abs_video_path
         logger.debug(f"VLC: Playing video from file: {abs_video_path}")
         
         # Show the play label for fullscreen even when video is playing inline
@@ -1775,6 +2057,7 @@ class ThumbnailWidget(QWidget):
         try:
             # Clean up any existing VLC player
             self.cleanup_current_media()
+            self.current_video_path = abs_video_path
             
             # Keep the image label in the same position but hide it
             # This helps maintain consistent layout and prevents flashing
@@ -1789,7 +2072,10 @@ class ThumbnailWidget(QWidget):
 
             # Start VLC initialization in background
             worker = VlcWorker(abs_video_path, int(self.vlc_widget.winId()))
-            worker.signals.finished.connect(self.on_vlc_ready)
+            worker.signals.finished.connect(
+                lambda instance, player, result, media_url=requested_url:
+                self.on_vlc_ready(instance, player, result, requested_url=media_url)
+            )
             QThreadPool.globalInstance().start(worker)
             
             # If we have moderation buttons, make sure they stay at the bottom
@@ -1804,8 +2090,13 @@ class ThumbnailWidget(QWidget):
                 self.imageLabel.setText(f"Video error: {str(e)}")
                 self.imageLabel.show()
 
-    def on_vlc_ready(self, instance, player, result):
+    def on_vlc_ready(self, instance, player, result, requested_url=None):
         """Handle VLC initialization completion."""
+        if requested_url and requested_url != self.current_media_request_url:
+            # The gallery page changed while VLC initialized.  Do not let a
+            # stale player replace the current page's media.
+            QThreadPool.globalInstance().start(VlcCleanupWorker(player, instance))
+            return
         try:
             self.vlc_instance = instance
             self.vlc_player = player
@@ -1952,6 +2243,24 @@ class ThumbnailWidget(QWidget):
                          try: delattr(self, 'vlc_container')
                          except AttributeError: pass
 
+            # VLC can still be initializing when a gallery arrow is clicked.
+            # Its player is not available yet, but the black render container
+            # already is; leaving it in the layout hides the next image.
+            if hasattr(self, 'vlc_container'):
+                try:
+                    self.vlc_container.setParent(None)
+                    self.vlc_container.deleteLater()
+                except Exception:
+                    pass
+                try:
+                    delattr(self, 'vlc_container')
+                except AttributeError:
+                    pass
+            if hasattr(self, 'vlc_widget'):
+                try:
+                    delattr(self, 'vlc_widget')
+                except AttributeError:
+                    pass
 
             # Clean up the AnimatedGifDisplay
             if hasattr(self, 'gifDisplay') and self.gifDisplay is not None:
@@ -1965,6 +2274,10 @@ class ThumbnailWidget(QWidget):
             if hasattr(self, 'movie') and self.movie:
                 self.movie.stop()
                 self.movie = None
+
+            # A later static image must not open the previous gallery video's
+            # fullscreen player.
+            self.current_video_path = None
             
             # Show the image label again if it exists
             if hasattr(self, 'imageLabel'):
@@ -2210,34 +2523,20 @@ class ThumbnailWidget(QWidget):
     
     def show_previous_image(self): # Line 1219 - Corrected indentation
         """Show the previous image in a gallery post."""
-        self.stop_all_media()
-        if not self.has_multiple_images or len(self.images) <= 1:
+        if not self.has_multiple_images or self.current_index <= 0:
             return
-            
-        # Decrement index with wraparound
-        self.current_index = (self.current_index - 1) % len(self.images)
-        
-        # Update image counter label
-        if hasattr(self, 'imageCountLabel'):
-            self.imageCountLabel.setText(f"Image {self.current_index + 1}/{len(self.images)}")
-        
-        # Load the new image
+        self.stop_all_media()
+        self.current_index -= 1
+        self._update_gallery_navigation_controls()
         self.load_image_async(self.images[self.current_index])
         
     def show_next_image(self): # Line 1234 - Corrected indentation
         """Show the next image in a gallery post."""
-        self.stop_all_media()
-        if not self.has_multiple_images or len(self.images) <= 1:
+        if not self.has_multiple_images or self.current_index >= len(self.images) - 1:
             return
-            
-        # Increment index with wraparound
-        self.current_index = (self.current_index + 1) % len(self.images)
-        
-        # Update image counter label
-        if hasattr(self, 'imageCountLabel'):
-            self.imageCountLabel.setText(f"Image {self.current_index + 1}/{len(self.images)}")
-        
-        # Load the new image
+        self.stop_all_media()
+        self.current_index += 1
+        self._update_gallery_navigation_controls()
         self.load_image_async(self.images[self.current_index])
 
 class AnimatedGifDisplay(QLabel):

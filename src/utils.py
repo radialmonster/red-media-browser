@@ -16,7 +16,7 @@ import time
 import threading
 import hashlib
 
-from urllib.parse import urlparse, unquote, quote, parse_qs
+from urllib.parse import urlparse, unquote, parse_qs
 from PyQt6.QtGui import QImage
 from praw.models import Redditor, Subreddit
 from constants import REPORT_CACHE_TTL_SECONDS
@@ -68,10 +68,6 @@ def preload_file_cache():
     with _file_cache_lock:
         _file_cache_set = file_set
     logger.info(f"Preloaded file cache with {len(_file_cache_set)} media files.")
-
-def force_repair_cache_index():
-    """Force a complete cache repair regardless of apparent consistency."""
-    return repair_cache_index(force_repair=True)
 
 def repair_cache_index(force_repair=False):
     """
@@ -338,15 +334,6 @@ def calculate_image_visual_hash(file_path):
         logger.exception(f"Could not calculate visual hash for image {file_path}: {e}")
         return None
 
-def _visual_hash_distance(hash_a, hash_b):
-    """Return Hamming distance between two 64-bit visual hashes."""
-    if not hash_a or not hash_b:
-        return None
-    try:
-        return (int(str(hash_a), 16) ^ int(str(hash_b), 16)).bit_count()
-    except Exception:
-        return None
-
 def _is_useful_image_visual_hash(visual_hash):
     """Return whether an image dHash has enough signal for duplicate matching."""
     if not visual_hash:
@@ -576,22 +563,6 @@ def record_removed_submission(submission, subreddit_name=None):
 
     return removal_count
 
-def record_removed_log_entry(entry):
-    """Record one removal entry already extracted from a moderator log."""
-    removal_log = load_removal_log()
-    removal_count = _upsert_removed_entry(removal_log, entry)
-    if save_removal_log(removal_log):
-        normalized_entry = _normalize_removal_log_entry(entry)
-        logger.info(
-            "removal_log_backfill_recorded subreddit=%s author=%s count=%s fullname=%s mod=%s",
-            (normalized_entry.get("subreddit") or "unknown").lower(),
-            normalized_entry.get("author") or "[deleted]",
-            removal_count,
-            normalized_entry.get("fullname"),
-            normalized_entry.get("moderator", ""),
-        )
-    return removal_count
-
 def remove_approved_submission_from_removal_log(submission_id=None, fullname=None):
     """Remove an approved submission from removal history."""
     if not submission_id and not fullname:
@@ -783,18 +754,45 @@ def ensure_json_url(url):
         url = url + ".json"
     return url
 
-def _extract_gallery_urls(media_metadata, submission_id_str, source_type):
-    """Helper function to extract URLs from gallery metadata."""
+def _extract_gallery_urls(media_metadata, submission_id_str, source_type, gallery_data=None):
+    """Extract gallery URLs in Reddit's declared gallery-item order.
+
+    ``media_metadata`` is keyed by media ID, but it is not the ordering
+    contract for a gallery.  ``gallery_data['items']`` supplies that contract;
+    falling back to metadata order keeps older cached submissions viewable.
+    """
     if not isinstance(media_metadata, dict):
         logger.warning(f"media_metadata is not a dict for {submission_id_str} ({source_type}), type: {type(media_metadata)}")
         return None
 
     try:
-        urls = [
-            html.unescape(media['s']['u'])
-            for media in media_metadata.values()
-            if isinstance(media, dict) and 's' in media and isinstance(media['s'], dict) and 'u' in media['s']
-        ]
+        def media_url(media):
+            if not isinstance(media, dict):
+                return None
+            source = media.get('s')
+            if not isinstance(source, dict):
+                return None
+            url = source.get('u')
+            return html.unescape(url) if isinstance(url, str) and url else None
+
+        urls = []
+        gallery_items = gallery_data.get('items') if isinstance(gallery_data, dict) else None
+        if isinstance(gallery_items, list):
+            for item in gallery_items:
+                media_id = item.get('media_id') if isinstance(item, dict) else None
+                url = media_url(media_metadata.get(media_id)) if media_id else None
+                if url:
+                    urls.append(url)
+
+            if not urls:
+                logger.warning(
+                    "%s gallery order data contained no usable media for %s; "
+                    "falling back to metadata order.",
+                    source_type.title(), submission_id_str,
+                )
+
+        if not urls:
+            urls = [url for media in media_metadata.values() if (url := media_url(media))]
         if urls:
             logger.debug(f"Extracted {len(urls)} gallery URLs from {source_type} {submission_id_str}.")
             return urls
@@ -831,7 +829,10 @@ def extract_image_urls(submission):
 
         # Try gallery first
         if parent_data.get('is_gallery') and parent_data.get('media_metadata'):
-            gallery_urls = _extract_gallery_urls(parent_data.get('media_metadata'), submission_id_str, "crosspost parent")
+            gallery_urls = _extract_gallery_urls(
+                parent_data.get('media_metadata'), submission_id_str, "crosspost parent",
+                parent_data.get('gallery_data'),
+            )
             if gallery_urls:
                 return gallery_urls
 
@@ -847,7 +848,10 @@ def extract_image_urls(submission):
 
     # Try gallery
     if getattr(submission, 'is_gallery', False) and getattr(submission, 'media_metadata', None):
-        gallery_urls = _extract_gallery_urls(getattr(submission, 'media_metadata'), submission_id_str, "main submission")
+        gallery_urls = _extract_gallery_urls(
+            getattr(submission, 'media_metadata'), submission_id_str, "main submission",
+            getattr(submission, 'gallery_data', None),
+        )
         if gallery_urls:
             return gallery_urls
 
@@ -989,7 +993,7 @@ def _cache_path_in_preloaded_set(cache_path):
     return file_in_cache_preloaded(rel_path)
 
 def _iter_equivalent_cache_paths(cache_path):
-    """Yield cache paths that may hold the same media after content-type extension correction."""
+    """Yield cache paths that may hold the same media after MIME correction."""
     if not cache_path:
         return
 
@@ -997,13 +1001,13 @@ def _iter_equivalent_cache_paths(cache_path):
 
     base_path, ext = os.path.splitext(cache_path)
     ext = ext.lower()
-    equivalent_exts = {
-        ".jpeg": (".jpg",),
-        ".jpg": (".jpeg",),
-    }.get(ext, ())
-
-    for equivalent_ext in equivalent_exts:
-        yield f"{base_path}{equivalent_ext}"
+    # A server can legitimately return media whose Content-Type does not match
+    # the URL suffix (notably CDN image format negotiation).  The downloader
+    # stores it under the MIME-derived suffix, so every supported output suffix
+    # must be considered when resolving the original URL on a later visit.
+    for equivalent_ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".webm"):
+        if equivalent_ext != ext:
+            yield f"{base_path}{equivalent_ext}"
 
 def get_existing_cache_path_for_url(url):
     """Return the existing cache path for a URL, including equivalent content-type extensions."""

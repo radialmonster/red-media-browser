@@ -9,19 +9,18 @@ It also handles downloading and caching of media files.
 
 import os
 import re
+import tempfile
 import logging
 import requests
-import shutil
-import time
-import json
 import html # For unescaping potential entities in extracted URLs
+import threading
 from urllib.parse import urlparse, quote
 
 from PyQt6.QtCore import QObject, QRunnable, pyqtSignal, pyqtSlot
 
 from utils import (
     normalize_redgifs_url, ensure_json_url, get_cache_path_for_url,
-    file_exists_in_cache, get_domain_cache_dir, update_metadata_cache,
+    file_exists_in_cache, update_metadata_cache,
     register_cached_file_path, get_existing_cache_path_for_url
 )
 
@@ -30,6 +29,23 @@ logger = logging.getLogger(__name__)
 
 # Simple cache for processed URLs to avoid duplicate processing
 _processed_url_cache = {}
+
+# Serializes downloads that resolve to the same cache key.  The cache key is
+# intentionally used instead of the source URL because equivalent URLs may
+# normalize to a single destination.  These locks are tiny and the key set
+# mirrors the application's cache-key space.
+_cache_download_locks = {}
+_cache_download_locks_guard = threading.Lock()
+
+
+def _get_cache_download_lock(cache_path):
+    """Return the shared lock for a cache destination."""
+    with _cache_download_locks_guard:
+        lock = _cache_download_locks.get(cache_path)
+        if lock is None:
+            lock = threading.Lock()
+            _cache_download_locks[cache_path] = lock
+        return lock
 
 
 def _classify_url_normalization(original_url, normalized_url):
@@ -957,170 +973,97 @@ class MediaDownloadWorker(QRunnable):
         elif "imgur.com" in url:
             headers['Referer'] = 'https://imgur.com/'
 
-        # --- Initial Download Attempt ---
-        logger.debug(f"Attempting download from: {url}")
-        response = requests.get(url, stream=True, headers=headers, timeout=30, allow_redirects=True)
-        logger.debug(f"Initial response status: {response.status_code}, Final URL: {response.url}")
+        # The cache check in run() happens before network work starts, so it
+        # cannot prevent two workers from passing it at the same time.  Repeat
+        # it while holding a per-destination lock; the later worker then reuses
+        # the file published by the first worker instead of downloading it too.
+        download_lock = _get_cache_download_lock(cache_path)
+        with download_lock:
+            existing_cache_path = get_existing_cache_path_for_url(url)
+            if existing_cache_path:
+                logger.debug("Download skipped; cache was populated while waiting: %s", existing_cache_path)
+                return existing_cache_path
 
-        # --- Handle RedGifs Image Redirect ---
-        # Check if an i.redgifs.com image URL redirected to a www.redgifs.com/watch page returning HTML
-        original_domain = urlparse(url).netloc
-        final_domain = urlparse(response.url).netloc
-        content_type = response.headers.get('Content-Type', '').lower()
+            return self._download_file_to_cache(url, cache_path, headers)
 
-        if (original_domain == "i.redgifs.com" and
-            final_domain == "www.redgifs.com" and
-            "/watch/" in response.url and
-            response.status_code == 200 and
-            'text/html' in content_type):
+    def _download_file_to_cache(self, url, cache_path, headers):
+        """Fetch ``url`` and atomically publish it at an unlocked cache path."""
+        response = None
+        try:
+            logger.debug("Attempting download from: %s", url)
+            response = requests.get(url, stream=True, headers=headers, timeout=30, allow_redirects=True)
+            logger.debug("Initial response status: %s, Final URL: %s", response.status_code, response.url)
 
-            logger.debug("Detected i.redgifs.com image redirect to HTML watch page. Parsing for actual image URL.")
-            html_content = response.text
-            # Try extracting og:image meta tag
-            og_image_match = re.search(
-                r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-                html_content,
-                re.IGNORECASE
-            )
-            # Try extracting twitter:image meta tag as fallback
-            twitter_image_match = re.search(
-                 r'<meta\s+name=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']',
-                 html_content,
-                 re.IGNORECASE
-            )
+            original_domain = urlparse(url).netloc.lower()
+            final_domain = urlparse(response.url).netloc.lower()
+            content_type = response.headers.get('Content-Type', '').lower()
+            if (
+                original_domain == "i.redgifs.com"
+                and final_domain == "www.redgifs.com"
+                and "/watch/" in response.url
+                and response.status_code == 200
+                and 'text/html' in content_type
+            ):
+                html_content = response.text
+                match = re.search(
+                    r'<meta\s+(?:property=["\']og:image["\']|name=["\']twitter:image["\'])\s+'
+                    r'content=["\']([^"\']+)["\']',
+                    html_content,
+                    re.IGNORECASE,
+                )
+                if not match:
+                    raise RuntimeError("Failed to extract an image URL from the RedGifs watch page.")
 
-            actual_image_url = None
-            if og_image_match:
-                actual_image_url = og_image_match.group(1)
-                logger.debug(f"Found og:image URL: {actual_image_url}")
-            elif twitter_image_match:
-                 actual_image_url = twitter_image_match.group(1)
-                 logger.debug(f"Found twitter:image URL: {actual_image_url}")
-            else:
-                logger.error("Could not find image URL (og:image or twitter:image) in redirected HTML.")
-                raise Exception("Failed to extract actual image URL from RedGifs watch page HTML.")
-
-            # --- Second Download Attempt (Actual Image) ---
-            if actual_image_url:
-                logger.debug(f"Attempting second download for actual image: {actual_image_url}")
-                # Use same headers, maybe update Referer?
-                headers['Referer'] = response.url # Referer is the watch page
+                actual_image_url = html.unescape(match.group(1))
+                headers['Referer'] = response.url
+                response.close()
                 response = requests.get(actual_image_url, stream=True, headers=headers, timeout=30)
-                logger.debug(f"Second download response status: {response.status_code}")
-                # Update URL variable to reflect the actual downloaded content for later extension logic
                 url = actual_image_url
-                content_type = response.headers.get('Content-Type', '').lower() # Update content_type too
+                content_type = response.headers.get('Content-Type', '').lower()
 
-        # --- Process Final Response ---
-        if response.status_code == 200:
-            # Get content length for progress reporting (use final response)
-            content_length = int(response.headers.get('Content-Length', 0))
-            
-            # Setup progress tracking
+            if response.status_code != 200:
+                logger.error("Failed to download %s: HTTP status %s", url, response.status_code)
+                raise RuntimeError(f"HTTP error {response.status_code}")
+
+            try:
+                content_length = int(response.headers.get('Content-Length', 0))
+            except (TypeError, ValueError):
+                content_length = 0
+
+            content_type_ext = self._extension_for_content_type(content_type)
+            if content_type_ext and os.path.splitext(cache_path.lower())[1] != content_type_ext:
+                cache_path = os.path.splitext(cache_path)[0] + content_type_ext
+
             bytes_downloaded = 0
-            
-            with open(cache_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:  # filter out keep-alive new chunks
-                        f.write(chunk)
-                        
-                        # Update progress if content length is known
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode='wb',
+                    prefix=f".{os.path.basename(cache_path)}.",
+                    suffix='.part',
+                    dir=os.path.dirname(cache_path),
+                    delete=False,
+                ) as temp_file:
+                    temp_path = temp_file.name
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        temp_file.write(chunk)
                         if content_length > 0:
                             bytes_downloaded += len(chunk)
-                            progress = int(100 * bytes_downloaded / content_length)
-                            self.signals.progress.emit(progress)
+                            self.signals.progress.emit(min(100, int(100 * bytes_downloaded / content_length)))
+                os.replace(temp_path, cache_path)
+            except Exception:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
 
-            content_type = response.headers.get('Content-Type', '').lower()
-            content_type_ext = self._extension_for_content_type(content_type)
-            current_ext = os.path.splitext(cache_path.lower())[1]
-            if content_type_ext and current_ext != content_type_ext:
-                new_cache_path = os.path.splitext(cache_path)[0] + content_type_ext
-                try:
-                    if not os.path.exists(new_cache_path):
-                        shutil.move(cache_path, new_cache_path)
-                        cache_path = new_cache_path
-                        logger.debug(
-                            "Renamed downloaded media based on Content-Type %s: %s",
-                            content_type,
-                            cache_path,
-                        )
-                    elif cache_path != new_cache_path:
-                        os.remove(cache_path)
-                        cache_path = new_cache_path
-                        logger.debug(
-                            "Content-Type-correct media file already exists: %s",
-                            cache_path,
-                        )
-                except Exception as e:
-                    logger.error(f"Error renaming file based on Content-Type: {e}")
-            
-            # Special handling for RedGIFs content
-            if "redgifs.com" in url:
-                # Check content type to determine if it's an image or video
-                # Use the URL *passed to download_file* to check the extension
-                original_ext = os.path.splitext(url.lower())[1]
-                is_image_url = original_ext in ['.jpg', '.jpeg', '.png', '.webp']
-                is_image_content = 'image/' in content_type
-
-                if is_image_url or is_image_content:
-                    # If the URL looked like an image OR content type confirms it's an image
-                    logger.debug(f"RedGifs image detected (URL: {is_image_url}, Content: {is_image_content}), ensuring correct extension.")
-
-                    # Determine the correct extension
-                    correct_ext = original_ext # Default to original URL extension if it was an image type
-                    if not is_image_url: # If original URL didn't have image ext, use content type
-                         if 'image/jpeg' in content_type:
-                             correct_ext = '.jpg'
-                         elif 'image/png' in content_type:
-                             correct_ext = '.png'
-                         elif 'image/webp' in content_type:
-                             correct_ext = '.webp'
-                         else:
-                             correct_ext = '.jpg' # Fallback
-
-                    # Ensure the cached file has the correct extension
-                    current_ext = os.path.splitext(cache_path.lower())[1]
-                    if current_ext != correct_ext:
-                        base_path = os.path.splitext(cache_path)[0]
-                        new_cache_path = base_path + correct_ext
-                        try:
-                            # Only move if the target doesn't already exist (avoid race conditions)
-                            if not os.path.exists(new_cache_path):
-                                shutil.move(cache_path, new_cache_path)
-                                cache_path = new_cache_path
-                                logger.debug(f"Renamed RedGifs image file to use correct extension: {cache_path}")
-                            elif cache_path != new_cache_path:
-                                # Target exists, likely another thread handled it, remove the duplicate
-                                os.remove(cache_path)
-                                cache_path = new_cache_path # Point to the existing correct file
-                                logger.debug(f"Correctly named RedGifs image file already exists: {cache_path}")
-                        except Exception as e:
-                            logger.error(f"Error renaming file to use correct extension: {e}")
-
-                # Only force .mp4 if the URL *didn't* look like an image initially
-                elif not is_image_url and not cache_path.lower().endswith('.mp4'):
-                    # For non-image URLs (likely videos), force .mp4 extension if needed
-                    new_cache_path = os.path.splitext(cache_path)[0] + ".mp4"
-                    try:
-                         # Only move if the target doesn't already exist
-                        if not os.path.exists(new_cache_path):
-                            shutil.move(cache_path, new_cache_path)
-                            cache_path = new_cache_path
-                            logger.debug(f"Renamed RedGifs file to ensure .mp4 extension: {cache_path}")
-                        elif cache_path != new_cache_path:
-                            os.remove(cache_path)
-                            cache_path = new_cache_path
-                            logger.debug(f"Correctly named RedGifs video file already exists: {cache_path}")
-                    except Exception as e:
-                        logger.error(f"Error renaming file to add .mp4 extension: {e}")
-
-            # Success
             register_cached_file_path(cache_path)
             return cache_path
-        else:
-            # Request failed
-            logger.error(f"Failed to download {url}: HTTP status {response.status_code}")
-            raise Exception(f"HTTP error {response.status_code}")
+        finally:
+            close_response = getattr(response, "close", None)
+            if callable(close_response):
+                close_response()
 
     def _extension_for_content_type(self, content_type):
         """Return a preferred file extension for common media content types."""

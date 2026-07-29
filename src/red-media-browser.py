@@ -29,11 +29,11 @@ except Exception:  # pragma: no cover - older PRAW or stubbed test environment
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QScrollArea, QMessageBox,
-    QComboBox, QProgressBar, QSplitter, QMenu, QStatusBar, QTabWidget,
-    QGridLayout, QDialog, QTextBrowser, QTableWidget, QTableWidgetItem,
+    QComboBox, QProgressBar, QMenu, QStatusBar, QGridLayout,
+    QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView
 )
-from PyQt6.QtCore import Qt, QSize, QThreadPool, QThread, pyqtSignal, QTimer, QMutex, QRunnable, QMutexLocker
+from PyQt6.QtCore import Qt, QThreadPool, QThread, pyqtSignal, QTimer, QMutex, QRunnable, QMutexLocker
 from PyQt6.QtGui import QAction, QPixmapCache
 
 from red_config import (
@@ -42,9 +42,9 @@ from red_config import (
 )
 # Import specific workers and functions
 from reddit_api import RedditGalleryModel, SnapshotFetcher, ModeratedSubredditsFetcher, BanWorker
-from ui_components import ThumbnailWidget, BanUserDialog
+from ui_components import ThumbnailWidget, BanUserDialog, DuplicateGroupPreviewDialog
 from utils import (
-    get_cache_dir, ensure_directory, extract_image_urls,
+    get_cache_dir, extract_image_urls,
     record_removed_submission, remove_approved_submission_from_removal_log,
     get_removed_user_summaries, backfill_removal_log_from_mod_actions,
     rebuild_media_usage_index, get_duplicate_media_usage_groups,
@@ -55,12 +55,13 @@ from media_handlers import process_media_url, MediaDownloadWorker, WorkerSignals
 # Import constants
 from constants import (
     PIXMAP_CACHE_SIZE_MB, POSTS_FETCH_LIMIT, DEFAULT_POSTS_FETCH_LIMIT, MOD_LOG_FETCH_LIMIT,
-    UI_UPDATE_DELAY_MS, MOD_STATUS_DELAY_MS, THREAD_TERMINATION_TIMEOUT_MS,
+    UI_UPDATE_DELAY_MS, MOD_STATUS_DELAY_MS,
     MEDIA_PREFETCH_RENDER_DELAY_MS,
     SNAPSHOT_GRID_COLUMNS, SNAPSHOT_GRID_CELL_MIN_WIDTH, SNAPSHOT_GRID_CELL_MIN_HEIGHT,
     DEFAULT_PREFETCH_MEDIA_LIMIT, DEFAULT_MAX_CONCURRENT_PREFETCH_DOWNLOADS,
     DEFAULT_POST_PREFETCH_BUFFER_SIZE, MAX_AUTO_PREFETCHED_POSTS,
-    PREFETCH_RETRY_BASE_DELAY_MS, PREFETCH_RETRY_MAX_ATTEMPTS
+    PREFETCH_RETRY_BASE_DELAY_MS, PREFETCH_RETRY_MAX_ATTEMPTS,
+    PREFETCH_CACHE_TTL_SECONDS
 )
 
 # Configure logging using config.json when available, defaulting to INFO.
@@ -502,6 +503,42 @@ class MediaPrefetchWorker(QRunnable):
                     batch_stats['media_urls_considered'] += 1
                     submission_id = getattr(submission, 'id', 'UnknownID')
                     try:
+                        # Most repeat scans are raw-URL duplicates. Avoid
+                        # provider resolution (which can be network-bound)
+                        # unless an error is actually eligible for retry.
+                        with QMutexLocker(self.main_window.prefetch_mutex):
+                            raw_existing = self.main_window._find_prefetched_media_match_locked(url)
+                            raw_status = raw_existing.get('status') if raw_existing else None
+                            raw_attempts = int(raw_existing.get('attempts', 0)) if raw_existing else 0
+                            raw_next_retry_at = float(raw_existing.get('next_retry_at', 0) or 0) if raw_existing else 0
+                            raw_skip = raw_existing is not None and (
+                                raw_status != 'error' or
+                                raw_attempts >= PREFETCH_RETRY_MAX_ATTEMPTS or
+                                raw_next_retry_at > time.time()
+                            )
+                            if raw_skip:
+                                if raw_status == 'error':
+                                    stat_key = ('retry_exhausted_skips' if raw_attempts >= PREFETCH_RETRY_MAX_ATTEMPTS
+                                                else 'retry_backoff_skips')
+                                    batch_key = stat_key
+                                else:
+                                    stat_key = batch_key = 'duplicate_skips'
+                                self.main_window._increment_prefetch_stat_locked(stat_key)
+                                batch_stats[batch_key] += 1
+
+                        if raw_skip:
+                            self.main_window._log_prefetch_skip(
+                                ('retry_exhausted' if raw_status == 'error' and raw_attempts >= PREFETCH_RETRY_MAX_ATTEMPTS
+                                 else 'retry_backoff' if raw_status == 'error'
+                                 else f'existing_{raw_status or "entry"}'),
+                                url,
+                                processed_url=raw_existing.get('processed_url'),
+                                submission_id=submission_id,
+                                attempts=raw_attempts if raw_status == 'error' else None,
+                                next_retry_at=raw_next_retry_at if raw_status == 'error' else None,
+                            )
+                            continue
+
                         # Resolve provider-specific URLs before dedupe so equivalent
                         # source links do not start duplicate downloads.
                         processed_url = process_media_url(url)
@@ -632,10 +669,20 @@ class MediaPrefetchWorker(QRunnable):
                     except Exception as e:
                         logger.debug(f"Error prefetching media {url}: {e}")
                         batch_stats['errors'] += 1
+                        with QMutexLocker(self.main_window.prefetch_mutex):
+                            existing_error = self.main_window._find_prefetched_media_match_locked(url) or {}
+                            attempts = int(existing_error.get('attempts', 0)) + 1
+                            retryable = attempts < PREFETCH_RETRY_MAX_ATTEMPTS
+                            next_retry_at = (
+                                time.time() + (PREFETCH_RETRY_BASE_DELAY_MS * attempts / 1000)
+                                if retryable else None
+                            )
                         self.main_window._update_prefetched_media_status(
                             url,
                             "error",
                             error_message=str(e),
+                            attempts=attempts,
+                            next_retry_at=next_retry_at,
                         )
                         continue
 
@@ -665,7 +712,6 @@ class RedMediaBrowser(QMainWindow):
         # Initialize class variables
         self.reddit = None
         self.current_model = None
-        self.current_after = None
         self.all_current_snapshot = []
         self.current_snapshot = []
         self.all_current_filtered_snapshot = []
@@ -740,8 +786,17 @@ class RedMediaBrowser(QMainWindow):
         self.max_concurrent_prefetch_downloads = DEFAULT_MAX_CONCURRENT_PREFETCH_DOWNLOADS
         self.prefetched_media = {}  # url -> prefetch_status
         self.prefetch_workers = []  # Track active prefetch workers
+        # Keep download workers alive until their terminal signal reaches the
+        # UI thread.  QThreadPool owns the QRunnable while it runs, but it does
+        # not provide a Python-level reference for its WorkerSignals QObject.
+        # Without one, a prefetch can finish without delivering finished/error,
+        # permanently consuming an entry in active_prefetch_downloads.
+        self.prefetch_download_workers = []
         self.prefetch_download_queue = OrderedDict()
         self.active_prefetch_downloads = set()
+        # processed_url -> callbacks owned by visible widgets.  Callbacks use
+        # weak widget references, so this registry never keeps a page alive.
+        self.prefetch_waiters = {}
         self.prefetch_mutex = QMutex()  # Thread safety for prefetch data
         self.is_shutting_down = False
         # Restartable single-shot timer that triggers the next-page media
@@ -751,6 +806,10 @@ class RedMediaBrowser(QMainWindow):
         self.media_prefetch_timer = QTimer(self)
         self.media_prefetch_timer.setSingleShot(True)
         self.media_prefetch_timer.timeout.connect(self.start_media_prefetch)
+        self.prefetch_cleanup_timer = QTimer(self)
+        self.prefetch_cleanup_timer.setInterval(PREFETCH_CACHE_TTL_SECONDS * 1000)
+        self.prefetch_cleanup_timer.timeout.connect(self.cleanup_prefetch_data)
+        self.prefetch_cleanup_timer.start(PREFETCH_CACHE_TTL_SECONDS * 1000)
         self.prefetch_stats = {
             'scheduled': 0,
             'started': 0,
@@ -1596,7 +1655,6 @@ class RedMediaBrowser(QMainWindow):
         self.all_current_filtered_snapshot = []
         self.current_filtered_snapshot = []
         self.snapshot_offset = 0
-        self.current_after = None
         self.can_fetch_more_posts = False
         self._set_view_mode(queue_name.lower(), queue_name)
         self._sync_source_specific_controls()
@@ -1823,11 +1881,9 @@ class RedMediaBrowser(QMainWindow):
             is_gallery = getattr(submission, 'is_gallery', False)
             gallery_data = getattr(submission, 'gallery_data', None)
             media_metadata = getattr(submission, 'media_metadata', None)
-            has_multiple_images = is_gallery and (gallery_data or media_metadata)
-
             # Source URL
             source_url = getattr(submission, 'url', '')
-            if has_multiple_images:
+            if is_gallery:
                 source_url = "Gallery post"
 
             # Get image URLs
@@ -1835,6 +1891,9 @@ class RedMediaBrowser(QMainWindow):
             if not image_urls:
                 logger.warning(f"No images found for submission ID {submission_id_str}")
                 return
+            # Show paging controls only when there is an actual second page.
+            # Gallery metadata can be partial, stale, or contain a single item.
+            has_multiple_images = is_gallery and len(image_urls) > 1
 
             # Moderator check
             can_moderate_this_post = (
@@ -1856,6 +1915,7 @@ class RedMediaBrowser(QMainWindow):
                 reddit_instance=self.reddit,
                 vlc_path=self.vlc_path,  # Pass the VLC path from config
                 prefetch_state_getter=self.get_prefetch_state_for_url,
+                prefetch_request_handler=self.join_or_promote_prefetch,
             )
             thumbnail.authorClicked.connect(self.on_author_clicked)
             thumbnail.moderationStateChanged.connect(
@@ -2170,6 +2230,44 @@ class RedMediaBrowser(QMainWindow):
             existing = self._find_prefetched_media_match_locked(original_url, processed_url)
             return dict(existing) if existing else None
 
+    def join_or_promote_prefetch(self, original_url, on_ready, on_error) -> bool:
+        """Attach a visible tile to queued/inflight prefetch work for a raw URL.
+
+        A visible request is promoted to the front of the FIFO when possible.
+        This is deliberately keyed by the already-resolved prefetch entry, so
+        page rendering never performs provider URL resolution on the UI thread.
+        """
+        with QMutexLocker(self.prefetch_mutex):
+            entry = self._find_prefetched_media_match_locked(original_url) or {}
+            processed_url = entry.get('processed_url')
+            if entry.get('status') not in {'queued', 'prefetching'} or not processed_url:
+                return False
+
+            self.prefetch_waiters.setdefault(processed_url, []).append((on_ready, on_error))
+            if processed_url in self.prefetch_download_queue:
+                self.prefetch_download_queue.move_to_end(processed_url, last=False)
+                logger.info("prefetch_promoted processed_url=%s", processed_url)
+            else:
+                logger.info("prefetch_joined_active processed_url=%s", processed_url)
+
+        self._start_queued_prefetch_downloads()
+        return True
+
+    def _notify_prefetch_waiters(self, processed_url, *, file_path=None, error_message=None) -> None:
+        """Resolve and release visible-widget callbacks for a prefetch job."""
+        if not processed_url:
+            return
+        with QMutexLocker(self.prefetch_mutex):
+            waiters = self.prefetch_waiters.pop(processed_url, [])
+        for on_ready, on_error in waiters:
+            try:
+                if file_path:
+                    on_ready(file_path, processed_url)
+                else:
+                    on_error(error_message or "Prefetched media failed")
+            except RuntimeError:
+                logger.debug("Visible widget was deleted before prefetched media completed")
+
     def _ensure_prefetch_batch_record_locked(self, batch_id: int) -> Dict[str, int]:
         """Create or return the mutable metrics record for one prefetch batch."""
         batch_record = self.prefetch_batches.get(batch_id)
@@ -2185,6 +2283,8 @@ class RedMediaBrowser(QMainWindow):
                 'downloads_completed': 0,
                 'downloads_failed': 0,
                 'downloads_retried': 0,
+                'downloads_queued_pending': 0,
+                'downloads_discarded': 0,
                 'downloads_inflight': 0,
                 'queue_phase_done': 0,
             }
@@ -2243,6 +2343,8 @@ class RedMediaBrowser(QMainWindow):
 
         batch_record = self._ensure_prefetch_batch_record_locked(batch_id)
         batch_record['downloads_started'] += 1
+        if batch_record['downloads_queued_pending'] > 0:
+            batch_record['downloads_queued_pending'] -= 1
         batch_record['downloads_inflight'] += 1
 
     def _record_prefetch_batch_download_finished(self, batch_id: Optional[int], *, failed: bool, retried: bool = False) -> None:
@@ -2279,6 +2381,8 @@ class RedMediaBrowser(QMainWindow):
                 return
             if batch_record['downloads_inflight'] > 0:
                 return
+            if batch_record.get('downloads_queued_pending', 0) > 0:
+                return
 
             outcome = dict(batch_record)
             del self.prefetch_batches[batch_id]
@@ -2286,7 +2390,7 @@ class RedMediaBrowser(QMainWindow):
         logger.info(
             "prefetch_batch_async_done batch_id=%s queued=%s cache_hits=%s duplicate_skips=%s "
             "retry_backoff_skips=%s retry_exhausted_skips=%s errors=%s downloads_started=%s "
-            "downloads_completed=%s downloads_failed=%s downloads_retried=%s",
+            "downloads_completed=%s downloads_failed=%s downloads_retried=%s downloads_discarded=%s",
             batch_id,
             outcome['queued'],
             outcome['cache_hits'],
@@ -2298,6 +2402,7 @@ class RedMediaBrowser(QMainWindow):
             outcome['downloads_completed'],
             outcome['downloads_failed'],
             outcome['downloads_retried'],
+            outcome.get('downloads_discarded', 0),
         )
 
     def _abort_prefetch_activity(self, reason: str) -> None:
@@ -2312,6 +2417,13 @@ class RedMediaBrowser(QMainWindow):
         if timer is not None:
             try:
                 timer.stop()
+            except (RuntimeError, AttributeError):
+                pass
+
+        cleanup_timer = getattr(self, "prefetch_cleanup_timer", None)
+        if cleanup_timer is not None:
+            try:
+                cleanup_timer.stop()
             except (RuntimeError, AttributeError):
                 pass
 
@@ -2335,6 +2447,9 @@ class RedMediaBrowser(QMainWindow):
             self.active_prefetch_downloads.clear()
             self.prefetch_batches.clear()
             self.prefetch_workers.clear()
+            download_workers = getattr(self, "prefetch_download_workers", None)
+            if hasattr(download_workers, "clear"):
+                download_workers.clear()
 
         for batch_id, batch_record in batch_records.items():
             logger.warning(
@@ -3199,10 +3314,6 @@ class RedMediaBrowser(QMainWindow):
         self.next_batch_navigation_pending = False
 
         self.can_fetch_more_posts = len(posts) >= DEFAULT_POSTS_FETCH_LIMIT
-        if posts:
-            last_fullname = self._get_last_fullname(list(posts))
-            if last_fullname:
-                self.current_after = last_fullname
 
         if self.next_prefetch_fetcher is not None:
             self.cleanup_worker(self.next_prefetch_fetcher)
@@ -3587,6 +3698,7 @@ class RedMediaBrowser(QMainWindow):
             self.duplicate_media_view_author_button = None
             self.duplicate_media_ban_author_button = None
             self.duplicate_media_refresh_button = None
+            self.duplicate_media_preview_button = None
             self.duplicate_media_rows = self._build_duplicate_media_rows(groups)
 
             self.clear_content()
@@ -3610,6 +3722,11 @@ class RedMediaBrowser(QMainWindow):
             refresh_button.clicked.connect(self._refresh_duplicate_media_index)
             actions_layout.addWidget(refresh_button)
 
+            preview_button = QPushButton("Preview Group", actions_widget)
+            preview_button.setToolTip("View the cached images and posts for this match")
+            preview_button.clicked.connect(self._preview_selected_duplicate_media_group)
+            actions_layout.addWidget(preview_button)
+
             view_button = QPushButton("View Author Posts", actions_widget)
             view_button.clicked.connect(self._view_selected_duplicate_media_author)
             actions_layout.addWidget(view_button)
@@ -3621,6 +3738,7 @@ class RedMediaBrowser(QMainWindow):
             page_layout.addWidget(actions_widget)
 
             self.duplicate_media_refresh_button = refresh_button
+            self.duplicate_media_preview_button = preview_button
             self.duplicate_media_view_author_button = view_button
             self.duplicate_media_ban_author_button = ban_button
 
@@ -3772,8 +3890,11 @@ class RedMediaBrowser(QMainWindow):
     def _update_duplicate_media_action_buttons(self) -> None:
         """Enable duplicate-media actions for the selected row."""
         row_data = self._get_selected_duplicate_media_row()
+        has_row = row_data is not None
         author = str((row_data or {}).get("author") or "").strip()
         actionable = bool(author and author.lower() not in {"[deleted]", "unknown", "none"})
+        if self.duplicate_media_preview_button is not None:
+            self.duplicate_media_preview_button.setEnabled(has_row)
         if self.duplicate_media_view_author_button is not None:
             self.duplicate_media_view_author_button.setEnabled(actionable)
         if self.duplicate_media_ban_author_button is not None:
@@ -3788,11 +3909,11 @@ class RedMediaBrowser(QMainWindow):
             self.duplicate_media_refresh_button.setEnabled(self.duplicate_media_fetcher is None)
 
     def _on_duplicate_media_cell_double_clicked(self, row: int, column: int) -> None:
-        """Open selected duplicate-media author posts on double-click."""
+        """Open the group preview dialog on double-click."""
         table = self.duplicate_media_table
         if table is not None:
             table.selectRow(row)
-        self._view_selected_duplicate_media_author()
+        self._preview_selected_duplicate_media_group()
 
     def _view_selected_duplicate_media_author(self) -> None:
         """Open posts for the selected duplicate-media author."""
@@ -3800,6 +3921,21 @@ class RedMediaBrowser(QMainWindow):
         author = str((row_data or {}).get("author") or "").strip()
         if author and author.lower() not in {"[deleted]", "unknown", "none"}:
             self.on_author_clicked(author)
+
+    def _preview_selected_duplicate_media_group(self) -> None:
+        """Open a dialog showing the cached media and posts for the selected group."""
+        row_data = self._get_selected_duplicate_media_row()
+        if not row_data:
+            return
+        group = row_data.get("group") or {}
+        posts = [p for p in (row_data.get("all_posts") or []) if isinstance(p, dict)]
+        dialog = DuplicateGroupPreviewDialog(
+            group,
+            posts,
+            parent=self,
+            on_view_author=self.on_author_clicked,
+        )
+        dialog.exec()
 
     def _ban_selected_duplicate_media_author(self) -> None:
         """Open ban dialog for the selected duplicate-media author."""
@@ -3830,7 +3966,6 @@ class RedMediaBrowser(QMainWindow):
         self.current_filtered_snapshot = []
         self.all_current_filtered_snapshot = []
         self.snapshot_offset = 0
-        self.current_after = None
         self.can_fetch_more_posts = False
         self._set_view_mode("removed_users", "Removed Users")
         self._sync_source_specific_controls()
@@ -4295,15 +4430,6 @@ class RedMediaBrowser(QMainWindow):
         self.all_current_snapshot.extend(unique_new_posts)
         self._refresh_visible_snapshots()
 
-        # Update after value for future fetches
-        if new_posts:
-            last_post = new_posts[-1]
-            last_fullname = getattr(last_post, "fullname", None)
-            if not last_fullname and hasattr(last_post, 'id'):
-                last_fullname = f"t3_{last_post.id}"
-            if last_fullname:
-                self.current_after = last_fullname
-
         # Hide loading indicator
         self.is_loading_posts = False
         self.loading_bar.hide()
@@ -4521,17 +4647,20 @@ class RedMediaBrowser(QMainWindow):
         original_url: str,
         processed_url: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Return existing prefetch state for either the raw or resolved media URL."""
+        """Return existing prefetch state for either the raw or resolved media URL.
+
+        ``_sync_prefetched_media_entries_locked`` aliases every entry under its
+        ``processed_url`` as a dictionary key, so the two direct key lookups above
+        fully cover both the raw and resolved URL forms. An earlier O(n) value
+        scan fallback was removed because it could only ever be reached when both
+        key lookups missed (i.e. genuine misses) and therefore always returned
+        ``None`` after walking the whole alias map.
+        """
         if original_url in self.prefetched_media:
             return self.prefetched_media[original_url]
 
         if processed_url and processed_url in self.prefetched_media:
             return self.prefetched_media[processed_url]
-
-        if processed_url:
-            for data in self.prefetched_media.values():
-                if data.get('processed_url') == processed_url:
-                    return data
 
         return None
 
@@ -4544,11 +4673,17 @@ class RedMediaBrowser(QMainWindow):
     ) -> None:
         """Keep raw and resolved URL aliases aligned to one prefetch state."""
         effective_processed_url = processed_url or entry_data.get('processed_url')
-        self.prefetched_media[original_url] = dict(entry_data)
+        canonical_data = dict(entry_data)
+        if effective_processed_url:
+            # The raw URL is the usual lookup key for visible media widgets.
+            # It must carry the canonical URL too; otherwise a caller that
+            # supplied ``processed_url`` separately can create a raw alias
+            # that join_or_promote_prefetch() cannot associate with its queue.
+            canonical_data['processed_url'] = effective_processed_url
+        self.prefetched_media[original_url] = canonical_data
 
         if effective_processed_url:
-            alias_data = dict(entry_data)
-            alias_data['processed_url'] = effective_processed_url
+            alias_data = dict(canonical_data)
             self.prefetched_media[effective_processed_url] = alias_data
 
             for key, existing_data in list(self.prefetched_media.items()):
@@ -4556,6 +4691,48 @@ class RedMediaBrowser(QMainWindow):
                     continue
                 if existing_data.get('processed_url') == effective_processed_url:
                     self.prefetched_media[key] = dict(alias_data)
+
+    def _drop_prefetched_media_entries_locked(self, processed_url: str) -> None:
+        """Remove all raw/resolved aliases for a discarded queued download."""
+        for key, data in list(self.prefetched_media.items()):
+            if key == processed_url or data.get('processed_url') == processed_url:
+                del self.prefetched_media[key]
+
+    def _prune_prefetch_queue(self, allowed_submission_ids) -> int:
+        """Discard stale queued work without orphaning visible media requests."""
+        removed = []
+        retained_for_visible_waiter = []
+        with QMutexLocker(self.prefetch_mutex):
+            for processed_url, queued_download in list(self.prefetch_download_queue.items()):
+                submission_id = getattr(queued_download.get('submission_data'), 'id', None)
+                if submission_id not in allowed_submission_ids:
+                    # A tile on the currently visible page may already have
+                    # joined this queued job.  Dropping it would also drop its
+                    # only completion callback, leaving its loading indicator
+                    # up indefinitely.  Preserve and prioritize that request;
+                    # it is now foreground-relevant rather than stale work.
+                    if self.prefetch_waiters.get(processed_url):
+                        retained_for_visible_waiter.append(processed_url)
+                        continue
+                    batch_id = queued_download.get('batch_id')
+                    removed.append((processed_url, batch_id))
+                    del self.prefetch_download_queue[processed_url]
+                    self._drop_prefetched_media_entries_locked(processed_url)
+                    if batch_id is not None:
+                        batch_record = self._ensure_prefetch_batch_record_locked(batch_id)
+                        if batch_record['downloads_queued_pending'] > 0:
+                            batch_record['downloads_queued_pending'] -= 1
+                        batch_record['downloads_discarded'] += 1
+            for processed_url in reversed(retained_for_visible_waiter):
+                self.prefetch_download_queue.move_to_end(processed_url, last=False)
+        if removed:
+            logger.info("prefetch_queue_pruned removed=%s remaining=%s", len(removed), len(self.prefetch_download_queue))
+        if retained_for_visible_waiter:
+            logger.info(
+                "prefetch_queue_retained_for_visible_waiters retained=%s",
+                len(retained_for_visible_waiter),
+            )
+        return len(removed)
 
     def _update_prefetched_media_status(
         self,
@@ -4684,6 +4861,8 @@ class RedMediaBrowser(QMainWindow):
                     'submission_data': submission_data,
                     'batch_id': batch_id,
                 }
+                if batch_id is not None:
+                    self._ensure_prefetch_batch_record_locked(batch_id)['downloads_queued_pending'] += 1
                 queued = True
                 duplicate_reason = None
 
@@ -4793,8 +4972,33 @@ class RedMediaBrowser(QMainWindow):
                 ),
                 Qt.ConnectionType.QueuedConnection
             )
+            # Retain the runnable and its signals until one terminal callback
+            # is delivered.  The cleanup connections are intentionally queued
+            # too, so they run after the corresponding state handler.
+            worker.signals.finished.connect(
+                lambda _file_path, _processed_url, _submission_data, completed_worker=worker:
+                self._cleanup_prefetch_download_worker(completed_worker),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            worker.signals.error.connect(
+                lambda _error_message, _submission_data, completed_worker=worker:
+                self._cleanup_prefetch_download_worker(completed_worker),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            with QMutexLocker(self.prefetch_mutex):
+                self.prefetch_download_workers.append(worker)
 
             QThreadPool.globalInstance().start(worker)
+
+    def _cleanup_prefetch_download_worker(self, worker) -> None:
+        """Release a completed prefetch download worker and its signal bridge."""
+        with QMutexLocker(self.prefetch_mutex):
+            try:
+                self.prefetch_download_workers.remove(worker)
+            except ValueError:
+                # Shutdown clears the tracking collection before queued signals
+                # can run, which is safe and expected.
+                pass
 
     def _finalize_prefetch_download(self, processed_url: Optional[str]) -> None:
         """Release a completed prefetch download slot and start the next queued item."""
@@ -4841,6 +5045,10 @@ class RedMediaBrowser(QMainWindow):
                 error_message="Prefetch finished without a cache path.",
             )
             self._record_prefetch_batch_download_finished(batch_id, failed=True)
+            self._notify_prefetch_waiters(
+                processed_url,
+                error_message="Prefetch finished without a cache path.",
+            )
             self._finalize_prefetch_download(processed_url)
             return
 
@@ -4867,6 +5075,7 @@ class RedMediaBrowser(QMainWindow):
             queued,
         )
         self._record_prefetch_batch_download_finished(batch_id, failed=False)
+        self._notify_prefetch_waiters(processed_url, file_path=file_path)
         self._finalize_prefetch_download(processed_url)
 
     def on_prefetch_download_error(
@@ -4904,6 +5113,10 @@ class RedMediaBrowser(QMainWindow):
             failed=True,
             retried=should_retry,
         )
+        # A visible tile should not wait through background backoff; it falls
+        # back to one foreground request while the prefetch retry remains best
+        # effort for future navigation.
+        self._notify_prefetch_waiters(processed_url, error_message=error_message)
         self._finalize_prefetch_download(processed_url)
 
         if should_retry and not self.is_shutting_down:
@@ -4962,6 +5175,11 @@ class RedMediaBrowser(QMainWindow):
                     if len(unique_submissions) >= prefetch_limit:
                         break
 
+            # The queue is a read-ahead window, not a background archive.  Old
+            # FIFO entries otherwise starve the page the user has actually
+            # reached after rapid navigation.
+            self._prune_prefetch_queue({getattr(item, 'id', None) for item in unique_submissions})
+
             if unique_submissions:
                 # Any still-running scanner is now scanning a superseded window
                 # (the user has moved on); ask it to stop so its process_media_url
@@ -5004,12 +5222,15 @@ class RedMediaBrowser(QMainWindow):
         """Clean up old prefetch data to prevent memory bloat."""
         try:
             current_time = time.time()
-            cleanup_threshold = 300  # 5 minutes
+            cleanup_threshold = PREFETCH_CACHE_TTL_SECONDS
 
             with QMutexLocker(self.prefetch_mutex):
                 # Clean up old media prefetch entries
                 urls_to_remove = []
                 for url, data in self.prefetched_media.items():
+                    processed_url = data.get('processed_url')
+                    if processed_url in self.prefetch_download_queue or processed_url in self.active_prefetch_downloads:
+                        continue
                     if current_time - data.get('started_at', 0) > cleanup_threshold:
                         urls_to_remove.append(url)
 
